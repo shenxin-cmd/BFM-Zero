@@ -38,6 +38,9 @@ from ..pytree_utils import tree_get_batch_size
 class FBModelArchiConfig(BaseConfig):
     z_dim: int = 100
     norm_z: bool = True
+    right_hand_z_start: int = 0
+    right_hand_z_dim: int = 32
+    z_norm_mode: tp.Literal["global", "per_part"] = "global"
     f: ForwardArchiConfig | ForwardFilterArchiConfig = pydantic.Field(ForwardArchiConfig(), discriminator="name")
     b: BackwardArchiConfig | BackwardFilterArchiConfig = pydantic.Field(BackwardArchiConfig(), discriminator="name")
     # Because of the "name" attribute, these two can be chosen between via strings easily
@@ -85,6 +88,11 @@ class FBModel(BaseModel):
         self._backward_map = arch.b.build(obs_space, arch.z_dim)
         self._forward_map = arch.f.build(obs_space, arch.z_dim, action_dim)
         self._actor = arch.actor.build(obs_space, arch.z_dim, action_dim)
+        self._right_hand_head = torch.nn.Sequential(
+            torch.nn.Linear(arch.right_hand_z_dim, arch.right_hand_z_dim * 2),
+            torch.nn.ReLU(),
+            torch.nn.Linear(arch.right_hand_z_dim * 2, 7),
+        )
         self._obs_normalizer = self.cfg.obs_normalizer.build(obs_space)
 
         # make sure the model is in eval mode and never computes gradients
@@ -122,8 +130,37 @@ class FBModel(BaseModel):
 
     def project_z(self, z):
         if self.cfg.archi.norm_z:
-            z = math.sqrt(z.shape[-1]) * F.normalize(z, dim=-1)
+            if self.cfg.archi.z_norm_mode == "per_part":
+                right_start = self.cfg.archi.right_hand_z_start
+                right_dim = self.cfg.archi.right_hand_z_dim
+                right_end = right_start + right_dim
+                if right_dim <= 0 or right_end > z.shape[-1]:
+                    raise ValueError("Invalid right hand z partition.")
+
+                right_part = z[..., right_start:right_end]
+                rest_left = z[..., :right_start]
+                rest_right = z[..., right_end:]
+                z_right = math.sqrt(right_part.shape[-1]) * F.normalize(right_part, dim=-1)
+                if rest_left.shape[-1] + rest_right.shape[-1] > 0:
+                    rest = torch.cat([rest_left, rest_right], dim=-1)
+                    z_rest = math.sqrt(rest.shape[-1]) * F.normalize(rest, dim=-1)
+                    z = torch.cat([z_rest[..., :right_start], z_right, z_rest[..., right_start:]], dim=-1)
+                else:
+                    z = z_right
+            else:
+                z = math.sqrt(z.shape[-1]) * F.normalize(z, dim=-1)
         return z
+
+    def split_z(self, z: torch.Tensor) -> dict[str, torch.Tensor]:
+        right_start = self.cfg.archi.right_hand_z_start
+        right_dim = self.cfg.archi.right_hand_z_dim
+        right_end = right_start + right_dim
+        if right_dim <= 0 or right_end > z.shape[-1]:
+            raise ValueError("Invalid right hand z partition.")
+        return {
+            "right_hand": z[..., right_start:right_end],
+            "rest": torch.cat([z[..., :right_start], z[..., right_end:]], dim=-1),
+        }
 
     def act(self, obs: torch.Tensor | dict[str, torch.Tensor], z: torch.Tensor, mean: bool = True) -> torch.Tensor:
         dist = self.actor(obs, z, self.cfg.actor_std)

@@ -42,6 +42,12 @@ class FBAgentTrainConfig(BaseConfig):
     rollout_expert_trajectories: bool = False
     rollout_expert_trajectories_length: int = 250
     rollout_expert_trajectories_percentage: float = 0.25
+    enable_right_hand_pose_loss: bool = False
+    right_hand_pose_loss_coef: float = 1.0
+    right_hand_pos_coef: float = 1.0
+    right_hand_rot_coef: float = 0.3
+    enable_part_orth_loss: bool = False
+    part_orth_loss_coef: float = 1.0
 
 
 class FBAgentConfig(BaseConfig):
@@ -81,17 +87,24 @@ class FBAgent:
 
     @property
     def optimizer_dict(self):
-        return {
+        optimizers = {
             "actor_optimizer": self.actor_optimizer.state_dict(),
             "backward_optimizer": self.backward_optimizer.state_dict(),
             "forward_optimizer": self.forward_optimizer.state_dict(),
         }
+        if hasattr(self, "right_hand_head_optimizer"):
+            optimizers["right_hand_head_optimizer"] = self.right_hand_head_optimizer.state_dict()
+        return optimizers
 
     def setup_training(self) -> None:
         self._model.train(True)
         self._model.requires_grad_(True)
         self._model.apply(weight_init)
         self._model._prepare_for_train()  # ensure that target nets are initialized after applying the weights
+        right_start = self.cfg.model.archi.right_hand_z_start
+        right_end = right_start + self.cfg.model.archi.right_hand_z_dim
+        if (self.cfg.train.enable_right_hand_pose_loss or self.cfg.train.enable_part_orth_loss) and right_end > self.cfg.model.archi.z_dim:
+            raise ValueError("Right hand z partition exceeds total z_dim.")
 
         self.backward_optimizer = torch.optim.Adam(
             self._model._backward_map.parameters(),
@@ -111,6 +124,13 @@ class FBAgent:
             capturable=self.cfg.cudagraphs and not self.cfg.compile,
             weight_decay=self.cfg.train.weight_decay,
         )
+        if self.cfg.train.enable_right_hand_pose_loss:
+            self.right_hand_head_optimizer = torch.optim.Adam(
+                self._model._right_hand_head.parameters(),
+                lr=self.cfg.train.lr_b,
+                capturable=self.cfg.cudagraphs and not self.cfg.compile,
+                weight_decay=self.cfg.train.weight_decay,
+            )
 
         # prepare parameter list
         self._forward_map_paramlist = tuple(x for x in self._model._forward_map.parameters())
@@ -167,6 +187,8 @@ class FBAgent:
             batch["next"]["observation"],
             batch["next"]["terminated"],
         )
+        right_hand_pose = batch.get("right_hand_pose", None)
+        next_right_hand_pose = batch.get("next", {}).get("right_hand_pose", None)
         discount = self.cfg.train.discount * ~terminated
 
         self._model._obs_normalizer(obs)
@@ -189,6 +211,8 @@ class FBAgent:
             next_obs=next_obs,
             goal=next_obs,
             z=z,
+            right_hand_pose=right_hand_pose,
+            next_right_hand_pose=next_right_hand_pose,
             q_loss_coef=q_loss_coef,
             clip_grad_norm=clip_grad_norm,
         )
@@ -221,6 +245,8 @@ class FBAgent:
         next_obs: torch.Tensor | dict[str, torch.Tensor],
         goal: torch.Tensor,
         z: torch.Tensor,
+        right_hand_pose: torch.Tensor | None,
+        next_right_hand_pose: torch.Tensor | None,
         q_loss_coef: float | None,
         clip_grad_norm: float | None,
     ) -> Dict[str, torch.Tensor]:
@@ -251,6 +277,37 @@ class FBAgent:
             orth_loss = orth_loss_offdiag + orth_loss_diag
             fb_loss += self.cfg.train.ortho_coef * orth_loss
 
+            right_hand_pose_loss = torch.zeros(1, device=z.device, dtype=z.dtype)
+            right_hand_pos_loss = torch.zeros(1, device=z.device, dtype=z.dtype)
+            right_hand_rot_loss = torch.zeros(1, device=z.device, dtype=z.dtype)
+            part_orth_loss = torch.zeros(1, device=z.device, dtype=z.dtype)
+
+            if self.cfg.train.enable_part_orth_loss:
+                z_parts = self._model.split_z(B)
+                z_right = z_parts["right_hand"]
+                z_rest = z_parts["rest"]
+                if z_rest.shape[-1] > 0:
+                    cross_cov = torch.matmul(z_right.T, z_rest) / z_right.shape[0]
+                    part_orth_loss = cross_cov.pow(2).mean()
+                    fb_loss += self.cfg.train.part_orth_loss_coef * part_orth_loss
+
+            if self.cfg.train.enable_right_hand_pose_loss:
+                if next_right_hand_pose is None:
+                    raise ValueError(
+                        "enable_right_hand_pose_loss=True but next_right_hand_pose is missing in replay buffer batch."
+                    )
+                target_pose = next_right_hand_pose.to(z.device)
+                right_start = self.cfg.model.archi.right_hand_z_start
+                right_end = right_start + self.cfg.model.archi.right_hand_z_dim
+                pred_pose = self._model._right_hand_head(B[:, right_start:right_end])
+                right_hand_pos_loss = F.mse_loss(pred_pose[:, :3], target_pose[:, :3])
+                right_hand_rot_loss = F.mse_loss(pred_pose[:, 3:], target_pose[:, 3:])
+                right_hand_pose_loss = (
+                    self.cfg.train.right_hand_pos_coef * right_hand_pos_loss
+                    + self.cfg.train.right_hand_rot_coef * right_hand_rot_loss
+                )
+                fb_loss += self.cfg.train.right_hand_pose_loss_coef * right_hand_pose_loss
+
             q_loss = torch.zeros(1, device=z.device, dtype=z.dtype)
             if q_loss_coef is not None:
                 with torch.no_grad():
@@ -271,12 +328,16 @@ class FBAgent:
         # optimize FB
         self.forward_optimizer.zero_grad(set_to_none=True)
         self.backward_optimizer.zero_grad(set_to_none=True)
+        if self.cfg.train.enable_right_hand_pose_loss:
+            self.right_hand_head_optimizer.zero_grad(set_to_none=True)
         fb_loss.backward()
         if clip_grad_norm is not None:
             torch.nn.utils.clip_grad_norm_(self._model._forward_map.parameters(), clip_grad_norm)
             torch.nn.utils.clip_grad_norm_(self._model._backward_map.parameters(), clip_grad_norm)
         self.forward_optimizer.step()
         self.backward_optimizer.step()
+        if self.cfg.train.enable_right_hand_pose_loss:
+            self.right_hand_head_optimizer.step()
 
         with torch.no_grad():
             output_metrics = {
@@ -292,7 +353,11 @@ class FBAgent:
                 "orth_loss": orth_loss,
                 "orth_loss_diag": orth_loss_diag,
                 "orth_loss_offdiag": orth_loss_offdiag,
+                "part_orth_loss": part_orth_loss,
                 "q_loss": q_loss,
+                "right_hand_pose_loss": right_hand_pose_loss,
+                "right_hand_pos_loss": right_hand_pos_loss,
+                "right_hand_rot_loss": right_hand_rot_loss,
             }
         return output_metrics
 

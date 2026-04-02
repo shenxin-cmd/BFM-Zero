@@ -260,6 +260,8 @@ class HumanoidVerseVectorEnv(VectorEnv):
         included_dr_obs_names: list[str] | None = None,
         include_history_actor: bool = True,
         include_history_noaction: bool = False,
+        include_right_hand_pose: bool = False,
+        right_hand_body_name: str = "right_wrist_roll_link",
     ):
         super().__init__()
         self._env = env
@@ -272,6 +274,13 @@ class HumanoidVerseVectorEnv(VectorEnv):
         self.include_dr_info = include_dr_info
         self.include_history_actor = include_history_actor
         self.include_history_noaction = include_history_noaction
+        self.include_right_hand_pose = include_right_hand_pose
+        self.right_hand_body_name = right_hand_body_name
+        self.right_hand_body_idx: int | None = None
+        if self.include_right_hand_pose:
+            if right_hand_body_name not in self._env.body_names:
+                raise ValueError(f"Body name '{right_hand_body_name}' not found in env body names.")
+            self.right_hand_body_idx = self._env.body_names.index(right_hand_body_name)
         if included_dr_obs_names is not None:
             self.included_dr_obs_names = included_dr_obs_names
         else:
@@ -378,6 +387,7 @@ class HumanoidVerseVectorEnv(VectorEnv):
         _, info = self.base_env.reset_all(target_states=target_states)
         observation = self._get_g1env_observation(to_numpy=to_numpy)
         qpos, qvel = self._get_qpos_qvel(to_numpy=to_numpy)
+        right_hand_pose = self._get_right_hand_pose(to_numpy=to_numpy)
         # add only observation to the history
         # observation is now 1 step ahead
         if self.history_handler is not None:
@@ -385,6 +395,8 @@ class HumanoidVerseVectorEnv(VectorEnv):
             observation["history"] = {"observation": [], "action": []}
         self.env_to_reset = []
         info = {"qpos": qpos, "qvel": qvel}
+        if right_hand_pose is not None:
+            info["right_hand_pose"] = right_hand_pose
         return observation, info
 
     def _get_qpos_qvel(self, to_numpy: bool = True):
@@ -400,6 +412,18 @@ class HumanoidVerseVectorEnv(VectorEnv):
             mujoco_qpos = mujoco_qpos.cpu().numpy()
             mujoco_qvel = mujoco_qvel.cpu().numpy()
         return mujoco_qpos, mujoco_qvel
+
+    def _get_right_hand_pose(self, to_numpy: bool = True):
+        if not self.include_right_hand_pose:
+            return None
+        if self.right_hand_body_idx is None:
+            raise ValueError("right_hand_body_idx was not initialized.")
+        right_hand_pos = self._env.simulator._rigid_body_pos[:, self.right_hand_body_idx].clone().detach()
+        right_hand_rot = self._env.simulator._rigid_body_rot[:, self.right_hand_body_idx].clone().detach()
+        right_hand_pose = torch.cat([right_hand_pos, right_hand_rot], dim=-1)
+        if to_numpy:
+            right_hand_pose = right_hand_pose.cpu().numpy()
+        return right_hand_pose
 
     def _get_g1env_observation(self, to_numpy: bool = True):
         """Turn current Isaac sim state into a G1Env-like observation."""
@@ -469,6 +493,7 @@ class HumanoidVerseVectorEnv(VectorEnv):
         actions = {"actions": actions}
         _, reward, reset, new_info = self.base_env.step(actions)
         qpos, qvel = self._get_qpos_qvel(to_numpy=to_numpy)
+        right_hand_pose = self._get_right_hand_pose(to_numpy=to_numpy)
         # handle the reset logic
         reset = reset.bool()
         env_to_reset = reset.nonzero(as_tuple=False).flatten()  # this is used only for history
@@ -490,6 +515,8 @@ class HumanoidVerseVectorEnv(VectorEnv):
             truncated = truncated.cpu().numpy()
         new_info["qpos"] = qpos
         new_info["qvel"] = qvel
+        if right_hand_pose is not None:
+            new_info["right_hand_pose"] = right_hand_pose
         return observation, reward, terminated, truncated, new_info
 
     def close(self):
@@ -595,6 +622,8 @@ class HumanoidVerseIsaacConfig(BaseConfig):
     included_dr_obs_names: tp.List[str] | None = None
     include_history_actor: bool = False
     include_history_noaction: bool = False
+    include_right_hand_pose: bool = False
+    right_hand_body_name: str = "right_wrist_roll_link"
 
     make_config_g1env_compatible: bool = False
 
@@ -724,6 +753,8 @@ class HumanoidVerseIsaacConfig(BaseConfig):
             context_length=self.context_length,
             include_history_actor=self.include_history_actor,
             include_history_noaction=self.include_history_noaction,
+            include_right_hand_pose=self.include_right_hand_pose,
+            right_hand_body_name=self.right_hand_body_name,
         )
 
         env._creation_config = self

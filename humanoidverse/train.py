@@ -113,6 +113,8 @@ class TrainConfig(BaseConfig):
     # misc
     load_isaac_expert_data: bool = True
     buffer_device: str = "cpu"
+    include_right_hand_pose: bool = True
+    right_hand_pose_key: str = "right_hand_pose"
     # Default to True; otherwise you will spam the console with tqdm
     disable_tqdm: bool = True
 
@@ -294,6 +296,8 @@ class Workspace:
         else:
             if self.cfg.use_trajectory_buffer:
                 output_key_t = ["observation", "action", "z", "terminated", "truncated", "step_count", "reward"]
+                if self.cfg.include_right_hand_pose:
+                    output_key_t.append(self.cfg.right_hand_pose_key)
                 # TODO this interface should be more elegant (how to inform buffer what keys are coming in / need to be sampled?)
                 if isinstance(self.cfg.agent, (FBcprAuxAgentConfig)):
                     output_key_t.append("aux_rewards")
@@ -304,7 +308,7 @@ class Workspace:
                     n_dim=2,
                     end_key="truncated",
                     output_key_t=output_key_t,  # TODO(team): fix this. in principle we could avoid to sample qpos, qvel for training but we need them for reward evaluation
-                    output_key_tp1=["observation", "terminated"],
+                    output_key_tp1=["observation", "terminated"] + ([self.cfg.right_hand_pose_key] if self.cfg.include_right_hand_pose else []),
                 )
             else:
                 replay_buffer["train"] = DictBuffer(capacity=self.cfg.buffer_size, device=self.cfg.buffer_device)
@@ -441,6 +445,8 @@ class Workspace:
                         "step_count": step_count[None, ..., None],
                         "reward": new_reward[None, ..., None],
                     }
+                    if self.cfg.include_right_hand_pose and self.cfg.right_hand_pose_key in info:
+                        data[self.cfg.right_hand_pose_key] = info[self.cfg.right_hand_pose_key][None, ...]
                     data["observation"].pop("history", None)
                     if context is not None:
                         data["z"] = context[None, ...]
@@ -473,6 +479,9 @@ class Workspace:
                             "truncated": new_truncated[indexes].reshape(-1, 1),
                         },
                     }
+                    if self.cfg.include_right_hand_pose and self.cfg.right_hand_pose_key in info and self.cfg.right_hand_pose_key in new_info:
+                        data[self.cfg.right_hand_pose_key] = info[self.cfg.right_hand_pose_key][indexes]
+                        data["next"][self.cfg.right_hand_pose_key] = new_info[self.cfg.right_hand_pose_key][indexes]
                     data["observation"].pop("history", None)
                     if context is not None:
                         data["z"] = context[indexes]
@@ -602,6 +611,9 @@ def train_bfm_zero():
                     name='FBcprAuxModelArchiConfig',
                     z_dim=256,
                     norm_z=True,
+                    right_hand_z_start=0,
+                    right_hand_z_dim=32,
+                    z_norm_mode='per_part',
                     f=ForwardArchiConfig(name='ForwardArchi', hidden_dim=2048, model='residual', hidden_layers=6, embedding_layers=2, num_parallel=2, ensemble_mode='batch', input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state', 'last_action', 'history_actor'])),
                     b=BackwardArchiConfig(name='BackwardArchi', hidden_dim=256, hidden_layers=1, norm=True, input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'privileged_state'])),
                     actor=ActorArchiConfig(name='actor', model='residual', hidden_dim=2048, hidden_layers=6, embedding_layers=2, input_filter=DictInputFilterConfig(name='DictInputFilterConfig', key=['state', 'last_action', 'history_actor'])),
@@ -659,7 +671,13 @@ def train_bfm_zero():
                 weight_decay_discriminator=0.0,
                 lr_aux_critic=0.0003,
                 reg_coeff_aux=0.02,
-                aux_critic_pessimism_penalty=0.5
+                    aux_critic_pessimism_penalty=0.5,
+                    enable_right_hand_pose_loss=True,
+                    right_hand_pose_loss_coef=1.0,
+                    right_hand_pos_coef=1.0,
+                    right_hand_rot_coef=0.3,
+                    enable_part_orth_loss=True,
+                    part_orth_loss_coef=1.0
             ),
             aux_rewards=['penalty_torques', 'penalty_action_rate', 'limits_dof_pos', 'limits_torque', 'penalty_undesired_contact', 'penalty_feet_ori', 'penalty_ankle_roll', 'penalty_slippage'],
             aux_rewards_scaling={'penalty_action_rate': -0.1, 'penalty_feet_ori': -0.4, 'penalty_ankle_roll': -4.0, 'limits_dof_pos': -10.0, 'penalty_slippage': -2.0, 'penalty_undesired_contact': -1.0, 'penalty_torques': 0.0, 'limits_torque': 0.0},
@@ -686,6 +704,8 @@ def train_bfm_zero():
             included_dr_obs_names=None,
             include_history_actor=True,
             include_history_noaction=False,
+            include_right_hand_pose=True,
+            right_hand_body_name='right_wrist_roll_link',
             make_config_g1env_compatible=False,
             root_height_obs=True
         ),
@@ -699,7 +719,7 @@ def train_bfm_zero():
         num_agent_updates=16,
         checkpoint_every_steps=9600000,
         checkpoint_buffer=True,
-        prioritization=True,
+        prioritization=False,
         prioritization_min_val=0.5,
         prioritization_max_val=2.0,
         prioritization_scale=2.0,
@@ -712,6 +732,8 @@ def train_bfm_zero():
         wandb_pname='bfmzero-isaac',  # your wandb project name
         load_isaac_expert_data=True,
         buffer_device='cuda',
+        include_right_hand_pose=True,
+        right_hand_pose_key='right_hand_pose',
         disable_tqdm=True,
         evaluations=[HumanoidVerseIsaacTrackingEvaluationConfig(name='HumanoidVerseIsaacTrackingEvaluationConfig', generate_videos=False, videos_dir='videos', video_name_prefix='unknown_agent', name_in_logs='humanoidverse_tracking_eval', env=None, num_envs=1024, n_episodes_per_motion=1)],
         eval_every_steps=9600000,

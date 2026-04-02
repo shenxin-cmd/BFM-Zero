@@ -176,6 +176,8 @@ class FBcprAgent(FBAgent):
             train_batch["action"].to(self.device),
             tree_map(lambda x: x.to(self.device), train_batch["next"]["observation"]),
         )
+        right_hand_pose = train_batch.get("right_hand_pose", None)
+        next_right_hand_pose = train_batch.get("next", {}).get("right_hand_pose", None)
         discount = self.cfg.train.discount * ~train_batch["next"]["terminated"].to(self.device)
         expert_obs, expert_next_obs = (
             tree_map(lambda x: x.to(self.device), expert_batch["observation"]),
@@ -227,6 +229,8 @@ class FBcprAgent(FBAgent):
                 next_obs=train_next_obs,
                 goal=train_next_obs,
                 z=train_z,
+                right_hand_pose=right_hand_pose,
+                next_right_hand_pose=next_right_hand_pose,
                 q_loss_coef=q_loss_coef,
                 clip_grad_norm=clip_grad_norm,
             )
