@@ -14,7 +14,7 @@ obs:
       history_actor,
       max_local_self,
     ]
-
+  
     critic_obs: [
       max_local_self
     ]

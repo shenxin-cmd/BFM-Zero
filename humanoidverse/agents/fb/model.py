@@ -162,6 +162,23 @@ class FBModel(BaseModel):
             "rest": torch.cat([z[..., :right_start], z[..., right_end:]], dim=-1),
         }
 
+    def merge_z(self, parts: dict[str, torch.Tensor]) -> torch.Tensor:
+        right_start = self.cfg.archi.right_hand_z_start
+        right_dim = self.cfg.archi.right_hand_z_dim
+        right_end = right_start + right_dim
+        z_dim = self.cfg.archi.z_dim
+
+        z_right = parts["right_hand"]
+        z_rest = parts["rest"]
+        if z_right.shape[-1] != right_dim:
+            raise ValueError(f"right_hand part dim mismatch: expected {right_dim}, got {z_right.shape[-1]}")
+        if z_rest.shape[-1] != (z_dim - right_dim):
+            raise ValueError(f"rest part dim mismatch: expected {z_dim - right_dim}, got {z_rest.shape[-1]}")
+        if z_right.shape[:-1] != z_rest.shape[:-1]:
+            raise ValueError("right_hand and rest parts must have matching batch dimensions.")
+
+        return torch.cat([z_rest[..., :right_start], z_right, z_rest[..., right_start:]], dim=-1)
+
     def act(self, obs: torch.Tensor | dict[str, torch.Tensor], z: torch.Tensor, mean: bool = True) -> torch.Tensor:
         dist = self.actor(obs, z, self.cfg.actor_std)
         if mean:
