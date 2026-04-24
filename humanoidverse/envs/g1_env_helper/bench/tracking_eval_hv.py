@@ -158,11 +158,7 @@ def _async_tracking_worker(inputs, env, disable_tqdm: bool = False):
     # Precompute context and target states per motion
     for m_id in motion_ids.tolist():
         tracking_target, tracking_target_dict = get_backward_observation(env, m_id)
-        z = agent.model.backward_map(tracking_target)
-        for step in range(z.shape[0]):
-            end_idx = min(step + 1, z.shape[0])
-            z[step] = z[step:end_idx].mean(dim=0)
-        ctx = agent.model.project_z(z)
+        ctx = agent.model.tracking_inference(tracking_target)
         ctx_dict[m_id] = ctx
         tracking_targets[m_id] = tracking_target.cpu()
         # import ipdb; ipdb.set_trace()

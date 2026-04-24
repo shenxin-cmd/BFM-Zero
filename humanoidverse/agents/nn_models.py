@@ -195,9 +195,26 @@ class BackwardArchiConfig(BaseConfig):
     hidden_layers: int = 2
     norm: bool = True
     input_filter: NNFilter = IdentityInputFilterConfig()
+    z_hand_dim: int = 0
+    hand_hidden_dim: int | None = None
+    hand_hidden_layers: int | None = None
+    hand_input_filter: NNFilter = IdentityInputFilterConfig()
+    z_hand_scale: float = 1.0
 
     def build(self, obs_space, z_dim: int):
+        if self.z_hand_dim > 0:
+            return StructuredBackwardMap(obs_space, z_dim, self)
         return BackwardMap(obs_space, z_dim, self)
+
+
+def _build_backward_net(input_dim: int, hidden_dim: int, hidden_layers: int, output_dim: int, norm: bool) -> nn.Sequential:
+    seq = [nn.Linear(input_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.Tanh()]
+    for _ in range(hidden_layers - 1):
+        seq += [nn.Linear(hidden_dim, hidden_dim), nn.ReLU()]
+    seq += [nn.Linear(hidden_dim, output_dim)]
+    if norm:
+        seq += [Norm()]
+    return nn.Sequential(*seq)
 
 
 class BackwardMap(nn.Module):
@@ -212,17 +229,84 @@ class BackwardMap(nn.Module):
             f"filtered_space must be a Box space, got {type(filtered_space)}. Did you forget to set input_filter?"
         )
         assert len(filtered_space.shape) == 1, "filtered_space must have a 1D shape"
-        seq = [nn.Linear(filtered_space.shape[0], cfg.hidden_dim), nn.LayerNorm(cfg.hidden_dim), nn.Tanh()]
-        for _ in range(cfg.hidden_layers - 1):
-            seq += [nn.Linear(cfg.hidden_dim, cfg.hidden_dim), nn.ReLU()]
-        seq += [nn.Linear(cfg.hidden_dim, z_dim)]
-        if cfg.norm:
-            seq += [Norm()]
-        self.net = nn.Sequential(*seq)
+        self.net = _build_backward_net(
+            input_dim=filtered_space.shape[0],
+            hidden_dim=cfg.hidden_dim,
+            hidden_layers=cfg.hidden_layers,
+            output_dim=z_dim,
+            norm=cfg.norm,
+        )
 
     def forward(self, x: torch.Tensor | dict[str, torch.Tensor]) -> torch.Tensor:
         x = self.input_filter(x)
         return self.net(x)
+
+
+class StructuredBackwardMap(nn.Module):
+    def __init__(self, obs_space, z_dim, cfg: BackwardArchiConfig) -> None:
+        super().__init__()
+        if cfg.z_hand_dim <= 0:
+            raise ValueError("StructuredBackwardMap requires z_hand_dim > 0.")
+        if cfg.z_hand_dim >= z_dim:
+            raise ValueError(f"z_hand_dim must be smaller than z_dim, got {cfg.z_hand_dim} >= {z_dim}.")
+        if cfg.z_hand_scale <= 0:
+            raise ValueError(f"z_hand_scale must be positive, got {cfg.z_hand_scale}.")
+
+        self.cfg: BackwardArchiConfig = cfg
+        self.z_hand_dim = cfg.z_hand_dim
+        self.z_body_dim = z_dim - cfg.z_hand_dim
+        self.z_hand_scale = cfg.z_hand_scale
+
+        self.body_input_filter = cfg.input_filter.build(obs_space)
+        self.hand_input_filter = cfg.hand_input_filter.build(obs_space)
+        body_space = self.body_input_filter.output_space
+        hand_space = self.hand_input_filter.output_space
+
+        assert isinstance(body_space, gymnasium.spaces.Box), (
+            f"body_space must be a Box space, got {type(body_space)}. Did you forget to set input_filter?"
+        )
+        assert isinstance(hand_space, gymnasium.spaces.Box), (
+            f"hand_space must be a Box space, got {type(hand_space)}. Did you forget to set hand_input_filter?"
+        )
+        assert len(body_space.shape) == 1, "body_space must have a 1D shape"
+        assert len(hand_space.shape) == 1, "hand_space must have a 1D shape"
+
+        hand_hidden_dim = cfg.hand_hidden_dim or cfg.hidden_dim
+        hand_hidden_layers = cfg.hand_hidden_layers or cfg.hidden_layers
+        self.body_net = _build_backward_net(
+            input_dim=body_space.shape[0],
+            hidden_dim=cfg.hidden_dim,
+            hidden_layers=cfg.hidden_layers,
+            output_dim=self.z_body_dim,
+            norm=cfg.norm,
+        )
+        self.hand_net = _build_backward_net(
+            input_dim=hand_space.shape[0],
+            hidden_dim=hand_hidden_dim,
+            hidden_layers=hand_hidden_layers,
+            output_dim=self.z_hand_dim,
+            norm=False,
+        )
+
+    def encode_hand(self, z_hand: torch.Tensor) -> torch.Tensor:
+        return z_hand * self.z_hand_scale
+
+    def decode_hand(self, z_hand: torch.Tensor) -> torch.Tensor:
+        return z_hand / self.z_hand_scale
+
+    def merge_components(self, z_hand: torch.Tensor, z_body: torch.Tensor, z_hand_encoded: bool = False) -> torch.Tensor:
+        if not z_hand_encoded:
+            z_hand = self.encode_hand(z_hand)
+        return torch.cat([z_hand, z_body], dim=-1)
+
+    def forward_components(self, x: torch.Tensor | dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        z_hand = self.hand_net(self.hand_input_filter(x))
+        z_body = self.body_net(self.body_input_filter(x))
+        return z_hand, z_body
+
+    def forward(self, x: torch.Tensor | dict[str, torch.Tensor]) -> torch.Tensor:
+        z_hand, z_body = self.forward_components(x)
+        return self.merge_components(z_hand, z_body)
 
 
 def simple_embedding(input_dim, hidden_dim, hidden_layers, num_parallel=1):

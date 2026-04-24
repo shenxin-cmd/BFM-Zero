@@ -20,6 +20,7 @@ class FBcprModelArchiConfig(FBModelArchiConfig):
     discriminator: DiscriminatorArchiConfig | DiscriminatorFilterArchiConfig = pydantic.Field(
         DiscriminatorArchiConfig(), discriminator="name"
     )
+    discriminator_use_z_body_only: bool = False
 
 
 class FBcprModelConfig(FBModelConfig):
@@ -38,7 +39,8 @@ class FBcprModel(FBModel):
         super().__init__(obs_space, action_dim, cfg)
         # For IDEs
         self.cfg: FBcprModelConfig = cfg
-        self._discriminator = cfg.archi.discriminator.build(obs_space, cfg.archi.z_dim)
+        discriminator_z_dim = self.z_body_dim if cfg.archi.discriminator_use_z_body_only and self.has_structured_z else cfg.archi.z_dim
+        self._discriminator = cfg.archi.discriminator.build(obs_space, discriminator_z_dim)
         self._critic = cfg.archi.critic.build(obs_space, cfg.archi.z_dim, action_dim, output_dim=1)
 
         # make sure the model is in eval mode and never computes gradients
@@ -58,4 +60,9 @@ class FBcprModel(FBModel):
     @torch.no_grad()
     def discriminator(self, obs: torch.Tensor | dict[str, torch.Tensor], z: torch.Tensor):
         with autocast(device_type=self.device, dtype=self.amp_dtype, enabled=self.cfg.amp):
-            return self._discriminator(self._normalize(obs), z)
+            return self._discriminator(self._normalize(obs), self.discriminator_z(z))
+
+    def discriminator_z(self, z: torch.Tensor) -> torch.Tensor:
+        if self.cfg.archi.discriminator_use_z_body_only and self.has_structured_z:
+            return self.extract_z_body(z)
+        return z

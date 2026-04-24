@@ -42,6 +42,8 @@ class FBAgentTrainConfig(BaseConfig):
     rollout_expert_trajectories: bool = False
     rollout_expert_trajectories_length: int = 250
     rollout_expert_trajectories_percentage: float = 0.25
+    anchor_coef: float = 0.0
+    hand_body_ortho_coef: float = 0.0
 
 
 class FBAgentConfig(BaseConfig):
@@ -153,9 +155,20 @@ class FBAgent:
                 perm = torch.randperm(self.cfg.train.batch_size, device=self.device)
                 train_goal = tree_map(lambda x: x[perm], train_goal)
                 goals = self._model._backward_map(train_goal)
-                goals = self._model.project_z(goals)
-                mask = torch.rand((self.cfg.train.batch_size, 1), device=self.device) < self.cfg.train.train_goal_ratio
-                z = torch.where(mask, goals, z)
+                if self._model.has_structured_z:
+                    random_hand = self._model.extract_z_hand(z)
+                    random_body = self._model.extract_z_body(z)
+                    goal_hand = self._model.extract_z_hand(goals)
+                    goal_body = self._model.extract_z_body(goals)
+                    hand_mask = torch.rand((self.cfg.train.batch_size, 1), device=self.device) < self.cfg.train.train_goal_ratio
+                    body_mask = torch.rand((self.cfg.train.batch_size, 1), device=self.device) < self.cfg.train.train_goal_ratio
+                    mixed_hand = torch.where(hand_mask, goal_hand, random_hand)
+                    mixed_body = torch.where(body_mask, goal_body, random_body)
+                    z = self._model.merge_z(mixed_hand, mixed_body, z_hand_encoded=True)
+                else:
+                    goals = self._model.project_z(goals)
+                    mask = torch.rand((self.cfg.train.batch_size, 1), device=self.device) < self.cfg.train.train_goal_ratio
+                    z = torch.where(mask, goals, z)
         return z
 
     def update(self, replay_buffer, step: int) -> Dict[str, torch.Tensor]:
@@ -168,6 +181,7 @@ class FBAgent:
             batch["next"]["terminated"],
         )
         discount = self.cfg.train.discount * ~terminated
+        hand_target = self._model.extract_hand_pos(next_obs) if self._model.has_structured_z else None
 
         self._model._obs_normalizer(obs)
         self._model._obs_normalizer(next_obs)
@@ -191,6 +205,7 @@ class FBAgent:
             z=z,
             q_loss_coef=q_loss_coef,
             clip_grad_norm=clip_grad_norm,
+            hand_target=hand_target,
         )
         metrics.update(
             self.update_actor(
@@ -223,6 +238,7 @@ class FBAgent:
         z: torch.Tensor,
         q_loss_coef: float | None,
         clip_grad_norm: float | None,
+        hand_target: torch.Tensor | None = None,
     ) -> Dict[str, torch.Tensor]:
         with autocast(device_type=self.device, dtype=self._model.amp_dtype, enabled=self.cfg.model.amp):
             with torch.no_grad():
@@ -250,6 +266,20 @@ class FBAgent:
             orth_loss_offdiag = 0.5 * (Cov * self.off_diag).pow(2).sum() / self.off_diag_sum
             orth_loss = orth_loss_offdiag + orth_loss_diag
             fb_loss += self.cfg.train.ortho_coef * orth_loss
+
+            anchor_loss = torch.zeros(1, device=z.device, dtype=z.dtype)
+            hand_body_ortho_loss = torch.zeros(1, device=z.device, dtype=z.dtype)
+            if self._model.has_structured_z:
+                pred_hand, pred_body = self._model.backward_components(goal)
+                if hand_target is None:
+                    raise ValueError("Structured z training requires hand_target during update_fb.")
+                anchor_loss = F.mse_loss(pred_hand, hand_target)
+                pred_hand_centered = pred_hand - pred_hand.mean(dim=0, keepdim=True)
+                pred_body_centered = pred_body - pred_body.mean(dim=0, keepdim=True)
+                cross_cov = pred_hand_centered.T @ pred_body_centered / max(pred_hand.shape[0] - 1, 1)
+                hand_body_ortho_loss = cross_cov.pow(2).mean()
+                fb_loss += self.cfg.train.anchor_coef * anchor_loss
+                fb_loss += self.cfg.train.hand_body_ortho_coef * hand_body_ortho_loss
 
             q_loss = torch.zeros(1, device=z.device, dtype=z.dtype)
             if q_loss_coef is not None:
@@ -292,6 +322,8 @@ class FBAgent:
                 "orth_loss": orth_loss,
                 "orth_loss_diag": orth_loss_diag,
                 "orth_loss_offdiag": orth_loss_offdiag,
+                "anchor_loss": anchor_loss,
+                "hand_body_ortho_loss": hand_body_ortho_loss,
                 "q_loss": q_loss,
             }
         return output_metrics
@@ -345,11 +377,22 @@ class FBAgent:
     def _sample_tracking_z(self, replay_buffer, batch_dim, traj_length):
         batch = replay_buffer["expert_slicer"].sample(batch_dim * traj_length, seq_length=traj_length)  # N*T x obs_dim
         z = self._model.backward_map(batch["next"]["observation"])  # NT x z_dim
+        if not self._model.has_structured_z:
+            z = z.view(batch_dim, traj_length, z.shape[-1])  # N x T x z_dim
+            for step in range(traj_length):
+                end_idx = min(step + self.cfg.model.seq_length, traj_length)
+                z[:, step] = z[:, step:end_idx].mean(dim=1)
+            return self._model.project_z(z)  # N x T x z_dim
+
         z = z.view(batch_dim, traj_length, z.shape[-1])  # N x T x z_dim
+        z_hand = self._model.extract_z_hand(z)
+        z_body = self._model.extract_z_body(z)
+        z_body = z_body.clone()
         for step in range(traj_length):
             end_idx = min(step + self.cfg.model.seq_length, traj_length)
-            z[:, step] = z[:, step:end_idx].mean(dim=1)
-        return self._model.project_z(z)  # N x T x z_dim
+            z_body[:, step] = z_body[:, step:end_idx].mean(dim=1)
+        z_body = self._model.project_z_body(z_body)
+        return self._model.merge_z(z_hand, z_body, z_hand_encoded=True)
 
     def maybe_update_rollout_context(self, z: torch.Tensor | None, step_count: torch.Tensor, replay_buffer: None = None) -> torch.Tensor:
         # get mask for environmets where we need to change z

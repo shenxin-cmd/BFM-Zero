@@ -90,6 +90,7 @@ class FBcprAuxAgent(FBcprAgent):
             tree_map(lambda x: x.to(self.device), train_batch["next"]["observation"]),
         )
         discount = self.cfg.train.discount * ~train_batch["next"]["terminated"].to(self.device)
+        hand_target = self._model.extract_hand_pos(train_next_obs) if self._model.has_structured_z else None
         expert_obs, expert_next_obs = (
             tree_map(lambda x: x.to(self.device), expert_batch["observation"]),
             tree_map(lambda x: x.to(self.device), expert_batch["next"]["observation"]),
@@ -142,6 +143,7 @@ class FBcprAuxAgent(FBcprAgent):
                 z=train_z,
                 q_loss_coef=q_loss_coef,
                 clip_grad_norm=clip_grad_norm,
+                hand_target=hand_target,
             )
         )
         metrics.update(

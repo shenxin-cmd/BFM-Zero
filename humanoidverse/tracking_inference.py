@@ -67,11 +67,7 @@ def main(model_folder: Path, data_path: Path | None = None, headless: bool = Tru
     print(f"Exported model to {output_dir}/{model_name}.onnx")
 
     def tracking_inference(obs) -> torch.Tensor:
-        z = model.backward_map(obs)
-        for step in range(z.shape[0]):
-            end_idx = min(step + 1, z.shape[0])
-            z[step] = z[step:end_idx].mean(dim=0)
-        return model.project_z(z)
+        return model.tracking_inference(obs)
 
     # rgb_renderer = IsaacRendererWithMuJoco(render_size=256)
     env_cfg = HumanoidVerseIsaacConfig(**config["env"])

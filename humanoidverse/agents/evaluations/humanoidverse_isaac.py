@@ -420,11 +420,7 @@ def _async_tracking_worker(
     for m_id in motion_ids:
         tracking_target, tracking_target_dict = get_backward_observation(env._env, m_id, include_last_action=env.include_last_action)
         # first z should try to reach the next state, ie 1:
-        z = model.backward_map(tree_map(lambda x: x[1:], tracking_target)).clone()
-        for step in range(z.shape[0]):
-            end_idx = min(step + 1, z.shape[0])
-            z[step] = z[step:end_idx].mean(dim=0)
-        ctx = model.project_z(z)
+        ctx = model.tracking_inference(tree_map(lambda x: x[1:], tracking_target)).clone()
         ctx_dict[m_id] = ctx
         tracking_targets[m_id] = tree_map(lambda x: x.cpu(), tracking_target)
         tracking_joint_pos[m_id] = tracking_target_dict["dof_pos"].clone()

@@ -140,12 +140,32 @@ class FBcprAgent(FBAgent):
             perm = torch.randperm(self.cfg.train.batch_size, device=self.device)
             train_goal = tree_map(lambda x: x[perm], train_goal)
             goals = self._model._backward_map(train_goal)
-            goals = self._model.project_z(goals)
-            z = torch.where(mix_idxs == 0, goals, z)
+            if self._model.has_structured_z:
+                random_hand = self._model.extract_z_hand(z)
+                random_body = self._model.extract_z_body(z)
+                goal_hand = self._model.extract_z_hand(goals)
+                goal_body = self._model.extract_z_body(goals)
+                expert_hand = self._model.extract_z_hand(expert_encodings[perm])
+                expert_body = self._model.extract_z_body(expert_encodings[perm])
+
+                hand_mix_idxs = torch.multinomial(prob, num_samples=self.cfg.train.batch_size, replacement=True).reshape(-1, 1)
+                body_mix_idxs = torch.multinomial(prob, num_samples=self.cfg.train.batch_size, replacement=True).reshape(-1, 1)
+
+                mixed_hand = torch.where(hand_mix_idxs == 0, goal_hand, random_hand)
+                mixed_hand = torch.where(hand_mix_idxs == 1, expert_hand, mixed_hand)
+
+                mixed_body = torch.where(body_mix_idxs == 0, goal_body, random_body)
+                mixed_body = torch.where(body_mix_idxs == 1, expert_body, mixed_body)
+
+                z = self._model.merge_z(mixed_hand, mixed_body, z_hand_encoded=True)
+            else:
+                goals = self._model.project_z(goals)
+                z = torch.where(mix_idxs == 0, goals, z)
 
             # zs obtained by encoding expert trajectories
-            perm = torch.randperm(self.cfg.train.batch_size, device=self.device)
-            z = torch.where(mix_idxs == 1, expert_encodings[perm], z)
+            if not self._model.has_structured_z:
+                perm = torch.randperm(self.cfg.train.batch_size, device=self.device)
+                z = torch.where(mix_idxs == 1, expert_encodings[perm], z)
 
         return z
 
@@ -157,14 +177,23 @@ class FBcprAgent(FBAgent):
         # encode expert trajectories through B
         with autocast(device_type=self.device, dtype=self._model.amp_dtype, enabled=self.cfg.model.amp):
             B_expert = self._model._backward_map(next_obs).detach()  # batch x d
-            B_expert = B_expert.view(
-                self.cfg.train.batch_size // self.cfg.model.seq_length,
-                self.cfg.model.seq_length,
-                B_expert.shape[-1],
-            )  # N x L x d
-            z_expert = B_expert.mean(dim=1)  # N x d
-            z_expert = self._model.project_z(z_expert)
-            z_expert = torch.repeat_interleave(z_expert, self.cfg.model.seq_length, dim=0)  # batch x d
+            if self._model.has_structured_z:
+                batch_dim = self.cfg.train.batch_size // self.cfg.model.seq_length
+                z_hand = self._model.extract_z_hand(B_expert)
+                z_body = self._model.extract_z_body(B_expert)
+                z_body = z_body.view(batch_dim, self.cfg.model.seq_length, z_body.shape[-1]).mean(dim=1)
+                z_body = self._model.project_z_body(z_body)
+                z_body = torch.repeat_interleave(z_body, self.cfg.model.seq_length, dim=0)
+                z_expert = self._model.merge_z(z_hand, z_body, z_hand_encoded=True)
+            else:
+                B_expert = B_expert.view(
+                    self.cfg.train.batch_size // self.cfg.model.seq_length,
+                    self.cfg.model.seq_length,
+                    B_expert.shape[-1],
+                )  # N x L x d
+                z_expert = B_expert.mean(dim=1)  # N x d
+                z_expert = self._model.project_z(z_expert)
+                z_expert = torch.repeat_interleave(z_expert, self.cfg.model.seq_length, dim=0)  # batch x d
         return z_expert
 
     def update(self, replay_buffer, step: int) -> Dict[str, torch.Tensor]:
@@ -177,6 +206,7 @@ class FBcprAgent(FBAgent):
             tree_map(lambda x: x.to(self.device), train_batch["next"]["observation"]),
         )
         discount = self.cfg.train.discount * ~train_batch["next"]["terminated"].to(self.device)
+        hand_target = self._model.extract_hand_pos(train_next_obs) if self._model.has_structured_z else None
         expert_obs, expert_next_obs = (
             tree_map(lambda x: x.to(self.device), expert_batch["observation"]),
             tree_map(lambda x: x.to(self.device), expert_batch["next"]["observation"]),
@@ -229,6 +259,7 @@ class FBcprAgent(FBAgent):
                 z=train_z,
                 q_loss_coef=q_loss_coef,
                 clip_grad_norm=clip_grad_norm,
+                hand_target=hand_target,
             )
         )
         metrics.update(
@@ -339,15 +370,17 @@ class FBcprAgent(FBAgent):
         grad_penalty: float | None,
     ) -> Dict[str, torch.Tensor]:
         with autocast(device_type=self.device, dtype=self._model.amp_dtype, enabled=self.cfg.model.amp):
-            expert_logits = self._model._discriminator.compute_logits(obs=expert_obs, z=expert_z)
-            unlabeled_logits = self._model._discriminator.compute_logits(obs=train_obs, z=train_z)
+            expert_disc_z = self._model.discriminator_z(expert_z)
+            train_disc_z = self._model.discriminator_z(train_z)
+            expert_logits = self._model._discriminator.compute_logits(obs=expert_obs, z=expert_disc_z)
+            unlabeled_logits = self._model._discriminator.compute_logits(obs=train_obs, z=train_disc_z)
             # these are equivalent to binary cross entropy
             expert_loss = -torch.nn.functional.logsigmoid(expert_logits)
             unlabeled_loss = torch.nn.functional.softplus(unlabeled_logits)
             loss = torch.mean(expert_loss + unlabeled_loss)
 
             if grad_penalty is not None:
-                wgan_gp = self.gradient_penalty_wgan(expert_obs, expert_z, train_obs, train_z)
+                wgan_gp = self.gradient_penalty_wgan(expert_obs, expert_disc_z, train_obs, train_disc_z)
                 loss += grad_penalty * wgan_gp
 
         self.discriminator_optimizer.zero_grad(set_to_none=True)
@@ -376,7 +409,7 @@ class FBcprAgent(FBAgent):
             num_parallel = self.cfg.model.archi.critic.num_parallel
             # compute target critic
             with torch.no_grad():
-                reward = self._model._discriminator.compute_reward(obs=obs, z=z)
+                reward = self._model._discriminator.compute_reward(obs=obs, z=self._model.discriminator_z(z))
                 dist = self._model._actor(next_obs, z, self._model.cfg.actor_std)
                 next_action = dist.sample(clip=self.cfg.train.stddev_clip)
                 next_Qs = self._model._target_critic(next_obs, z, next_action)  # num_parallel x batch x 1
