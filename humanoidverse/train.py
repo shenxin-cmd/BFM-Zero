@@ -696,7 +696,7 @@ def train_bfm_zero():
             make_config_g1env_compatible=False,
             root_height_obs=True
         ),
-        work_dir='results/bfmzero-isaac',
+        work_dir='results/bfmzero-isaac-rhand',
         seed=4728,
         online_parallel_envs=1024,
         log_every_updates=384000,
