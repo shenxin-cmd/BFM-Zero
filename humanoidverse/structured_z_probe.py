@@ -7,6 +7,7 @@ from typing import Any
 
 import joblib
 import mediapy as media
+import mujoco
 import numpy as np
 import torch
 
@@ -40,6 +41,93 @@ def _default_deltas() -> list[np.ndarray]:
         (0.08, 0.0, 0.0),
     ]
     return [np.asarray(v, dtype=np.float32) for v in raw]
+
+
+def _quat_wxyz_to_xyzw(quat_wxyz: np.ndarray) -> np.ndarray:
+    return np.asarray([quat_wxyz[1], quat_wxyz[2], quat_wxyz[3], quat_wxyz[0]], dtype=np.float32)
+
+
+def _quat_rotate_vec_xyzw(quat_xyzw: np.ndarray, vec: np.ndarray) -> np.ndarray:
+    q = torch.tensor(quat_xyzw, dtype=torch.float32).view(1, 4)
+    v = torch.tensor(vec, dtype=torch.float32).view(1, 3)
+    return my_quat_rotate(q, v)[0].cpu().numpy()
+
+
+def _compute_world_target_from_local(base_qpos: np.ndarray, local_target: np.ndarray) -> np.ndarray:
+    root_pos = base_qpos[:3].astype(np.float32)
+    root_quat_xyzw = _quat_wxyz_to_xyzw(base_qpos[3:7].astype(np.float32))
+    return root_pos + _quat_rotate_vec_xyzw(root_quat_xyzw, local_target.astype(np.float32))
+
+
+def _make_front_camera(qpos: np.ndarray) -> mujoco.MjvCamera:
+    root_pos = qpos[:3].astype(np.float32)
+    root_quat_xyzw = _quat_wxyz_to_xyzw(qpos[3:7].astype(np.float32))
+    forward = _quat_rotate_vec_xyzw(root_quat_xyzw, np.array([1.0, 0.0, 0.0], dtype=np.float32))
+    camera = mujoco.MjvCamera()
+    camera.type = mujoco.mjtCamera.mjCAMERA_FREE
+    camera.lookat[:] = root_pos + np.array([0.0, 0.0, 0.80], dtype=np.float32)
+    camera.distance = 2.4
+    camera.azimuth = float(np.degrees(np.arctan2(forward[1], forward[0])) + 180.0)
+    camera.elevation = -18.0
+    return camera
+
+
+def _add_sphere_marker(renderer, position: np.ndarray, rgba: np.ndarray, radius: float = 0.05) -> None:
+    scene = renderer.scene
+    if scene.ngeom >= scene.maxgeom:
+        return
+    scene.ngeom += 1
+    mujoco.mjv_initGeom(
+        scene.geoms[scene.ngeom - 1],
+        mujoco.mjtGeom.mjGEOM_SPHERE,
+        np.array([radius, radius, radius], dtype=np.float32),
+        position.astype(np.float32),
+        np.eye(3, dtype=np.float32).reshape(-1),
+        rgba.astype(np.float32),
+    )
+
+
+def _render_qpos_with_camera(
+    renderer: IsaacRendererWithMuJoco,
+    qpos: np.ndarray,
+    camera: mujoco.MjvCamera,
+    marker_world: np.ndarray | None = None,
+    marker_rgba: np.ndarray | None = None,
+) -> np.ndarray:
+    mujoco_env = renderer.mujoco_env.unwrapped
+    qvel = mujoco_env._mj_data.qvel.copy()
+    renderer.mujoco_env.reset(options={"qpos": qpos, "qvel": qvel})
+    mujoco_env.renderer.update_scene(mujoco_env._mj_data, camera=camera)
+    if marker_world is not None:
+        rgba = marker_rgba if marker_rgba is not None else np.array([1.0, 0.15, 0.15, 1.0], dtype=np.float32)
+        _add_sphere_marker(mujoco_env.renderer, marker_world, rgba)
+    return mujoco_env.renderer.render().copy()
+
+
+def _estimate_foreground_mask(frame: np.ndarray) -> np.ndarray:
+    corners = np.concatenate(
+        [
+            frame[:20, :20].reshape(-1, 3),
+            frame[:20, -20:].reshape(-1, 3),
+            frame[-20:, :20].reshape(-1, 3),
+            frame[-20:, -20:].reshape(-1, 3),
+        ],
+        axis=0,
+    )
+    background = np.median(corners.astype(np.float32), axis=0)
+    diff = np.linalg.norm(frame.astype(np.float32) - background[None, None, :], axis=-1)
+    return diff > 28.0
+
+
+def _overlay_goal_frame(current_frame: np.ndarray, goal_frame: np.ndarray) -> np.ndarray:
+    mask = _estimate_foreground_mask(goal_frame)
+    tinted_goal = goal_frame.astype(np.float32).copy()
+    blue_tint = np.array([90.0, 185.0, 255.0], dtype=np.float32)
+    tinted_goal = 0.25 * tinted_goal + 0.75 * blue_tint
+    out = current_frame.astype(np.float32).copy()
+    alpha = 0.42
+    out[mask] = (1.0 - alpha) * out[mask] + alpha * tinted_goal[mask]
+    return np.clip(out, 0, 255).astype(np.uint8)
 
 
 def _load_model_and_env(
@@ -212,6 +300,11 @@ def _warmup_reset(wrapped_env) -> dict[str, torch.Tensor]:
     return observation
 
 
+def _get_current_qpos(wrapped_env) -> np.ndarray:
+    qpos, _ = wrapped_env._get_qpos_qvel(to_numpy=True)
+    return qpos[0].copy()
+
+
 def _run_rollout(
     wrapped_env,
     task_env,
@@ -224,12 +317,26 @@ def _run_rollout(
     save_mp4: bool,
     video_path: Path | None,
     renderer,
+    goal_qpos: np.ndarray | None,
+    goal_marker_world: np.ndarray | None,
 ):
     observation = _warmup_reset(wrapped_env)
     rollout_states = [_capture_state(task_env, group_info)]
     frames = []
     if renderer is not None:
-        frames.append(renderer.render(wrapped_env._env, 0)[0])
+        current_qpos = _get_current_qpos(wrapped_env)
+        camera = _make_front_camera(current_qpos)
+        current_frame = _render_qpos_with_camera(renderer, current_qpos, camera)
+        if goal_qpos is not None:
+            goal_frame = _render_qpos_with_camera(
+                renderer,
+                goal_qpos,
+                camera,
+                marker_world=goal_marker_world,
+                marker_rgba=np.array([1.0, 0.1, 0.1, 1.0], dtype=np.float32),
+            )
+            current_frame = _overlay_goal_frame(current_frame, goal_frame)
+        frames.append(current_frame)
 
     with torch.no_grad():
         for _ in range(episode_len):
@@ -237,7 +344,19 @@ def _run_rollout(
             observation, reward, terminated, truncated, info = wrapped_env.step(action, to_numpy=False)
             rollout_states.append(_capture_state(task_env, group_info))
             if renderer is not None:
-                frames.append(renderer.render(wrapped_env._env, 0)[0])
+                current_qpos = _get_current_qpos(wrapped_env)
+                camera = _make_front_camera(current_qpos)
+                current_frame = _render_qpos_with_camera(renderer, current_qpos, camera)
+                if goal_qpos is not None:
+                    goal_frame = _render_qpos_with_camera(
+                        renderer,
+                        goal_qpos,
+                        camera,
+                        marker_world=goal_marker_world,
+                        marker_rgba=np.array([1.0, 0.1, 0.1, 1.0], dtype=np.float32),
+                    )
+                    current_frame = _overlay_goal_frame(current_frame, goal_frame)
+                frames.append(current_frame)
 
     metrics = _compute_metrics(rollout_states, z_hand_target, group_info)
     if renderer is not None and video_path is not None:
@@ -288,6 +407,8 @@ def _run_probe_case(
     save_mp4: bool,
     episode_len: int,
     renderer,
+    goal_qpos: np.ndarray,
+    goal_marker_world: np.ndarray,
 ) -> dict[str, Any]:
     z_command = model.merge_z(
         torch.tensor(z_hand_target, device=model.device, dtype=torch.float32).unsqueeze(0),
@@ -306,6 +427,8 @@ def _run_probe_case(
         save_mp4=save_mp4,
         video_path=video_path,
         renderer=renderer,
+        goal_qpos=goal_qpos,
+        goal_marker_world=goal_marker_world,
     )
     _save_rollout_artifacts(
         output_dir=output_dir,
@@ -341,12 +464,14 @@ def _sweep_mode(
     base_hand = current_hand
     rows = []
     renderer = IsaacRendererWithMuJoco(render_size=256) if save_mp4 else None
+    base_qpos = _get_current_qpos(wrapped_env)
     print(f"Base z_hand target: {_format_vec3(base_hand)}")
     print(f"Base observed hand pose: {_format_vec3(current_hand)}")
     print(f"Base inferred hand pose: {_format_vec3(hand_base_from_obs)}")
 
     for idx, delta in enumerate(deltas):
         target_hand = base_hand + delta
+        goal_marker_world = _compute_world_target_from_local(base_qpos, target_hand)
         run_name = _slugify(f"{idx:03d}_delta_{delta[0]:+.3f}_{delta[1]:+.3f}_{delta[2]:+.3f}")
         print(f"\nRunning sweep case {idx + 1}/{len(deltas)} with delta {_format_vec3(delta)} -> target {_format_vec3(target_hand)}")
         row = _run_probe_case(
@@ -361,6 +486,8 @@ def _sweep_mode(
             save_mp4=save_mp4,
             episode_len=episode_len,
             renderer=renderer,
+            goal_qpos=base_qpos,
+            goal_marker_world=goal_marker_world,
         )
         row["delta_x"] = float(delta[0])
         row["delta_y"] = float(delta[1])
@@ -384,6 +511,7 @@ def _interactive_mode(
     rows = []
     run_idx = 0
     renderer = IsaacRendererWithMuJoco(render_size=256) if save_mp4 else None
+    base_qpos = _get_current_qpos(wrapped_env)
 
     print("Structured-z interactive probe")
     print(f"Base z_hand target: {_format_vec3(base_hand)}")
@@ -414,6 +542,7 @@ def _interactive_mode(
             run_label = f"{run_idx:03d}_delta_{delta[0]:+.3f}_{delta[1]:+.3f}_{delta[2]:+.3f}"
 
         run_name = _slugify(run_label)
+        goal_marker_world = _compute_world_target_from_local(base_qpos, target_hand)
         print(f"Running target {_format_vec3(target_hand)}")
         row = _run_probe_case(
             wrapped_env=wrapped_env,
@@ -427,6 +556,8 @@ def _interactive_mode(
             save_mp4=save_mp4,
             episode_len=episode_len,
             renderer=renderer,
+            goal_qpos=base_qpos,
+            goal_marker_world=goal_marker_world,
         )
         rows.append(row)
         run_idx += 1
