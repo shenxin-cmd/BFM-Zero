@@ -38,11 +38,6 @@ def _default_deltas() -> list[np.ndarray]:
     raw = [
         (0.0, 0.0, 0.0),
         (0.08, 0.0, 0.0),
-        (-0.08, 0.0, 0.0),
-        (0.0, 0.08, 0.0),
-        (0.0, -0.08, 0.0),
-        (0.0, 0.0, 0.08),
-        (0.0, 0.0, -0.08),
     ]
     return [np.asarray(v, dtype=np.float32) for v in raw]
 
@@ -210,6 +205,13 @@ def _save_rollout_artifacts(
     joblib.dump(payload, state_file)
 
 
+def _warmup_reset(wrapped_env) -> dict[str, torch.Tensor]:
+    observation = None
+    for _ in range(4):
+        observation, _ = wrapped_env.reset(to_numpy=False, reset_to_default_pose=True)
+    return observation
+
+
 def _run_rollout(
     wrapped_env,
     task_env,
@@ -221,18 +223,13 @@ def _run_rollout(
     episode_len: int,
     save_mp4: bool,
     video_path: Path | None,
+    renderer,
 ):
-    observation, _ = wrapped_env.reset(to_numpy=False, reset_to_default_pose=True)
+    observation = _warmup_reset(wrapped_env)
     rollout_states = [_capture_state(task_env, group_info)]
     frames = []
-    renderer = None
-    if save_mp4:
-        try:
-            renderer = IsaacRendererWithMuJoco(render_size=256)
-        except Exception as exc:
-            print(f"Video renderer initialization failed, continuing without mp4 export: {exc}")
     if renderer is not None:
-        frames.append(renderer.render(task_env, 0)[0])
+        frames.append(renderer.render(wrapped_env._env, 0)[0])
 
     with torch.no_grad():
         for _ in range(episode_len):
@@ -240,11 +237,7 @@ def _run_rollout(
             observation, reward, terminated, truncated, info = wrapped_env.step(action, to_numpy=False)
             rollout_states.append(_capture_state(task_env, group_info))
             if renderer is not None:
-                try:
-                    frames.append(renderer.render(task_env, 0)[0])
-                except Exception as exc:
-                    print(f"Video rendering failed during rollout, disabling mp4 export for this run: {exc}")
-                    renderer = None
+                frames.append(renderer.render(wrapped_env._env, 0)[0])
 
     metrics = _compute_metrics(rollout_states, z_hand_target, group_info)
     if renderer is not None and video_path is not None:
@@ -294,6 +287,7 @@ def _run_probe_case(
     z_hand_target: np.ndarray,
     save_mp4: bool,
     episode_len: int,
+    renderer,
 ) -> dict[str, Any]:
     z_command = model.merge_z(
         torch.tensor(z_hand_target, device=model.device, dtype=torch.float32).unsqueeze(0),
@@ -311,6 +305,7 @@ def _run_probe_case(
         episode_len=episode_len,
         save_mp4=save_mp4,
         video_path=video_path,
+        renderer=renderer,
     )
     _save_rollout_artifacts(
         output_dir=output_dir,
@@ -345,6 +340,7 @@ def _sweep_mode(
     z_body, hand_base_from_obs, current_hand = _prepare_base_context(wrapped_env, task_env, model, group_info)
     base_hand = current_hand
     rows = []
+    renderer = IsaacRendererWithMuJoco(render_size=256) if save_mp4 else None
     print(f"Base z_hand target: {_format_vec3(base_hand)}")
     print(f"Base observed hand pose: {_format_vec3(current_hand)}")
     print(f"Base inferred hand pose: {_format_vec3(hand_base_from_obs)}")
@@ -364,6 +360,7 @@ def _sweep_mode(
             z_hand_target=target_hand,
             save_mp4=save_mp4,
             episode_len=episode_len,
+            renderer=renderer,
         )
         row["delta_x"] = float(delta[0])
         row["delta_y"] = float(delta[1])
@@ -386,6 +383,7 @@ def _interactive_mode(
     base_hand = current_hand
     rows = []
     run_idx = 0
+    renderer = IsaacRendererWithMuJoco(render_size=256) if save_mp4 else None
 
     print("Structured-z interactive probe")
     print(f"Base z_hand target: {_format_vec3(base_hand)}")
@@ -428,6 +426,7 @@ def _interactive_mode(
             z_hand_target=target_hand,
             save_mp4=save_mp4,
             episode_len=episode_len,
+            renderer=renderer,
         )
         rows.append(row)
         run_idx += 1
