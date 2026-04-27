@@ -65,10 +65,10 @@ def _make_front_camera(qpos: np.ndarray) -> mujoco.MjvCamera:
     forward = _quat_rotate_vec_xyzw(root_quat_xyzw, np.array([1.0, 0.0, 0.0], dtype=np.float32))
     camera = mujoco.MjvCamera()
     camera.type = mujoco.mjtCamera.mjCAMERA_FREE
-    camera.lookat[:] = root_pos + np.array([0.0, 0.0, 0.80], dtype=np.float32)
-    camera.distance = 2.4
+    camera.lookat[:] = root_pos + np.array([0.0, 0.0, 0.55], dtype=np.float32)
+    camera.distance = 1.9
     camera.azimuth = float(np.degrees(np.arctan2(forward[1], forward[0])) + 180.0)
-    camera.elevation = -18.0
+    camera.elevation = -4.0
     return camera
 
 
@@ -91,8 +91,7 @@ def _render_qpos_with_camera(
     renderer: IsaacRendererWithMuJoco,
     qpos: np.ndarray,
     camera: mujoco.MjvCamera,
-    marker_world: np.ndarray | None = None,
-    marker_rgba: np.ndarray | None = None,
+    markers: list[tuple[np.ndarray, np.ndarray, float]] | None = None,
 ) -> np.ndarray:
     mujoco_env = renderer.mujoco_env.unwrapped
     qvel = mujoco_env._mj_data.qvel.copy()
@@ -105,9 +104,9 @@ def _render_qpos_with_camera(
         )
         mujoco.mj_forward(mujoco_env._mj_model, mujoco_env._mj_data)
     mujoco_env.renderer.update_scene(mujoco_env._mj_data, camera=camera)
-    if marker_world is not None:
-        rgba = marker_rgba if marker_rgba is not None else np.array([1.0, 0.15, 0.15, 1.0], dtype=np.float32)
-        _add_sphere_marker(mujoco_env.renderer, marker_world, rgba)
+    if markers is not None:
+        for marker_world, marker_rgba, marker_radius in markers:
+            _add_sphere_marker(mujoco_env.renderer, marker_world, marker_rgba, radius=marker_radius)
     return mujoco_env.renderer.render().copy()
 
 
@@ -220,10 +219,15 @@ def _build_body_groups(task_env, right_hand_body: str | None) -> dict[str, Any]:
 
 def _capture_state(task_env, group_info: dict[str, Any]) -> dict[str, np.ndarray]:
     local_body = _local_body_positions(task_env)[0].cpu().numpy()
+    body_pos = getattr(task_env, "_rigid_body_pos_extend", None)
+    if body_pos is None:
+        body_pos = task_env.simulator._rigid_body_pos
+    body_pos = body_pos[0].clone().detach().cpu().numpy()
     root_pos = task_env.simulator.robot_root_states[0, :3].clone().detach().cpu().numpy()
     return {
         "local_body_pos": local_body,
         "right_hand_local": local_body[group_info["right_hand_idx"]].copy(),
+        "right_hand_world": body_pos[group_info["right_hand_idx"]].copy(),
         "root_pos": root_pos,
     }
 
@@ -333,14 +337,22 @@ def _run_rollout(
     if renderer is not None:
         current_qpos = _get_current_qpos(wrapped_env)
         camera = _make_front_camera(current_qpos)
-        current_frame = _render_qpos_with_camera(renderer, current_qpos, camera)
+        current_marker_world = rollout_states[-1]["right_hand_world"]
+        current_frame = _render_qpos_with_camera(
+            renderer,
+            current_qpos,
+            camera,
+            markers=[
+                (goal_marker_world, np.array([1.0, 0.1, 0.1, 1.0], dtype=np.float32), 0.045),
+                (current_marker_world, np.array([0.15, 0.55, 1.0, 1.0], dtype=np.float32), 0.04),
+            ],
+        )
         if goal_qpos is not None:
             goal_frame = _render_qpos_with_camera(
                 renderer,
                 goal_qpos,
                 camera,
-                marker_world=goal_marker_world,
-                marker_rgba=np.array([1.0, 0.1, 0.1, 1.0], dtype=np.float32),
+                markers=[(goal_marker_world, np.array([1.0, 0.1, 0.1, 1.0], dtype=np.float32), 0.045)],
             )
             current_frame = _overlay_goal_frame(current_frame, goal_frame)
         frames.append(current_frame)
@@ -353,14 +365,22 @@ def _run_rollout(
             if renderer is not None:
                 current_qpos = _get_current_qpos(wrapped_env)
                 camera = _make_front_camera(current_qpos)
-                current_frame = _render_qpos_with_camera(renderer, current_qpos, camera)
+                current_marker_world = rollout_states[-1]["right_hand_world"]
+                current_frame = _render_qpos_with_camera(
+                    renderer,
+                    current_qpos,
+                    camera,
+                    markers=[
+                        (goal_marker_world, np.array([1.0, 0.1, 0.1, 1.0], dtype=np.float32), 0.045),
+                        (current_marker_world, np.array([0.15, 0.55, 1.0, 1.0], dtype=np.float32), 0.04),
+                    ],
+                )
                 if goal_qpos is not None:
                     goal_frame = _render_qpos_with_camera(
                         renderer,
                         goal_qpos,
                         camera,
-                        marker_world=goal_marker_world,
-                        marker_rgba=np.array([1.0, 0.1, 0.1, 1.0], dtype=np.float32),
+                        markers=[(goal_marker_world, np.array([1.0, 0.1, 0.1, 1.0], dtype=np.float32), 0.045)],
                     )
                     current_frame = _overlay_goal_frame(current_frame, goal_frame)
                 frames.append(current_frame)
