@@ -97,6 +97,13 @@ def _render_qpos_with_camera(
     mujoco_env = renderer.mujoco_env.unwrapped
     qvel = mujoco_env._mj_data.qvel.copy()
     renderer.mujoco_env.reset(options={"qpos": qpos, "qvel": qvel})
+    if mujoco_env.renderer is None:
+        mujoco_env.renderer = mujoco.Renderer(
+            mujoco_env._mj_model,
+            width=mujoco_env._config.render_width,
+            height=mujoco_env._config.render_height,
+        )
+        mujoco.mj_forward(mujoco_env._mj_model, mujoco_env._mj_data)
     mujoco_env.renderer.update_scene(mujoco_env._mj_data, camera=camera)
     if marker_world is not None:
         rgba = marker_rgba if marker_rgba is not None else np.array([1.0, 0.15, 0.15, 1.0], dtype=np.float32)
