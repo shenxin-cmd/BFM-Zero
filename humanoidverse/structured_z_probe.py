@@ -5,14 +5,14 @@ import re
 from pathlib import Path
 from typing import Any
 
+os.environ["MUJOCO_GL"] = "egl"
+os.environ["OMP_NUM_THREADS"] = "1"
+
 import joblib
 import mediapy as media
 import mujoco
 import numpy as np
 import torch
-
-os.environ["MUJOCO_GL"] = "egl"
-os.environ["OMP_NUM_THREADS"] = "1"
 
 from humanoidverse.agents.envs.humanoidverse_isaac import HumanoidVerseIsaacConfig, IsaacRendererWithMuJoco
 from humanoidverse.agents.load_utils import load_model_from_checkpoint_dir
