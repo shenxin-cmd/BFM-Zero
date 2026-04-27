@@ -65,10 +65,10 @@ def _make_front_camera(qpos: np.ndarray) -> mujoco.MjvCamera:
     forward = _quat_rotate_vec_xyzw(root_quat_xyzw, np.array([1.0, 0.0, 0.0], dtype=np.float32))
     camera = mujoco.MjvCamera()
     camera.type = mujoco.mjtCamera.mjCAMERA_FREE
-    camera.lookat[:] = root_pos + np.array([0.0, 0.0, 0.55], dtype=np.float32)
-    camera.distance = 1.9
+    camera.lookat[:] = root_pos + np.array([0.0, 0.0, 0.42], dtype=np.float32)
+    camera.distance = 2.45
     camera.azimuth = float(np.degrees(np.arctan2(forward[1], forward[0])) + 180.0)
-    camera.elevation = -4.0
+    camera.elevation = -10.0
     return camera
 
 
