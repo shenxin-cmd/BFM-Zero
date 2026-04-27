@@ -77,7 +77,10 @@ def _load_model_and_env(
 
 
 def _local_body_positions(task_env) -> torch.Tensor:
-    body_pos = task_env.simulator._rigid_body_pos.clone().detach()
+    body_pos = getattr(task_env, "_rigid_body_pos_extend", None)
+    if body_pos is None:
+        body_pos = task_env.simulator._rigid_body_pos
+    body_pos = body_pos.clone().detach()
     root_pos = body_pos[:, 0:1, :]
     heading_inv = calc_heading_quat_inv(task_env.simulator.robot_root_states[:, 3:7].clone().detach(), w_last=True)
     heading_inv_expand = heading_inv.unsqueeze(1).repeat(1, body_pos.shape[1], 1).reshape(-1, 4)
@@ -88,6 +91,9 @@ def _local_body_positions(task_env) -> torch.Tensor:
 
 def _build_body_groups(task_env, right_hand_body: str | None) -> dict[str, Any]:
     body_names = list(task_env.simulator._body_list)
+    num_local_bodies = int(_local_body_positions(task_env).shape[1])
+    if len(body_names) != num_local_bodies:
+        body_names = body_names[:num_local_bodies]
     if right_hand_body is None:
         for candidate in ["right_wrist_yaw_link", "right_wrist_pitch_link", "right_wrist_roll_link"]:
             if candidate in body_names:
@@ -219,7 +225,12 @@ def _run_rollout(
     observation, _ = wrapped_env.reset(to_numpy=False, reset_to_default_pose=True)
     rollout_states = [_capture_state(task_env, group_info)]
     frames = []
-    renderer = IsaacRendererWithMuJoco(render_size=256) if save_mp4 else None
+    renderer = None
+    if save_mp4:
+        try:
+            renderer = IsaacRendererWithMuJoco(render_size=256)
+        except Exception as exc:
+            print(f"Video renderer initialization failed, continuing without mp4 export: {exc}")
     if renderer is not None:
         frames.append(renderer.render(task_env, 0)[0])
 
@@ -229,7 +240,11 @@ def _run_rollout(
             observation, reward, terminated, truncated, info = wrapped_env.step(action, to_numpy=False)
             rollout_states.append(_capture_state(task_env, group_info))
             if renderer is not None:
-                frames.append(renderer.render(task_env, 0)[0])
+                try:
+                    frames.append(renderer.render(task_env, 0)[0])
+                except Exception as exc:
+                    print(f"Video rendering failed during rollout, disabling mp4 export for this run: {exc}")
+                    renderer = None
 
     metrics = _compute_metrics(rollout_states, z_hand_target, group_info)
     if renderer is not None and video_path is not None:
