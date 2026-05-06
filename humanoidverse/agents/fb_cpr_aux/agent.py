@@ -257,22 +257,34 @@ class FBcprAuxAgent(FBcprAgent):
         z: torch.Tensor,
         clip_grad_norm: float | None,
     ) -> Dict[str, torch.Tensor]:
+        is_split = self.cfg.model.archi.is_split_mode
         with autocast(device_type=self.device, dtype=self._model.amp_dtype, enabled=self.cfg.model.amp):
             dist = self._model._actor(obs, z, self._model.cfg.actor_std)
             action = dist.sample(clip=self.cfg.train.stddev_clip)
 
-            # compute discriminator reward loss
+            # compute discriminator reward loss (critic not split)
             Qs_discriminator = self._model._critic(obs, z, action)  # num_parallel x batch x (1 or n_bins)
-            _, _, Q_discriminator = self.get_targets_uncertainty(Qs_discriminator, self.cfg.train.actor_pessimism_penalty)  # batch
+            _, _, Q_discriminator = self.get_targets_uncertainty(Qs_discriminator, self.cfg.train.actor_pessimism_penalty)
 
-            # compute auxiliary reward loss
+            # compute auxiliary reward loss (aux_critic not split)
             Qs_aux = self._model._aux_critic(obs, z, action)  # num_parallel x batch x (1 or n_bins)
-            _, _, Q_aux = self.get_targets_uncertainty(Qs_aux, self.cfg.train.actor_pessimism_penalty)  # batch
+            _, _, Q_aux = self.get_targets_uncertainty(Qs_aux, self.cfg.train.actor_pessimism_penalty)
 
-            # compute fb reward loss
+            # compute fb reward loss (weighted in split mode)
             Fs = self._model._forward_map(obs, z, action)  # num_parallel x batch x z_dim
-            Qs_fb = (Fs * z).sum(-1)  # num_parallel x batch
-            _, _, Q_fb = self.get_targets_uncertainty(Qs_fb, self.cfg.train.actor_pessimism_penalty)  # batch
+            if is_split:
+                z_body_dim = self.cfg.model.archi.z_body_dim
+                hand_weight = self.cfg.model.archi.z_body_dim / self.cfg.model.archi.z_hand_dim
+                z_body = z[:, :z_body_dim]
+                z_hand = z[:, z_body_dim:]
+                Qs_fb_body = (Fs[..., :z_body_dim] * z_body).sum(-1)
+                Qs_fb_hand = (Fs[..., z_body_dim:] * z_hand).sum(-1)
+                _, _, Q_fb_body = self.get_targets_uncertainty(Qs_fb_body, self.cfg.train.actor_pessimism_penalty)
+                _, _, Q_fb_hand = self.get_targets_uncertainty(Qs_fb_hand, self.cfg.train.actor_pessimism_penalty)
+                Q_fb = Q_fb_body + hand_weight * Q_fb_hand
+            else:
+                Qs_fb = (Fs * z).sum(-1)  # num_parallel x batch
+                _, _, Q_fb = self.get_targets_uncertainty(Qs_fb, self.cfg.train.actor_pessimism_penalty)
 
             weight = Q_fb.abs().mean().detach() if self.cfg.train.scale_reg else 1.0
             actor_loss = (

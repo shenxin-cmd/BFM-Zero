@@ -12,12 +12,12 @@ from torch.amp import autocast
 
 from ..fb.model import FBModel, FBModelArchiConfig, FBModelConfig
 from ..nn_filter_models import DiscriminatorFilterArchiConfig, ForwardFilterArchiConfig
-from ..nn_models import DiscriminatorArchiConfig, ForwardArchiConfig
+from ..nn_models import DiscriminatorArchiConfig, ForwardArchiConfig, SplitDiscriminatorArchiConfig
 
 
 class FBcprModelArchiConfig(FBModelArchiConfig):
     critic: ForwardArchiConfig | ForwardFilterArchiConfig = pydantic.Field(ForwardArchiConfig(), discriminator="name")
-    discriminator: DiscriminatorArchiConfig | DiscriminatorFilterArchiConfig = pydantic.Field(
+    discriminator: DiscriminatorArchiConfig | DiscriminatorFilterArchiConfig | SplitDiscriminatorArchiConfig = pydantic.Field(
         DiscriminatorArchiConfig(), discriminator="name"
     )
 
@@ -38,8 +38,10 @@ class FBcprModel(FBModel):
         super().__init__(obs_space, action_dim, cfg)
         # For IDEs
         self.cfg: FBcprModelConfig = cfg
-        self._discriminator = cfg.archi.discriminator.build(obs_space, cfg.archi.z_dim)
-        self._critic = cfg.archi.critic.build(obs_space, cfg.archi.z_dim, action_dim, output_dim=1)
+        # In split mode use z_body_dim for the discriminator; critic keeps full z.
+        disc_z_dim = cfg.archi.z_body_dim if cfg.archi.is_split_mode else cfg.archi.z_dim
+        self._discriminator = cfg.archi.discriminator.build(obs_space, disc_z_dim)
+        self._critic = cfg.archi.critic.build(obs_space, cfg.archi.total_z_dim, action_dim, output_dim=1)
 
         # make sure the model is in eval mode and never computes gradients
         self.train(False)

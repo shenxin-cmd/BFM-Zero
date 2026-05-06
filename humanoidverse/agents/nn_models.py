@@ -741,3 +741,336 @@ class RewardNormalizerConfig(BaseConfig):
 
     def build(self) -> nn.Module:
         return EMA(translate=self.translate, scale=self.scale)
+
+
+##########################
+# Split Z-space models
+##########################
+
+# ---------------------------------------------------------------
+# Observation slicing constants for G1 29-DOF robot
+# B-network input layout: [state(64), privileged_state(463)] = 527 dims
+#   state = [dof_pos(29), dof_vel(29), projected_gravity(3), base_ang_vel(3)]
+#   privileged_state = [root_height(1), local_body_pos(90), local_body_rot(186),
+#                       local_body_vel(93), local_body_ang_vel(93)]
+# Right-arm bodies: body_names indices 23-29 (right_shoulder_pitch ~ right_wrist_yaw)
+# Right-arm DOFs: dof_names indices 22-28
+# ---------------------------------------------------------------
+_G1_HAND_IDX_B: list[int] = (
+    list(range(22, 29))    # state: dof_pos right arm (indices 22-28 in 29-dim dof_pos)
+    + list(range(51, 58))  # state: dof_vel right arm (offset=29, same indices)
+    + list(range(131, 152))  # privstate offset 64: local_body_pos right arm (slots 22-28 × 3)
+    + list(range(293, 335))  # privstate offset 64: local_body_rot right arm (entries 23-29 × 6)
+    + list(range(410, 431))  # privstate offset 64: local_body_vel right arm (entries 23-29 × 3)
+    + list(range(503, 524))  # privstate offset 64: local_body_ang_vel right arm (entries 23-29 × 3)
+)  # total: 7+7+21+42+21+21 = 119 dims
+_G1_BODY_IDX_B: list[int] = [i for i in range(527) if i not in set(_G1_HAND_IDX_B)]
+# len(_G1_HAND_IDX_B) == 119,  len(_G1_BODY_IDX_B) == 408
+
+
+class SplitBackwardArchiConfig(BaseConfig):
+    """Config for the split B-network: B_hand + B_body in one forward pass."""
+
+    name: tp.Literal["SplitBackwardArchi"] = "SplitBackwardArchi"
+    hidden_dim: int = 256
+    hidden_layers: int = 2
+    norm: bool = True
+    input_filter: NNFilter = IdentityInputFilterConfig()
+    z_body_dim: int = 225
+    z_hand_dim: int = 36
+    # Observation indices in the concatenated [state, privstate] vector.
+    # Leave empty to use the G1 29-DOF defaults (_G1_HAND_IDX_B / _G1_BODY_IDX_B).
+    hand_obs_indices: list[int] = []
+    body_obs_indices: list[int] = []
+
+    def build(self, obs_space, z_dim: int) -> "SplitBackwardMap":
+        return SplitBackwardMap(obs_space, self)
+
+
+class SplitBackwardMap(nn.Module):
+    """Backward map with decoupled hand / body branches.
+
+    Output layout: [B_body (z_body_dim), B_hand (z_hand_dim)]
+    """
+
+    def __init__(self, obs_space, cfg: SplitBackwardArchiConfig) -> None:
+        super().__init__()
+        self.cfg = cfg
+
+        self.input_filter = cfg.input_filter.build(obs_space)
+        filtered_space = self.input_filter.output_space
+        assert isinstance(filtered_space, gymnasium.spaces.Box), (
+            f"SplitBackwardMap: filtered_space must be Box, got {type(filtered_space)}. "
+            "Set input_filter to DictInputFilterConfig with keys=[\"state\", \"privileged_state\"]."
+        )
+        assert len(filtered_space.shape) == 1
+        total_obs_dim = filtered_space.shape[0]
+
+        hand_idx = list(cfg.hand_obs_indices) if cfg.hand_obs_indices else _G1_HAND_IDX_B
+        body_idx = list(cfg.body_obs_indices) if cfg.body_obs_indices else [
+            i for i in range(total_obs_dim) if i not in set(hand_idx)
+        ]
+        self.register_buffer("hand_idx", torch.tensor(hand_idx, dtype=torch.long))
+        self.register_buffer("body_idx", torch.tensor(body_idx, dtype=torch.long))
+
+        hand_obs_dim = len(hand_idx)   # 119
+        body_obs_dim = len(body_idx)   # 408
+
+        def _make_mlp(in_dim: int, out_dim: int) -> nn.Sequential:
+            seq: list[nn.Module] = [nn.Linear(in_dim, cfg.hidden_dim), nn.LayerNorm(cfg.hidden_dim), nn.Tanh()]
+            for _ in range(cfg.hidden_layers - 1):
+                seq += [nn.Linear(cfg.hidden_dim, cfg.hidden_dim), nn.ReLU()]
+            seq += [nn.Linear(cfg.hidden_dim, out_dim)]
+            if cfg.norm:
+                seq += [Norm()]
+            return nn.Sequential(*seq)
+
+        self.hand_net = _make_mlp(hand_obs_dim, cfg.z_hand_dim)
+        self.body_net = _make_mlp(body_obs_dim, cfg.z_body_dim)
+
+    def forward(self, x: torch.Tensor | dict[str, torch.Tensor]) -> torch.Tensor:
+        x = self.input_filter(x)
+        b_hand = self.hand_net(x[:, self.hand_idx])
+        b_body = self.body_net(x[:, self.body_idx])
+        return torch.cat([b_body, b_hand], dim=-1)  # [B_body(225), B_hand(36)]
+
+
+class SplitForwardArchiConfig(BaseConfig):
+    """Config for the split F-network: shared trunk + hand head + body head."""
+
+    name: tp.Literal["SplitForwardArchi"] = "SplitForwardArchi"
+    hidden_dim: int = 1024
+    trunk_hidden_dim: int = 256
+    num_parallel: int = 2
+    input_filter: NNFilter = IdentityInputFilterConfig()
+    z_body_dim: int = 225
+    z_hand_dim: int = 36
+    hand_action_dim: int = 7  # right arm: last 7 action dims
+
+    def build(self, obs_space, z_dim: int, action_dim: int, output_dim=None) -> "SplitForwardMap":
+        return SplitForwardMap(obs_space, action_dim, self)
+
+
+class _SingleSplitForwardMap(nn.Module):
+    """One instance of the split F-network (no ensemble).
+
+    Input : obs (filtered flat), z=[z_body, z_hand], action
+    Output: [F_body (z_body_dim), F_hand (z_hand_dim)]
+    """
+
+    def __init__(self, obs_space, action_dim: int, cfg: SplitForwardArchiConfig) -> None:
+        super().__init__()
+        self.input_filter = cfg.input_filter.build(obs_space)
+        filtered_space = self.input_filter.output_space
+        assert isinstance(filtered_space, gymnasium.spaces.Box), (
+            "SplitForwardMap: set input_filter to DictInputFilterConfig with keys="
+            "[\"state\", \"privileged_state\", \"last_action\", \"history_actor\"]."
+        )
+        obs_dim = filtered_space.shape[0]
+
+        self.z_body_dim = cfg.z_body_dim
+        self.z_hand_dim = cfg.z_hand_dim
+        self.hand_action_dim = cfg.hand_action_dim
+        self.body_action_dim = action_dim - cfg.hand_action_dim
+
+        trunk_dim = cfg.trunk_hidden_dim
+        h = cfg.hidden_dim
+
+        self.trunk = nn.Sequential(
+            nn.Linear(obs_dim, h), nn.LayerNorm(h), nn.Tanh(),
+            nn.Linear(h, trunk_dim), nn.ReLU(),
+        )
+        self.hand_head = nn.Sequential(
+            nn.Linear(trunk_dim + cfg.hand_action_dim + cfg.z_hand_dim, h), nn.ReLU(),
+            nn.Linear(h, cfg.z_hand_dim),
+        )
+        self.body_head = nn.Sequential(
+            nn.Linear(trunk_dim + self.body_action_dim + cfg.z_body_dim, h), nn.ReLU(),
+            nn.Linear(h, cfg.z_body_dim),
+        )
+
+    def forward(
+        self,
+        obs: torch.Tensor | dict[str, torch.Tensor],
+        z: torch.Tensor,
+        action: torch.Tensor,
+    ) -> torch.Tensor:
+        x = self.input_filter(obs)
+        e_ctx = self.trunk(x)
+
+        z_body = z[:, : self.z_body_dim]
+        z_hand = z[:, self.z_body_dim :]
+        a_body = action[:, : self.body_action_dim]
+        a_hand = action[:, -self.hand_action_dim :]
+
+        f_body = self.body_head(torch.cat([e_ctx, a_body, z_body], dim=-1))
+        f_hand = self.hand_head(torch.cat([e_ctx, a_hand, z_hand], dim=-1))
+        return torch.cat([f_body, f_hand], dim=-1)
+
+
+class SplitForwardMap(nn.Module):
+    """Ensembled SplitForwardMap (num_parallel independent instances).
+
+    Output shape: num_parallel × batch × (z_body_dim + z_hand_dim)
+    Compatible with the existing code that expects num_parallel × batch × z_dim.
+    """
+
+    def __init__(self, obs_space, action_dim: int, cfg: SplitForwardArchiConfig) -> None:
+        super().__init__()
+        self.num_parallel = cfg.num_parallel
+        self.models = nn.ModuleList(
+            [_SingleSplitForwardMap(obs_space, action_dim, cfg) for _ in range(cfg.num_parallel)]
+        )
+
+    def forward(
+        self,
+        obs: torch.Tensor | dict[str, torch.Tensor],
+        z: torch.Tensor,
+        action: torch.Tensor,
+    ) -> torch.Tensor:
+        outputs = [m(obs, z, action) for m in self.models]
+        return torch.stack(outputs)  # num_parallel × batch × total_z_dim
+
+
+class SplitActorArchiConfig(BaseConfig):
+    """Config for the split Actor: shared trunk + hand policy + body policy."""
+
+    name: tp.Literal["SplitActorArchi"] = "SplitActorArchi"
+    hidden_dim: int = 1024
+    trunk_hidden_dim: int = 256
+    input_filter: NNFilter = IdentityInputFilterConfig()
+    z_body_dim: int = 225
+    z_hand_dim: int = 36
+    hand_action_dim: int = 7  # right arm: last 7 action dims
+
+    def build(self, obs_space, z_dim: int, action_dim: int) -> "SplitActor":
+        return SplitActor(obs_space, action_dim, self)
+
+
+class SplitActor(nn.Module):
+    """Split Actor: shared trunk extracts context, then separate policies for hand / body.
+
+    Output action layout: [mu_body (body_action_dim), mu_hand (hand_action_dim)]
+    — matches dof_names order where right arm is last.
+    """
+
+    def __init__(self, obs_space, action_dim: int, cfg: SplitActorArchiConfig) -> None:
+        super().__init__()
+        self.input_filter = cfg.input_filter.build(obs_space)
+        filtered_space = self.input_filter.output_space
+        assert isinstance(filtered_space, gymnasium.spaces.Box), (
+            "SplitActor: set input_filter to DictInputFilterConfig with keys="
+            "[\"state\", \"privileged_state\", \"last_action\", \"history_actor\"]."
+        )
+        obs_dim = filtered_space.shape[0]
+
+        self.z_body_dim = cfg.z_body_dim
+        self.z_hand_dim = cfg.z_hand_dim
+        self.hand_action_dim = cfg.hand_action_dim
+        self.body_action_dim = action_dim - cfg.hand_action_dim
+
+        trunk_dim = cfg.trunk_hidden_dim
+        h = cfg.hidden_dim
+
+        self.trunk = nn.Sequential(
+            nn.Linear(obs_dim, h), nn.LayerNorm(h), nn.Tanh(),
+            nn.Linear(h, trunk_dim), nn.ReLU(),
+        )
+        self.hand_policy = nn.Sequential(
+            nn.Linear(trunk_dim + cfg.z_hand_dim, h), nn.ReLU(),
+            nn.Linear(h, cfg.hand_action_dim),
+        )
+        self.body_policy = nn.Sequential(
+            nn.Linear(trunk_dim + cfg.z_body_dim, h), nn.ReLU(),
+            nn.Linear(h, self.body_action_dim),
+        )
+
+    def forward(
+        self,
+        obs: torch.Tensor | dict[str, torch.Tensor],
+        z: torch.Tensor,
+        std: float,
+    ) -> "TruncatedNormal":
+        x = self.input_filter(obs)
+        e_ctx = self.trunk(x)
+
+        z_body = z[:, : self.z_body_dim]
+        z_hand = z[:, self.z_body_dim :]
+
+        mu_body = self.body_policy(torch.cat([e_ctx, z_body], dim=-1))
+        mu_hand = self.hand_policy(torch.cat([e_ctx, z_hand], dim=-1))
+        mu = torch.tanh(torch.cat([mu_body, mu_hand], dim=-1))  # 29 dims: body first, hand last
+
+        std_tensor = torch.ones_like(mu) * std
+        return TruncatedNormal(mu, std_tensor)
+
+
+class SplitDiscriminatorArchiConfig(BaseConfig):
+    """Config for split Discriminator: only sees body observations and z_body."""
+
+    name: tp.Literal["SplitDiscriminatorArchi"] = "SplitDiscriminatorArchi"
+    hidden_dim: int = 1024
+    hidden_layers: int = 2
+    # Outer filter: converts obs dict → flat tensor (e.g. 527-dim [state, privstate]).
+    # Should be DictInputFilterConfig(key=["state", "privileged_state"]).
+    input_filter: NNFilter = IdentityInputFilterConfig()
+    z_body_dim: int = 225
+    # Leave empty to use _G1_BODY_IDX_B (408 indices).
+    body_obs_indices: list[int] = []
+
+    def build(self, obs_space, z_dim: int) -> "SplitDiscriminator":
+        body_obs_indices = list(self.body_obs_indices) if self.body_obs_indices else _G1_BODY_IDX_B
+        body_obs_dim = len(body_obs_indices)
+
+        inner_obs_space = gymnasium.spaces.Box(
+            low=np.full(body_obs_dim, -np.inf, dtype=np.float32),
+            high=np.full(body_obs_dim, np.inf, dtype=np.float32),
+        )
+        inner_cfg = DiscriminatorArchiConfig(hidden_dim=self.hidden_dim, hidden_layers=self.hidden_layers)
+        inner_disc = inner_cfg.build(inner_obs_space, self.z_body_dim)
+
+        outer_filter = self.input_filter.build(obs_space)
+        return SplitDiscriminator(inner_disc, outer_filter, body_obs_indices, self.z_body_dim)
+
+
+class SplitDiscriminator(nn.Module):
+    """Wrapper that routes body observations and z_body to an inner Discriminator.
+
+    Transparently implements the same interface as Discriminator so existing
+    agent code (update_discriminator, update_critic) needs no changes.
+    """
+
+    def __init__(
+        self,
+        base_disc: Discriminator,
+        obs_input_filter: nn.Module,
+        body_obs_indices: list[int],
+        z_body_dim: int,
+    ) -> None:
+        super().__init__()
+        self._base = base_disc
+        self._obs_input_filter = obs_input_filter
+        self.register_buffer("body_obs_idx", torch.tensor(body_obs_indices, dtype=torch.long))
+        self.z_body_dim = z_body_dim
+
+    def _filter_inputs(
+        self, obs: torch.Tensor | dict[str, torch.Tensor], z: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        obs_flat = self._obs_input_filter(obs)            # batch × 527
+        obs_body = obs_flat[:, self.body_obs_idx]          # batch × 408
+        z_body = z[:, : self.z_body_dim]                   # batch × 225
+        return obs_body, z_body
+
+    def forward(self, obs: torch.Tensor | dict[str, torch.Tensor], z: torch.Tensor) -> torch.Tensor:
+        obs_body, z_body = self._filter_inputs(obs, z)
+        return self._base.forward(obs_body, z_body)
+
+    def compute_logits(self, obs: torch.Tensor | dict[str, torch.Tensor], z: torch.Tensor) -> torch.Tensor:
+        obs_body, z_body = self._filter_inputs(obs, z)
+        return self._base.compute_logits(obs_body, z_body)
+
+    def compute_reward(
+        self, obs: torch.Tensor | dict[str, torch.Tensor], z: torch.Tensor, eps: float = 1e-7
+    ) -> torch.Tensor:
+        obs_body, z_body = self._filter_inputs(obs, z)
+        return self._base.compute_reward(obs_body, z_body, eps)

@@ -29,6 +29,9 @@ from ..nn_models import (
     ForwardArchiConfig,
     ResidualActorArchiConfig,
     SimpleActorArchiConfig,
+    SplitActorArchiConfig,
+    SplitBackwardArchiConfig,
+    SplitForwardArchiConfig,
     eval_mode,
 )
 from ..normalizers import ObsNormalizerConfig
@@ -36,10 +39,16 @@ from ..pytree_utils import tree_get_batch_size
 
 
 class FBModelArchiConfig(BaseConfig):
-    z_dim: int = 100
+    z_dim: int = 100       # used in non-split mode
+    z_body_dim: int = 0    # > 0 enables split mode for body sub-space
+    z_hand_dim: int = 0    # > 0 enables split mode for hand sub-space
     norm_z: bool = True
-    f: ForwardArchiConfig | ForwardFilterArchiConfig = pydantic.Field(ForwardArchiConfig(), discriminator="name")
-    b: BackwardArchiConfig | BackwardFilterArchiConfig = pydantic.Field(BackwardArchiConfig(), discriminator="name")
+    f: ForwardArchiConfig | ForwardFilterArchiConfig | SplitForwardArchiConfig = pydantic.Field(
+        ForwardArchiConfig(), discriminator="name"
+    )
+    b: BackwardArchiConfig | BackwardFilterArchiConfig | SplitBackwardArchiConfig = pydantic.Field(
+        BackwardArchiConfig(), discriminator="name"
+    )
     # Because of the "name" attribute, these two can be chosen between via strings easily
     actor: (
         ActorArchiConfig
@@ -48,7 +57,20 @@ class FBModelArchiConfig(BaseConfig):
         | ResidualActorArchiConfig
         | SimpleActorFilterArchiConfig
         | ResidualActorFilterArchiConfig
+        | SplitActorArchiConfig
     ) = pydantic.Field(SimpleActorArchiConfig(), discriminator="name")
+
+    @property
+    def is_split_mode(self) -> bool:
+        """True when z is split into z_body and z_hand sub-spaces."""
+        return self.z_body_dim > 0 and self.z_hand_dim > 0
+
+    @property
+    def total_z_dim(self) -> int:
+        """Effective z dimensionality: split (z_body + z_hand) or legacy z_dim."""
+        if self.is_split_mode:
+            return self.z_body_dim + self.z_hand_dim
+        return self.z_dim
 
 
 class FBModelConfig(BaseModelConfig):
@@ -81,10 +103,11 @@ class FBModel(BaseModel):
         self.device = self.cfg.device
         self.amp_dtype = torch.bfloat16
 
-        # create networks
-        self._backward_map = arch.b.build(obs_space, arch.z_dim)
-        self._forward_map = arch.f.build(obs_space, arch.z_dim, action_dim)
-        self._actor = arch.actor.build(obs_space, arch.z_dim, action_dim)
+        # create networks (use total_z_dim so split configs receive the correct dim)
+        z_dim = arch.total_z_dim
+        self._backward_map = arch.b.build(obs_space, z_dim)
+        self._forward_map = arch.f.build(obs_space, z_dim, action_dim)
+        self._actor = arch.actor.build(obs_space, z_dim, action_dim)
         self._obs_normalizer = self.cfg.obs_normalizer.build(obs_space)
 
         # make sure the model is in eval mode and never computes gradients
@@ -117,12 +140,21 @@ class FBModel(BaseModel):
             return self._actor(self._normalize(obs), z, std)
 
     def sample_z(self, size: int, device: str = "cpu") -> torch.Tensor:
-        z = torch.randn((size, self.cfg.archi.z_dim), dtype=torch.float32, device=device)
+        z = torch.randn((size, self.cfg.archi.total_z_dim), dtype=torch.float32, device=device)
         return self.project_z(z)
 
     def project_z(self, z):
         if self.cfg.archi.norm_z:
-            z = math.sqrt(z.shape[-1]) * F.normalize(z, dim=-1)
+            if self.cfg.archi.is_split_mode:
+                z_body_dim = self.cfg.archi.z_body_dim
+                z_body = z[..., :z_body_dim]
+                z_hand = z[..., z_body_dim:]
+                # Independently normalize each sub-space and scale to sqrt(dim)
+                z_body = math.sqrt(z_body.shape[-1]) * F.normalize(z_body, dim=-1)  # ×15
+                z_hand = math.sqrt(z_hand.shape[-1]) * F.normalize(z_hand, dim=-1)  # ×6
+                z = torch.cat([z_body, z_hand], dim=-1)
+            else:
+                z = math.sqrt(z.shape[-1]) * F.normalize(z, dim=-1)
         return z
 
     def act(self, obs: torch.Tensor | dict[str, torch.Tensor], z: torch.Tensor, mean: bool = True) -> torch.Tensor:

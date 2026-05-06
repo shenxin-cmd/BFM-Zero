@@ -213,6 +213,36 @@ class FBAgent:
             action = dist.sample(clip=self.cfg.train.stddev_clip)
         return action
 
+    def _fb_loss_single(
+        self,
+        Fs: torch.Tensor,
+        B: torch.Tensor,
+        discount: torch.Tensor,
+        target_M: torch.Tensor,
+    ):
+        """Compute FB loss for one z sub-space (or the full z in non-split mode).
+
+        Args:
+            Fs: num_parallel × batch × z_sub_dim
+            B:  batch × z_sub_dim
+            discount: batch × 1
+            target_M: batch × batch  (pre-computed pessimistic target)
+        Returns:
+            (fb_loss_scalar, Ms, fb_diag, fb_offdiag)
+        """
+        Ms = torch.matmul(Fs, B.T)  # num_parallel × batch × batch
+        diff = Ms - discount * target_M
+        fb_offdiag = 0.5 * (diff * self.off_diag).pow(2).sum() / self.off_diag_sum
+        fb_diag = -torch.diagonal(diff, dim1=1, dim2=2).mean() * Ms.shape[0]
+        return fb_offdiag + fb_diag, Ms, fb_diag, fb_offdiag
+
+    def _orth_loss_single(self, B: torch.Tensor):
+        """Orthonormality loss for one B sub-space."""
+        Cov = torch.matmul(B, B.T)
+        diag = -Cov.diag().mean()
+        offdiag = 0.5 * (Cov * self.off_diag).pow(2).sum() / self.off_diag_sum
+        return offdiag + diag, diag, offdiag
+
     def update_fb(
         self,
         obs: torch.Tensor | dict[str, torch.Tensor],
@@ -224,47 +254,98 @@ class FBAgent:
         q_loss_coef: float | None,
         clip_grad_norm: float | None,
     ) -> Dict[str, torch.Tensor]:
+        is_split = self.cfg.model.archi.is_split_mode
+        z_body_dim = self.cfg.model.archi.z_body_dim if is_split else 0
+
         with autocast(device_type=self.device, dtype=self._model.amp_dtype, enabled=self.cfg.model.amp):
             with torch.no_grad():
-                # dist = self._model._actor(next_obs, z, self._model.cfg.actor_std)
-                # next_action = dist.sample(clip=self.cfg.train.stddev_clip)
                 next_action = self.sample_action_from_norm_obs(next_obs, z)
                 target_Fs = self._model._target_forward_map(next_obs, z, next_action)  # num_parallel x batch x z_dim
                 target_B = self._model._target_backward_map(goal)  # batch x z_dim
-                target_Ms = torch.matmul(target_Fs, target_B.T)  # num_parallel x batch x batch
-                _, _, target_M = self.get_targets_uncertainty(target_Ms, self.cfg.train.fb_pessimism_penalty)  # batch x batch
+
+                if is_split:
+                    target_Fs_body = target_Fs[..., :z_body_dim]
+                    target_Fs_hand = target_Fs[..., z_body_dim:]
+                    target_B_body = target_B[:, :z_body_dim]
+                    target_B_hand = target_B[:, z_body_dim:]
+                    target_Ms_body = torch.matmul(target_Fs_body, target_B_body.T)
+                    target_Ms_hand = torch.matmul(target_Fs_hand, target_B_hand.T)
+                    _, _, target_M_body = self.get_targets_uncertainty(target_Ms_body, self.cfg.train.fb_pessimism_penalty)
+                    _, _, target_M_hand = self.get_targets_uncertainty(target_Ms_hand, self.cfg.train.fb_pessimism_penalty)
+                    # keep a combined target_M for metrics only
+                    target_Ms_all = torch.matmul(target_Fs, target_B.T)
+                    _, _, target_M = self.get_targets_uncertainty(target_Ms_all, self.cfg.train.fb_pessimism_penalty)
+                else:
+                    target_Ms = torch.matmul(target_Fs, target_B.T)  # num_parallel x batch x batch
+                    _, _, target_M = self.get_targets_uncertainty(target_Ms, self.cfg.train.fb_pessimism_penalty)
 
             # compute FB loss
             Fs = self._model._forward_map(obs, z, action)  # num_parallel x batch x z_dim
             B = self._model._backward_map(goal)  # batch x z_dim
-            Ms = torch.matmul(Fs, B.T)  # num_parallel x batch x batch
 
-            diff = Ms - discount * target_M  # num_parallel x batch x batch
-            fb_offdiag = 0.5 * (diff * self.off_diag).pow(2).sum() / self.off_diag_sum
-            fb_diag = -torch.diagonal(diff, dim1=1, dim2=2).mean() * Ms.shape[0]
-            fb_loss = fb_offdiag + fb_diag
+            if is_split:
+                hand_weight = self.cfg.model.archi.z_body_dim / self.cfg.model.archi.z_hand_dim  # ≈6.25
 
-            # compute orthonormality loss for backward embedding
-            Cov = torch.matmul(B, B.T)
-            orth_loss_diag = -Cov.diag().mean()
-            orth_loss_offdiag = 0.5 * (Cov * self.off_diag).pow(2).sum() / self.off_diag_sum
-            orth_loss = orth_loss_offdiag + orth_loss_diag
-            fb_loss += self.cfg.train.ortho_coef * orth_loss
+                Fs_body = Fs[..., :z_body_dim]
+                Fs_hand = Fs[..., z_body_dim:]
+                B_body = B[:, :z_body_dim]
+                B_hand = B[:, z_body_dim:]
+
+                fb_loss_body, Ms_body, fb_diag_body, fb_offdiag_body = self._fb_loss_single(
+                    Fs_body, B_body, discount, target_M_body
+                )
+                fb_loss_hand, Ms_hand, fb_diag_hand, fb_offdiag_hand = self._fb_loss_single(
+                    Fs_hand, B_hand, discount, target_M_hand
+                )
+                fb_loss = fb_loss_body + hand_weight * fb_loss_hand
+
+                # orthonormality losses (independent per sub-space)
+                orth_loss_body, orth_diag_body, orth_offdiag_body = self._orth_loss_single(B_body)
+                orth_loss_hand, orth_diag_hand, orth_offdiag_hand = self._orth_loss_single(B_hand)
+                orth_loss = orth_loss_body + orth_loss_hand
+                fb_loss += self.cfg.train.ortho_coef * orth_loss
+
+                # reuse first parallel slice for metrics
+                Ms = torch.cat([Ms_body, Ms_hand], dim=-1)
+                fb_diag = fb_diag_body + hand_weight * fb_diag_hand
+                fb_offdiag = fb_offdiag_body + hand_weight * fb_offdiag_hand
+                orth_loss_diag = orth_diag_body + orth_diag_hand
+                orth_loss_offdiag = orth_offdiag_body + orth_offdiag_hand
+            else:
+                Ms = torch.matmul(Fs, B.T)  # num_parallel x batch x batch
+                diff = Ms - discount * target_M
+                fb_offdiag = 0.5 * (diff * self.off_diag).pow(2).sum() / self.off_diag_sum
+                fb_diag = -torch.diagonal(diff, dim1=1, dim2=2).mean() * Ms.shape[0]
+                fb_loss = fb_offdiag + fb_diag
+
+                Cov = torch.matmul(B, B.T)
+                orth_loss_diag = -Cov.diag().mean()
+                orth_loss_offdiag = 0.5 * (Cov * self.off_diag).pow(2).sum() / self.off_diag_sum
+                orth_loss = orth_loss_offdiag + orth_loss_diag
+                fb_loss += self.cfg.train.ortho_coef * orth_loss
 
             q_loss = torch.zeros(1, device=z.device, dtype=z.dtype)
             if q_loss_coef is not None:
                 with torch.no_grad():
-                    next_Qs = (target_Fs * z).sum(dim=-1)  # num_parallel x batch
-                    _, _, next_Q = self.get_targets_uncertainty(next_Qs, self.cfg.train.fb_pessimism_penalty)  # batch
-                    # TODO: we disable autocast here to make sure B and cov have the same dtype (otherwise torch.linalg.solve fails)
+                    if is_split:
+                        z_body = z[:, :z_body_dim]
+                        z_hand = z[:, z_body_dim:]
+                        next_Qs = (target_Fs_body * z_body).sum(dim=-1) + hand_weight * (target_Fs_hand * z_hand).sum(dim=-1)
+                    else:
+                        next_Qs = (target_Fs * z).sum(dim=-1)  # num_parallel x batch
+                    _, _, next_Q = self.get_targets_uncertainty(next_Qs, self.cfg.train.fb_pessimism_penalty)
                     with autocast(device_type=self.device, dtype=self._model.amp_dtype, enabled=False):
                         cov = torch.matmul(B.T, B) / B.shape[0]  # z_dim x z_dim
-                    # inv_cov = torch.inverse(cov)  # z_dim x z_dim
                     B_inv_conv = torch.linalg.solve(cov, B, left=False)
                     implicit_reward = (B_inv_conv * z).sum(dim=-1)  # batch
                     target_Q = implicit_reward.detach() + discount.squeeze() * next_Q  # batch
                     expanded_targets = target_Q.expand(Fs.shape[0], -1)
-                Qs = (Fs * z).sum(dim=-1)  # num_parallel x batch
+                if is_split:
+                    Qs_body = (Fs_body * z_body).sum(dim=-1)
+                    Qs_hand = (Fs_hand * z_hand).sum(dim=-1)
+                    Qs = Qs_body + hand_weight * Qs_hand
+                else:
+                    Qs = (Fs * z).sum(dim=-1)  # num_parallel x batch
                 q_loss = 0.5 * Fs.shape[0] * F.mse_loss(Qs, expanded_targets)
                 fb_loss += q_loss_coef * q_loss
 
@@ -308,12 +389,26 @@ class FBAgent:
     def update_td3_actor(
         self, obs: torch.Tensor | dict[str, torch.Tensor], z: torch.Tensor, clip_grad_norm: float | None
     ) -> Dict[str, torch.Tensor]:
+        is_split = self.cfg.model.archi.is_split_mode
         with autocast(device_type=self.device, dtype=self._model.amp_dtype, enabled=self.cfg.model.amp):
             dist = self._model._actor(obs, z, self._model.cfg.actor_std)
             action = dist.sample(clip=self.cfg.train.stddev_clip)
             Fs = self._model._forward_map(obs, z, action)  # num_parallel x batch x z_dim
-            Qs = (Fs * z).sum(-1)  # num_parallel x batch
-            _, _, Q = self.get_targets_uncertainty(Qs, self.cfg.train.actor_pessimism_penalty)  # batch
+
+            if is_split:
+                z_body_dim = self.cfg.model.archi.z_body_dim
+                hand_weight = self.cfg.model.archi.z_body_dim / self.cfg.model.archi.z_hand_dim
+                z_body = z[:, :z_body_dim]
+                z_hand = z[:, z_body_dim:]
+                Qs_body = (Fs[..., :z_body_dim] * z_body).sum(-1)  # num_parallel x batch
+                Qs_hand = (Fs[..., z_body_dim:] * z_hand).sum(-1)
+                _, _, Q_body = self.get_targets_uncertainty(Qs_body, self.cfg.train.actor_pessimism_penalty)
+                _, _, Q_hand = self.get_targets_uncertainty(Qs_hand, self.cfg.train.actor_pessimism_penalty)
+                Q = Q_body + hand_weight * Q_hand
+            else:
+                Qs = (Fs * z).sum(-1)  # num_parallel x batch
+                _, _, Q = self.get_targets_uncertainty(Qs, self.cfg.train.actor_pessimism_penalty)
+
             actor_loss = -Q.mean()
 
         # optimize actor
