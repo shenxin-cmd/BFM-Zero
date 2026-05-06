@@ -452,4 +452,10 @@ class FBcprAgent(FBAgent):
                 "Q_discriminator": Q_discriminator.mean().detach(),
                 "Q_fb": Q_fb.mean().detach(),
             }
+            if is_split:
+                output_metrics.update({
+                    "Q_fb_body": Q_fb_body.mean().detach(),
+                    "Q_fb_hand": Q_fb_hand.mean().detach(),
+                    "Q_fb_total": Q_fb.mean().detach(),
+                })
         return output_metrics

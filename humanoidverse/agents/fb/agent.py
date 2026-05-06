@@ -122,7 +122,7 @@ class FBAgent:
         self.off_diag = 1 - torch.eye(self.cfg.train.batch_size, self.cfg.train.batch_size, device=self.device)
         self.off_diag_sum = self.off_diag.sum()
 
-        self.z_buffer = ZBuffer(self.cfg.train.z_buffer_size, self.cfg.model.archi.z_dim, self._model.device)
+        self.z_buffer = ZBuffer(self.cfg.train.z_buffer_size, self.cfg.model.archi.total_z_dim, self._model.device)
 
     def setup_compile(self):
         print(f"compile {self.cfg.compile}")
@@ -375,6 +375,26 @@ class FBAgent:
                 "orth_loss_offdiag": orth_loss_offdiag,
                 "q_loss": q_loss,
             }
+            if is_split:
+                output_metrics.update({
+                    # z sub-space norms
+                    "z_body_norm": torch.norm(z[:, :z_body_dim], dim=-1).mean(),
+                    "z_hand_norm": torch.norm(z[:, z_body_dim:], dim=-1).mean(),
+                    # B sub-space norms
+                    "B_body_norm": torch.norm(B_body, dim=-1).mean(),
+                    "B_hand_norm": torch.norm(B_hand, dim=-1).mean(),
+                    # FB losses per sub-space
+                    "fb_body_loss": fb_loss_body,
+                    "fb_hand_loss": fb_loss_hand,
+                    "fb_total_loss": fb_loss,
+                    # orthonormality losses per sub-space
+                    "orth_body_loss": orth_loss_body,
+                    "orth_hand_loss": orth_loss_hand,
+                    "orth_body_loss_diag": orth_diag_body,
+                    "orth_hand_loss_diag": orth_diag_hand,
+                    "orth_body_loss_offdiag": orth_offdiag_body,
+                    "orth_hand_loss_offdiag": orth_offdiag_hand,
+                })
         return output_metrics
 
     def update_actor(
@@ -418,7 +438,14 @@ class FBAgent:
             torch.nn.utils.clip_grad_norm_(self._model._actor.parameters(), clip_grad_norm)
         self.actor_optimizer.step()
 
-        return {"actor_loss": actor_loss.detach(), "q": Q.mean().detach()}
+        output_metrics = {"actor_loss": actor_loss.detach(), "q": Q.mean().detach()}
+        if is_split:
+            output_metrics.update({
+                "q_body": Q_body.mean().detach(),
+                "q_hand": Q_hand.mean().detach(),
+                "q_total": Q.mean().detach(),
+            })
+        return output_metrics
 
     def get_targets_uncertainty(
         self, preds: torch.Tensor, pessimism_penalty: torch.Tensor | float

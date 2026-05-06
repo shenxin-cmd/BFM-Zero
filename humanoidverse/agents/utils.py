@@ -74,7 +74,7 @@ def get_unique_name() -> str:
 
 
 def get_local_workdir(name: str = "") -> str:
-    return str(Path.cwd() / "workdir" / name / get_unique_name())
+    return str(Path.cwd() / "results" / name / get_unique_name())
 
 
 def set_seed_everywhere(seed):
