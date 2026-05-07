@@ -385,6 +385,21 @@ def _dict_box_dim(space: gym_spaces.Dict, key: str) -> int:
     return int(np.prod(s.shape))
 
 
+def _phys_action_dim(env) -> int:
+    """MuJoCo 实际控制维（nu / pose 切片长度）；勿仅用 wrapper 的 action_space（可能与 Isaac padding 同为 35）。"""
+    e: object = env
+    for _ in range(32):
+        if not hasattr(e, "unwrapped"):
+            break
+        u = e.unwrapped  # type: ignore[attr-defined]
+        if u is e:
+            break
+        e = u
+    if hasattr(e, "action_size"):
+        return int(getattr(e, "action_size"))
+    return int(np.prod(env.action_space.shape))
+
+
 def _align_vec(x: np.ndarray, expected: int) -> np.ndarray:
     """Pad with zeros or truncate so vector length matches BatchNorm / obs_space (e.g. Isaac 35 vs MuJoCo 29)."""
     x = np.asarray(x, dtype=np.float32).reshape(-1)
