@@ -1,6 +1,12 @@
 """
 Isaac 上 single-frame goal inference（Split-z）。与 ``goal_inference.py`` 同源，只取一帧作目标。
 
+**目标姿态（可行性与默认）**
+    ``backward_map`` / ``goal_inference`` 只需要与训练一致的 ``state``、``last_action``、``privileged_state``。
+    这与 ``inference_tutorial.ipynb`` / ``split_z_hand_validation.py`` 思路一致：在 MuJoCo 里设关节角 → ``mj_forward`` →
+    组装 privileged + state（速度置零）。**不必**再遍历 pkl。Isaac 仍负责 rollout；参考动作由
+    ``set_is_evaluating(rollout_motion_id)`` 单独指定，可与目标 z 解耦。
+
 **Rollout z 轨迹**：默认 ``--save-z-trace`` 将每步 ``backward_map → project_z`` 得到的 **推断 z** 与 **policy z** 写入 ``.npz``（``--z-trace-out`` 可指定路径）；用 ``python -m humanoidverse.plot_split_z_rollout_pca`` 画 PCA 图。
 
 噪声与录像说明见 ``main`` 的 docstring；``python -m humanoidverse.split_z_goal_inference_isaac --help``.
@@ -31,15 +37,29 @@ else:
     HUMANOIDVERSE_DIR = Path(__file__).resolve().parent
 
 # -----------------------------------------------------------------------------
-# 用户可编辑：当命令行未传 ``--motion-id`` / ``--goal-frame`` 时使用。
-# - USE_AUTO_ONE_LEG_GOAL=True（默认）：在 lafan 库里扫描，选「双脚 z 高度差大、脚与根速度小」
-#   的帧作为**近似单脚站立**目标，避免 motion_id=0 首帧常为 T 字/大臂张开站立。
-# - 设为 False 时改用下面固定 GOAL_MOTION_ID / GOAL_FRAME_IDX。
-# 命令行仍可 ``--motion-id`` / ``--goal-frame`` 覆盖；仅传 ``--motion-id`` 时会在该条 motion 内自动选帧。
+# 默认：MuJoCo 关节增量构造 goal（对齐 ``split_z_hand_validation.build_goal_arrays_from_mujoco_stand``，同 tutorial 逻辑）。
+# 关节名为训练 ``g1_29dof`` dof 名；值为在 **默认站姿**（与 ``split_z_hand_validation._REF_DEFAULT_DOF_POS``）上的增量 [rad]。
+# 关闭方式：``--no-use-mujoco-custom-goal`` 或 ``USE_MUJOCO_CUSTOM_GOAL = False`` 走下方 motion 库目标。
+# -----------------------------------------------------------------------------
+USE_MUJOCO_CUSTOM_GOAL = True
+
+# 示例：近似单腿支撑（可自行微调）；若想要 tutorial 式 T pose，可参考 inference_tutorial 里肩/肘赋值改到本 dict。
+GOAL_POSE_JOINT_DELTA_RAD: dict[str, float] = {
+    "left_hip_pitch_joint": -0.45,
+    "left_hip_roll_joint": -0.08,
+    "left_knee_joint": 0.75,
+    "left_ankle_pitch_joint": -0.35,
+    "right_knee_joint": 0.12,
+}
+
+# -----------------------------------------------------------------------------
+# Motion 库目标（仅当 ``USE_MUJOCO_CUSTOM_GOAL`` 为 False，且未显式关掉自动选帧等）
 # -----------------------------------------------------------------------------
 USE_AUTO_ONE_LEG_GOAL = True
 GOAL_MOTION_ID = 0
 GOAL_FRAME_IDX = 0
+# rollout 参考轨迹起始 id（eval 装入 num_envs 条 clip）；与 MuJoCo 目标 z 独立
+ROLLOUT_REF_MOTION_ID = 0
 
 
 def _pick_one_leg_goal_frame(env, motion_id: int | None) -> tuple[int, int]:
@@ -104,6 +124,8 @@ def main(
     data_path: Path | None = None,
     motion_id: int | None = None,
     goal_frame: int | None = None,
+    use_mujoco_custom_goal: bool = USE_MUJOCO_CUSTOM_GOAL,
+    mujoco_goal_xml: Path | None = None,
     headless: bool = True,
     device: str = "cuda",
     simulator: str = "isaacsim",
@@ -132,9 +154,11 @@ def main(
     ``z_hand`` 是训练中 **语义空间** 的子向量，并不等于在动作末尾直接加大幅度白噪。
     可试 ``--policy-sample`` 略增手部随机性。
 
-    **默认目标姿态**：模块级 ``USE_AUTO_ONE_LEG_GOAL`` 为 True 时，在未指定 ``--goal-frame`` 的情况下会在
-    lafan 库里自动选取「双脚高度差较大且脚部/根部速度较小」的一帧作为单脚站立近似；关闭则使用
-    ``GOAL_MOTION_ID`` / ``GOAL_FRAME_IDX``。
+    **目标姿态**：默认 ``use_mujoco_custom_goal`` 取模块 ``USE_MUJOCO_CUSTOM_GOAL``（默认 True），
+    用 ``GOAL_POSE_JOINT_DELTA_RAD`` 经 MuJoCo FK 构造（与 inference_tutorial / split_z_hand_validation 一致）。
+    传 ``--no-use-mujoco-custom-goal`` 时从 lafan motion 取帧；``USE_AUTO_ONE_LEG_GOAL`` / ``--goal-frame`` 等规则同旧版。
+
+    **Rollout 参考轨迹**：MuJoCo 目标下 ``--motion-id`` 仅影响 ``set_is_evaluating`` 装入的参考 clip；未传时用 ``ROLLOUT_REF_MOTION_ID``。
     """
 
     model_folder = Path(model_folder)
@@ -192,46 +216,83 @@ def main(
     wrapped_env, _ = env_cfg.build(num_envs)
     env = wrapped_env._env
 
-    if goal_frame is not None:
-        mid = GOAL_MOTION_ID if motion_id is None else motion_id
-        fid = goal_frame
-    elif USE_AUTO_ONE_LEG_GOAL:
-        focus = motion_id
-        mid, fid = _pick_one_leg_goal_frame(env, focus)
+    umc = use_mujoco_custom_goal
+    if umc and goal_frame is not None:
+        print("提示: 已启用 MuJoCo 关节目标，忽略 --goal-frame。")
+
+    if umc:
+        from humanoidverse.split_z_hand_validation import DEFAULT_MUJOCO_SCENE, build_goal_arrays_from_mujoco_stand
+        from humanoidverse.utils.g1_env_config import get_g1_robot_xml_root
+
+        rollout_mid = int(motion_id) if motion_id is not None else ROLLOUT_REF_MOTION_ID
+        xml_path = Path(mujoco_goal_xml).resolve() if mujoco_goal_xml is not None else (get_g1_robot_xml_root() / DEFAULT_MUJOCO_SCENE)
+        arrs = build_goal_arrays_from_mujoco_stand(
+            mujoco_scene_xml=xml_path,
+            root_height_obs=use_root_height_obs,
+            joint_delta_rad=GOAL_POSE_JOINT_DELTA_RAD,
+        )
+        backward_keys = ["state", "last_action", "privileged_state"]
+        goal_observation = {
+            k: torch.as_tensor(arrs[k], device=model.device, dtype=torch.float32).unsqueeze(0) for k in backward_keys
+        }
+        goal_source = "mujoco_joint_delta"
+        trace_file_tag = "mujoco_goal"
+        mid_meta = -1
+        fid_meta = 0
+        _mkey_s = f"mujoco:{xml_path.name}"
     else:
-        mid = GOAL_MOTION_ID if motion_id is None else motion_id
-        fid = GOAL_FRAME_IDX
+        if goal_frame is not None:
+            mid = GOAL_MOTION_ID if motion_id is None else motion_id
+            fid = goal_frame
+        elif USE_AUTO_ONE_LEG_GOAL:
+            focus = motion_id
+            mid, fid = _pick_one_leg_goal_frame(env, focus)
+        else:
+            mid = GOAL_MOTION_ID if motion_id is None else motion_id
+            fid = GOAL_FRAME_IDX
+
+        rollout_mid = mid
+        goal_source = "motion_lib"
+        trace_file_tag = f"M{mid}_f{fid}".replace(".", "p")
+        mid_meta = mid
+        fid_meta = fid
+
+        env.set_is_evaluating(rollout_mid)
+        gobs, _gobs_dict = get_backward_observation(
+            env, 0, use_root_height_obs=use_root_height_obs, velocity_multiplier=0
+        )
+        n_frames = int(gobs["state"].shape[0])
+        if fid < 0 or fid >= n_frames:
+            raise IndexError(f"goal_frame {fid} out of range [0, {n_frames}) for motion {mid}")
+
+        goal_observation = {k: v[fid : fid + 1] for k, v in gobs.items()}
+        goal_observation = tree_map(
+            lambda x: x.detach().clone().to(device=model.device, dtype=torch.float32)
+            if isinstance(x, torch.Tensor)
+            else torch.as_tensor(x, device=model.device, dtype=torch.float32),
+            goal_observation,
+        )
+        backward_keys = list(goal_observation.keys())
+
+        try:
+            _mkey = env._motion_lib._motion_data_keys[mid]
+            _mkey_s = _mkey.item() if hasattr(_mkey, "item") else str(_mkey)
+        except Exception:
+            _mkey_s = "?"
 
     vc = video_camera.lower().strip()
     if vc not in ("face_torso", "track"):
         raise ValueError("video_camera must be 'face_torso' or 'track'.")
 
-    try:
-        _mkey = env._motion_lib._motion_data_keys[mid]
-        _mkey_s = _mkey.item() if hasattr(_mkey, "item") else str(_mkey)
-    except Exception:
-        _mkey_s = "?"
-    print(f"motion_id={mid}, goal_frame={fid}, motion_key={_mkey_s}, use_root_height_obs={use_root_height_obs}")
+    print(
+        f"goal_source={goal_source} | rollout_ref_motion_id={rollout_mid} | "
+        f"motion_id_meta={mid_meta} goal_frame_meta={fid_meta} | motion_key={_mkey_s} | "
+        f"use_root_height_obs={use_root_height_obs}"
+    )
     print(f"hand_noise_std={hand_noise_std} | video_camera={vc} | policy_sample={policy_sample}")
 
-    env.set_is_evaluating(mid)
-    # motion 库与 goal_inference 一致：eval 只载入一条 clip，批量内局部索引恒为 0（不是数据集 motion_id）
-    gobs, _gobs_dict = get_backward_observation(
-        env, 0, use_root_height_obs=use_root_height_obs, velocity_multiplier=0
-    )
-    n_frames = int(gobs["state"].shape[0])
-    if fid < 0 or fid >= n_frames:
-        raise IndexError(f"goal_frame {fid} out of range [0, {n_frames}) for motion {mid}")
-
-    goal_observation = {k: v[fid : fid + 1] for k, v in gobs.items()}
-    goal_observation = tree_map(
-        lambda x: x.detach().clone().to(device=model.device, dtype=torch.float32)
-        if isinstance(x, torch.Tensor)
-        else torch.as_tensor(x, device=model.device, dtype=torch.float32),
-        goal_observation,
-    )
-
-    backward_keys = list(goal_observation.keys())
+    if umc:
+        env.set_is_evaluating(rollout_mid)
 
     with torch.no_grad():
         z_ref = model.goal_inference(goal_observation)
@@ -332,11 +393,13 @@ def main(
         zh_arr = np.stack(inferred_h, axis=0)
         zf_arr = np.stack(inferred_f, axis=0)
         trace_path = Path(z_trace_out) if z_trace_out is not None else vid_dir / (
-            f"ztrace_M{mid}_f{fid}_hnoise{hand_noise_std:.4f}".replace(".", "p") + ".npz"
+            f"ztrace_{trace_file_tag}_hnoise{hand_noise_std:.4f}".replace(".", "p") + ".npz"
         )
         meta = {
-            "motion_id": mid,
-            "goal_frame": fid,
+            "goal_source": goal_source,
+            "rollout_ref_motion_id": rollout_mid,
+            "motion_id": mid_meta,
+            "goal_frame": fid_meta,
             "hand_noise_std": hand_noise_std,
             "episode_len": episode_len,
             "num_inferred": int(zb_arr.shape[0]),
@@ -366,7 +429,7 @@ def main(
         noise_tag = f"hnoise{hand_noise_std:.4f}".replace(".", "p")
         vc_tag = vc
         samp = "_psample" if policy_sample else ""
-        out_mp4 = vid_dir / f"goal_M{mid}_f{fid}_{noise_tag}_{vc_tag}{samp}{sfx}.mp4"
+        out_mp4 = vid_dir / f"goal_{trace_file_tag}_{noise_tag}_{vc_tag}{samp}{sfx}.mp4"
         media.write_video(str(out_mp4), frames, fps=50)
         print(f"Saved video: {out_mp4}")
 
