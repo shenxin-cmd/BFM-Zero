@@ -410,8 +410,6 @@ def main(
     fps: int = 50,
 ) -> None:
     """CLI：不传 ``goal-file`` 时用内置 MuJoCo 站立 + 本文件顶部 ``STAND_POSE_JOINT_DELTA_RAD``。"""
-    import gymnasium as gymnasium
-
     from humanoidverse.agents.load_utils import load_model_from_checkpoint_dir
     from humanoidverse.utils.g1_env_config import G1EnvConfig, NoiseConfig, get_g1_robot_xml_root
 
@@ -482,7 +480,8 @@ def main(
         render_width=640,
         camera="track",
     ).build(num_envs=1)
-    env = gymnasium.wrappers.unwrap_env(env_wrapped)
+    # Gymnasium has no `wrappers.unwrap_env`; use core `unwrapped` (chains through wrappers).
+    env = env_wrapped.unwrapped
 
     out = Path(video_path) if video_path is not None else Path.cwd() / "split_z_hand_sweep.mp4"
     frames: list[np.ndarray] = []
