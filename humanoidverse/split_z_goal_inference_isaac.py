@@ -43,20 +43,28 @@ GOAL_FRAME_IDX = 0
 
 
 def _pick_one_leg_goal_frame(env, motion_id: int | None) -> tuple[int, int]:
-    """在 motion 库中选一帧：双脚高度差大且脚/根线速度小，用作单脚站立目标近似。"""
+    """在 motion 库中选一帧：双脚高度差大且脚/根线速度小，用作单脚站立目标近似。
+
+    注意：``MotionLib`` 在 eval 时往往只把 **num_envs 条** motion 载入显存，``len(_motion_lengths)==已载入条数``，
+    不能与 ``_num_unique_motions``（数据集里总条数）混用。此处通过 ``load_motions(start_idx=..., num_motions_to_load=1)``
+    逐条载入并在 **局部槽位 0** 上打分；全库扫描时对每条数据集 motion 各 load 一次（时间 O(N)，内存友好）。
+    """
     ml = env._motion_lib
     feet = env.feet_indices.long()
     if feet.numel() < 2:
         raise RuntimeError("feet_indices 至少需要两只脚以自动选单脚站立帧。")
 
-    def best_in_motion(mid: int) -> tuple[int, float]:
-        motion_len = ml._motion_lengths[mid]
+    n_unique = int(ml._num_unique_motions)
+
+    def best_in_loaded_slot0() -> tuple[int, float]:
+        """当前库内只载入了批量 motion，本环境 num_envs=1 时长度恒为 1，对应局部索引 0。"""
+        motion_len = ml._motion_lengths[0]
         n = int(torch.ceil(motion_len / env.dt).item())
         if n < 1:
             return 0, -1.0
         t = torch.arange(n, device=env.device, dtype=torch.float32) * env.dt
         with torch.no_grad():
-            res = ml.get_motion_state(mid, t)
+            res = ml.get_motion_state(0, t)
         rg = res["rg_pos_t"]
         bv = res["body_vel_t"]
         zl = rg[:, feet[0], 2]
@@ -68,16 +76,26 @@ def _pick_one_leg_goal_frame(env, motion_id: int | None) -> tuple[int, int]:
         j = int(score.argmax().item())
         return j, float(score[j].item())
 
-    if motion_id is not None:
-        fid, _ = best_in_motion(motion_id)
-        return motion_id, fid
+    def load_one_dataset_motion(dataset_idx: int) -> None:
+        dataset_idx = int(np.clip(dataset_idx, 0, max(n_unique - 1, 0)))
+        ml.load_motions(
+            random_sample=False,
+            num_motions_to_load=1,
+            start_idx=dataset_idx,
+        )
 
-    num_motions = int(ml._num_unique_motions)
+    if motion_id is not None:
+        ds = int(np.clip(motion_id, 0, max(n_unique - 1, 0)))
+        load_one_dataset_motion(ds)
+        fid, _ = best_in_loaded_slot0()
+        return ds, fid
+
     best_mid, best_fid, best_s = 0, 0, -1.0
-    for mid in range(num_motions):
-        fid, s = best_in_motion(mid)
+    for ds_idx in range(n_unique):
+        load_one_dataset_motion(ds_idx)
+        fid, s = best_in_loaded_slot0()
         if s > best_s:
-            best_mid, best_fid, best_s = mid, fid, s
+            best_mid, best_fid, best_s = ds_idx, fid, s
     return best_mid, best_fid
 
 
@@ -197,7 +215,10 @@ def main(
     print(f"hand_noise_std={hand_noise_std} | video_camera={vc} | policy_sample={policy_sample}")
 
     env.set_is_evaluating(mid)
-    gobs, _gobs_dict = get_backward_observation(env, mid, use_root_height_obs=use_root_height_obs, velocity_multiplier=0)
+    # motion 库与 goal_inference 一致：eval 只载入一条 clip，批量内局部索引恒为 0（不是数据集 motion_id）
+    gobs, _gobs_dict = get_backward_observation(
+        env, 0, use_root_height_obs=use_root_height_obs, velocity_multiplier=0
+    )
     n_frames = int(gobs["state"].shape[0])
     if fid < 0 or fid >= n_frames:
         raise IndexError(f"goal_frame {fid} out of range [0, {n_frames}) for motion {mid}")
