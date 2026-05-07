@@ -57,12 +57,13 @@ def main(model_folder: Path, data_path: Path | None = None, headless: bool = Tru
 
     output_dir = model_folder / "exported"
     output_dir.mkdir(parents=True, exist_ok=True)
+    z_export_dim = model.cfg.archi.total_z_dim
     export_meta_policy_as_onnx(
         model,
         output_dir,
         f"{model_name}.onnx",
-        {"actor_obs": torch.randn(1, model._actor.input_filter.output_space.shape[0] + model.cfg.archi.z_dim)},
-        z_dim=model.cfg.archi.z_dim,
+        {"actor_obs": torch.randn(1, model._actor.input_filter.output_space.shape[0] + z_export_dim)},
+        z_dim=z_export_dim,
         history=('history_actor' in model.cfg.archi.actor.input_filter.key),
         use_29dof=True,
     )

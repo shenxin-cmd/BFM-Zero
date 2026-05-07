@@ -237,7 +237,10 @@ def get_backward_observation(env, motion_id, use_root_height_obs: bool = False, 
         return max_local_self_obs, ref_dict
 
 
-def export_meta_policy_as_onnx(inference_model, path, exported_policy_name, example_obs_dict, z_dim, history: bool = False, use_29dof: bool = True):
+def export_meta_policy_as_onnx(
+    inference_model, path, exported_policy_name, example_obs_dict, z_dim, history: bool = False, use_29dof: bool = True
+):
+    # z_dim: tail length of z concatenated to actor obs; for split-z models pass archi.total_z_dim (not legacy z_dim).
     os.makedirs(path, exist_ok=True)
     path = os.path.join(path, exported_policy_name)
     inference_model = inference_model.eval()
