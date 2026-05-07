@@ -47,6 +47,7 @@ from pathlib import Path
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 
+import gymnasium.spaces as gym_spaces
 import joblib
 import mediapy as media
 import mujoco
@@ -375,14 +376,37 @@ def _to_model_obs(d: dict[str, np.ndarray], keys: list[str], device: torch.devic
     return out
 
 
+def _dict_box_dim(space: gym_spaces.Dict, key: str) -> int:
+    if key not in space.spaces:
+        raise KeyError(f"model.obs_space has no key {key!r}; keys={list(space.spaces.keys())}")
+    s = space.spaces[key]
+    if not isinstance(s, gym_spaces.Box):
+        raise TypeError(f"Expected Box for {key!r}, got {type(s)}")
+    return int(np.prod(s.shape))
+
+
+def _align_vec(x: np.ndarray, expected: int) -> np.ndarray:
+    """Pad with zeros or truncate so vector length matches BatchNorm / obs_space (e.g. Isaac 35 vs MuJoCo 29)."""
+    x = np.asarray(x, dtype=np.float32).reshape(-1)
+    if x.size == expected:
+        return x
+    if x.size > expected:
+        return x[:expected].copy()
+    out = np.zeros(expected, dtype=np.float32)
+    out[: x.size] = x
+    return out
+
+
 def _actor_obs_from_g1_step(
     obs: dict[str, np.ndarray],
     history_actor_fixed: torch.Tensor,
     device: torch.device,
+    state_dim: int,
+    last_action_dim: int,
 ) -> dict[str, torch.Tensor]:
     """用 G1 单步观测更新 state / last_action；history 沿用 goal 初始化（与 humenv 不提供 4 帧栈一致）。"""
-    s = np.asarray(obs["state"], dtype=np.float32).reshape(-1)
-    la = np.asarray(obs["last_action"], dtype=np.float32).reshape(-1)
+    s = _align_vec(obs["state"], state_dim)
+    la = _align_vec(obs["last_action"], last_action_dim)
     return {
         "state": torch.from_numpy(s).to(device=device, dtype=torch.float32).unsqueeze(0),
         "last_action": torch.from_numpy(la).to(device=device, dtype=torch.float32).unsqueeze(0),
@@ -453,6 +477,13 @@ def main(
             "Checkpoint is not split-z mode. Use ``train_bfm_zero_split_z`` checkpoint.",
         )
 
+    sp = model.obs_space
+    if not isinstance(sp, gym_spaces.Dict):
+        raise RuntimeError(
+            "This script expects a Dict obs_space (Isaac/HumEnv-style keys). Got "
+            f"{type(sp).__name__}.",
+        )
+
     root_height_obs = bool(train_cfg.get("env", {}).get("root_height_obs", False))
     mz = mujoco_xml if mujoco_xml is not None else get_g1_robot_xml_root() / DEFAULT_MUJOCO_SCENE
 
@@ -470,6 +501,11 @@ def main(
         g_numpy = _load_goal_dict(gf)
 
     _require_keys(g_numpy, ["state", "privileged_state", "last_action", "history_actor"])
+
+    # Isaac 训练里 last_action / actions 常与 MuJoCo nu（29）不等（多 padding），否则 BatchNorm 维度报错。
+    g_numpy["state"] = _align_vec(g_numpy["state"], _dict_box_dim(sp, "state"))
+    g_numpy["last_action"] = _align_vec(g_numpy["last_action"], _dict_box_dim(sp, "last_action"))
+    g_numpy["history_actor"] = _align_vec(g_numpy["history_actor"], _dict_box_dim(sp, "history_actor"))
 
     z_body_dim = model.cfg.archi.z_body_dim
     z_hand_dim = model.cfg.archi.z_hand_dim
@@ -517,6 +553,10 @@ def main(
     video_stds = list(video_hand_noise_stds) if video_hand_noise_stds is not None else stds
     history_fixed = obs_actor["history_actor"]
 
+    state_dim = _dict_box_dim(sp, "state")
+    last_action_dim = _dict_box_dim(sp, "last_action")
+    env_act_dim = int(np.prod(env_wrapped.action_space.shape))
+
     for std in video_stds:
         noise = torch.randn(zh0.shape, device=zh0.device, dtype=zh0.dtype, generator=rng)
         zh = zh0 + float(std) * noise
@@ -527,10 +567,14 @@ def main(
         if r0 is not None:
             frames.append(np.asarray(r0))
         for _ in range(video_steps_per_noise):
-            obs_t = _actor_obs_from_g1_step(obs, history_fixed, dev)
+            obs_t = _actor_obs_from_g1_step(obs, history_fixed, dev, state_dim, last_action_dim)
             with torch.no_grad():
                 action = model.act(obs_t, z, mean=True)
-            a_np = action.squeeze(0).detach().cpu().numpy()
+            a_flat = action.squeeze(0).detach().cpu().numpy().reshape(-1)
+            if a_flat.size >= env_act_dim:
+                a_np = a_flat[:env_act_dim]
+            else:
+                a_np = _align_vec(a_flat, env_act_dim)
             obs, _r, _te, _tu, _i = env_wrapped.step(a_np)
             fr = env_wrapped.render()
             if fr is not None:
