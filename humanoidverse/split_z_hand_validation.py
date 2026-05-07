@@ -61,6 +61,8 @@ from scipy.spatial.transform import Rotation as ScipyR
 # -----------------------------------------------------------------------------
 
 # 在此 dict 中填写要调整的关节名 -> 相对默认值的增量 [rad]；未列出的关节保持默认。
+# （若希望改用 **绝对铰链角** [rad]，可调用 ``build_goal_arrays_from_mujoco_stand(..., joint_abs_rad={...})``，
+# 与 ``joint_delta_rad`` 二选一传入非空。）
 STAND_POSE_JOINT_DELTA_RAD: dict[str, float] = {
     # 例：略抬右肩
     # "right_shoulder_pitch_joint": 0.3,
@@ -218,12 +220,18 @@ def build_goal_arrays_from_mujoco_stand(
     *,
     mujoco_scene_xml: Path,
     root_height_obs: bool,
-    joint_delta_rad: dict[str, float],
+    joint_delta_rad: dict[str, float] | None = None,
+    joint_abs_rad: dict[str, float] | None = None,
     gravity_z: float = -9.81,
 ) -> dict[str, np.ndarray]:
     """
     组装与 ``helpers.get_backward_observation(..., use_obs_filter 逻辑)`` 对齐的一帧观测
     （速度置零，等价于velocity_multiplier=0）。
+
+    关节目标二选一：
+    - ``joint_abs_rad``：各名为 **铰链角的绝对值** [rad]；未出现的关节用 ``_REF_DEFAULT_DOF_POS``。
+    - 否则：``joint_delta_rad``（默认 ``{}``）在默认站姿上加增量。
+    二者请勿同时传入非空（会 ``ValueError``）。
     """
     from humanoidverse.envs.legged_robot_motions.legged_robot_motions import compute_humanoid_observations_max
     from humanoidverse.utils.g1_env_config import get_g1_robot_xml_root
@@ -246,9 +254,17 @@ def build_goal_arrays_from_mujoco_stand(
     mj_type_hinge = int(mujoco.mjtJoint.mjJNT_HINGE)
 
     defaults = np.array([_REF_DEFAULT_DOF_POS[n] for n in _DOF_NAMES], dtype=np.float64)
+    dmap = joint_delta_rad if joint_delta_rad is not None else {}
+    amap = joint_abs_rad
+
+    if amap is not None and len(dmap) > 0:
+        raise ValueError("Use only one of joint_abs_rad or joint_delta_rad (non-empty), not both.")
 
     def _effective_angle(name: str) -> float:
-        return float(defaults[_DOF_NAMES.index(name)]) + float(joint_delta_rad.get(name, 0.0))
+        i = _DOF_NAMES.index(name)
+        if amap is not None:
+            return float(amap[name]) if name in amap else float(defaults[i])
+        return float(defaults[i]) + float(dmap.get(name, 0.0))
 
     # 写入与训练 dof 列表一致的铰链关节角（MJCF 必须与这些 joint 名称一致）。
     for jn in _DOF_NAMES:

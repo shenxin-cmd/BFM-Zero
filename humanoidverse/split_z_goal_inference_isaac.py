@@ -37,20 +37,51 @@ else:
     HUMANOIDVERSE_DIR = Path(__file__).resolve().parent
 
 # -----------------------------------------------------------------------------
-# 默认：MuJoCo 关节增量构造 goal（对齐 ``split_z_hand_validation.build_goal_arrays_from_mujoco_stand``，同 tutorial 逻辑）。
-# 关节名为训练 ``g1_29dof`` dof 名；值为在 **默认站姿**（与 ``split_z_hand_validation._REF_DEFAULT_DOF_POS``）上的增量 [rad]。
-# 关闭方式：``--no-use-mujoco-custom-goal`` 或 ``USE_MUJOCO_CUSTOM_GOAL = False`` 走下方 motion 库目标。
+# MuJoCo 手写 goal：build_goal_arrays_from_mujoco_stand（关节名见 split_z_hand_validation._DOF_NAMES）。
+# - GOAL_USE_ABSOLUTE_JOINT_RAD=True：GOAL_POSE_JOINT_ABS_RAD 中为 **铰链角绝对值** [rad]，未写的关节用
+#   _REF_DEFAULT_DOF_POS（与 g1_29dof.yaml 默认站姿一致）。
+# - False：则用 GOAL_POSE_JOINT_DELTA_RAD 在默认站姿上加增量。
+# 关闭手写 goal：`--no-use-mujoco-custom-goal` 或 USE_MUJOCO_CUSTOM_GOAL = False → 下方 motion 库逻辑。
 # -----------------------------------------------------------------------------
 USE_MUJOCO_CUSTOM_GOAL = True
 
-# 示例：近似单腿支撑（可自行微调）；若想要 tutorial 式 T pose，可参考 inference_tutorial 里肩/肘赋值改到本 dict。
-GOAL_POSE_JOINT_DELTA_RAD: dict[str, float] = {
-    "left_hip_pitch_joint": -0.45,
-    "left_hip_roll_joint": -0.08,
-    "left_knee_joint": 0.75,
-    "left_ankle_pitch_joint": -0.35,
-    "right_knee_joint": 0.12,
+GOAL_USE_ABSOLUTE_JOINT_RAD = True
+
+# 绝对角 [rad]（与往日「增量版」观感接近的一组示例；可自行改）
+GOAL_POSE_JOINT_ABS_RAD: dict[str, float] = {
+    "left_hip_pitch_joint": -0.1,
+    "left_hip_roll_joint": 0.0,
+    "left_hip_yaw_joint": 0.0,
+    "left_knee_joint": 0.3,
+    "left_ankle_pitch_joint": -0.2,
+    "left_ankle_roll_joint": 0.0,
+    "right_hip_pitch_joint": -0.1,
+    "right_hip_roll_joint": 0.0,
+    "right_hip_yaw_joint": 0.0,
+    "right_knee_joint": 0.3,
+    "right_ankle_pitch_joint": -0.2,
+    "right_ankle_roll_joint": 0.0,
+    "waist_yaw_joint": 0.0,
+    "waist_roll_joint": 0.0,
+    "waist_pitch_joint": 0.0,
+    "left_shoulder_pitch_joint": -0.09,
+    "left_shoulder_roll_joint": 0.41,
+    "left_shoulder_yaw_joint": 0.38,
+    "left_elbow_joint": -0.05,
+    "left_wrist_roll_joint": 0.03,
+    "left_wrist_pitch_joint": 0.38,
+    "left_wrist_yaw_joint": 0.38,
+    "right_shoulder_pitch_joint": -0.09,
+    "right_shoulder_roll_joint": 0.01,
+    "right_shoulder_yaw_joint": 0.38,
+    "right_elbow_joint": -0.05,
+    "right_wrist_roll_joint": 0.03,
+    "right_wrist_pitch_joint": 0.38,
+    "right_wrist_yaw_joint": 0.38,
 }
+
+# 仅当 GOAL_USE_ABSOLUTE_JOINT_RAD=False 时生效。
+GOAL_POSE_JOINT_DELTA_RAD: dict[str, float] = {}
 
 # -----------------------------------------------------------------------------
 # Motion 库目标（仅当 ``USE_MUJOCO_CUSTOM_GOAL`` 为 False，且未显式关掉自动选帧等）
@@ -155,7 +186,7 @@ def main(
     可试 ``--policy-sample`` 略增手部随机性。
 
     **目标姿态**：默认 ``use_mujoco_custom_goal`` 取模块 ``USE_MUJOCO_CUSTOM_GOAL``（默认 True），
-    用 ``GOAL_POSE_JOINT_DELTA_RAD`` 经 MuJoCo FK 构造（与 inference_tutorial / split_z_hand_validation 一致）。
+    用 ``GOAL_POSE_JOINT_ABS_RAD``（绝对 rad）或 ``GOAL_POSE_JOINT_DELTA_RAD``（由 ``GOAL_USE_ABSOLUTE_JOINT_RAD`` 切换）。
     传 ``--no-use-mujoco-custom-goal`` 时从 lafan motion 取帧；``USE_AUTO_ONE_LEG_GOAL`` / ``--goal-frame`` 等规则同旧版。
 
     **Rollout 参考轨迹**：MuJoCo 目标下 ``--motion-id`` 仅影响 ``set_is_evaluating`` 装入的参考 clip；未传时用 ``ROLLOUT_REF_MOTION_ID``。
@@ -229,7 +260,8 @@ def main(
         arrs = build_goal_arrays_from_mujoco_stand(
             mujoco_scene_xml=xml_path,
             root_height_obs=use_root_height_obs,
-            joint_delta_rad=GOAL_POSE_JOINT_DELTA_RAD,
+            joint_abs_rad=GOAL_POSE_JOINT_ABS_RAD if GOAL_USE_ABSOLUTE_JOINT_RAD else None,
+            joint_delta_rad=None if GOAL_USE_ABSOLUTE_JOINT_RAD else GOAL_POSE_JOINT_DELTA_RAD,
         )
         backward_keys = ["state", "last_action", "privileged_state"]
         goal_observation = {
