@@ -71,7 +71,7 @@ class G1Base(gymnasium.Env):
 
     def render(
         self,
-        camera: str | None = None,
+        camera: str | mujoco.MjvCamera | None = None,
         scene_option: Optional[mujoco.MjvOption] = None,
     ) -> np.ndarray | None:
         # We had to hijack whole render code because we need stuff between "update_scene" and "render"
@@ -82,8 +82,12 @@ class G1Base(gymnasium.Env):
                 height=self._config.render_height,
             )
             mujoco.mj_forward(self._mj_model, self._mj_data)
-        camera = camera or self._config.camera
-        self.renderer.update_scene(self._mj_data, camera=camera, scene_option=scene_option)
+        cam_arg: str | mujoco.MjvCamera
+        if camera is None:
+            cam_arg = self._config.camera
+        else:
+            cam_arg = camera
+        self.renderer.update_scene(self._mj_data, camera=cam_arg, scene_option=scene_option)
         if self._config.render_task:
             self._render_task()
 

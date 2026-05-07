@@ -1,24 +1,7 @@
 """
-Isaac 上 single-frame 的 goal inference（Split-z 友好），不依赖多目标 pkl。
+Isaac 上 single-frame goal inference（Split-z）。与 ``goal_inference.py`` 同源，只取一帧作目标。
 
-流程（与 ``goal_inference.py`` 一致：Isaac 环境 + ``get_backward_observation`` + ``model.goal_inference``），
-区别为 **只取运动库中一帧** 作为目标，并在代码顶部可编辑默认 ``motion_id`` / ``goal_frame``。
-
-``z_hand`` 噪声：在 ``project_z`` 前只对 ``z_ref`` 的手部子向量加高斯扰动，再 ``project_z`` 拼回，
-闭环 rollout 与 ``goal_inference.py`` 相同（每步用环境观测 + 固定 ``z`` 调用 ``model.act``）。
-
-用法::
-
-  # 默认使用文件顶部 GOAL_MOTION_ID / GOAL_FRAME_IDX；手部无噪声；保存 MP4
-  python -m humanoidverse.split_z_goal_inference_isaac \\
-    --model-folder workdir/bfmzero-split-z/<run> \\
-    --data-path humanoidverse/data/lafan_29dof.pkl
-
-  # 只看右手扰动：无噪与有噪各跑一次，对比两段视频
-  python -m humanoidverse.split_z_goal_inference_isaac ... --hand-noise-std 0   --video-suffix clean
-  python -m humanoidverse.split_z_goal_inference_isaac ... --hand-noise-std 2.0 --video-suffix zh_noisy
-
-环境变量：沿用 Isaac / 仓库约定，见 ``goal_inference.py``。
+噪声与录像说明见 ``main`` 的 docstring；``python -m humanoidverse.split_z_goal_inference_isaac --help``.
 """
 from __future__ import annotations
 
@@ -68,7 +51,21 @@ def main(
     disable_dr: bool = False,
     disable_obs_noise: bool = False,
     export_onnx: bool = False,
+    video_camera: str = "face_torso",
+    face_torso_camera_distance: float = 2.75,
+    face_torso_camera_elevation_deg: float = 14.0,
+    policy_sample: bool = False,
 ) -> None:
+    """
+    **z_hand 噪声**：先做 ``zh <- zh_ref + hand_noise_std * ε``（ε∼标准正态），再 ``project_z(cat(z_body, zh))``.
+    Split 模式下 ``project_z`` 对 ``z_hand`` 做 normalize，故 **极大 std 不会改变投影后的范数量级**，只会改变与其它随机方向的混合，
+    ``std`` 从 2 调到 20 往往看起来差不多属正常。
+
+    **为何不“乱挥”**：策略 ``act(..., mean=True)`` 取 **均值**，无采样噪声；映射到 **有界关节动作**，
+    ``z_hand`` 是训练中 **语义空间** 的子向量，并不等于在动作末尾直接加大幅度白噪。
+    可试 ``--policy-sample`` 略增手部随机性。
+    """
+
     model_folder = Path(model_folder)
     vid_dir = Path(video_folder) if video_folder is not None else model_folder / "split_z_goal_isaac" / "videos"
     vid_dir.mkdir(parents=True, exist_ok=True)
@@ -127,8 +124,12 @@ def main(
     mid = GOAL_MOTION_ID if motion_id is None else motion_id
     fid = GOAL_FRAME_IDX if goal_frame is None else goal_frame
 
+    vc = video_camera.lower().strip()
+    if vc not in ("face_torso", "track"):
+        raise ValueError("video_camera must be 'face_torso' or 'track'.")
+
     print(f"motion_id={mid}, goal_frame={fid}, use_root_height_obs={use_root_height_obs}")
-    print(f"hand_noise_std={hand_noise_std} (z_hand only, before project_z)")
+    print(f"hand_noise_std={hand_noise_std} | video_camera={vc} | policy_sample={policy_sample}")
 
     env.set_is_evaluating(mid)
     gobs, _gobs_dict = get_backward_observation(env, mid, use_root_height_obs=use_root_height_obs, velocity_multiplier=0)
@@ -158,10 +159,23 @@ def main(
         noise = torch.randn(zh.shape, device=zh.device, dtype=zh.dtype, generator=rng)
         zh = zh + float(hand_noise_std) * noise
     z = model.project_z(torch.cat([zb, zh], dim=-1))
-    print(f"z after noise+project_z: ||z||={z.norm().item():.4f}")
+
+    zb2 = z[:, : model.cfg.archi.z_body_dim]
+    zh2 = z[:, model.cfg.archi.z_body_dim :]
+    print(
+        f"z after noise+project_z: ||z||={z.norm().item():.4f}, "
+        f"||z_body||={zb2.norm().item():.4f}, ||z_hand||={zh2.norm().item():.4f}"
+    )
+
+    render_inner = wrapped_env._env
 
     if save_mp4:
-        rgb_renderer = IsaacRendererWithMuJoco(render_size=256)
+        rgb_renderer = IsaacRendererWithMuJoco(
+            render_size=256,
+            video_camera=vc,
+            face_torso_distance=face_torso_camera_distance,
+            face_torso_elevation_deg=face_torso_camera_elevation_deg,
+        )
 
     observation, info = wrapped_env.reset(to_numpy=False)
     observation, info = wrapped_env.reset(to_numpy=False)
@@ -170,18 +184,22 @@ def main(
 
     frames: list = []
     _pbar = tqdm(desc="steps", disable=False, leave=False, total=episode_len)
+    zn = z.repeat(render_inner.num_envs, 1)
+    act_mean = not policy_sample
     for _counter in range(episode_len):
-        action = model.act(observation, z.repeat(num_envs, 1), mean=True)
+        action = model.act(observation, zn, mean=act_mean)
         observation, _reward, _terminated, _truncated, _info = wrapped_env.step(action, to_numpy=False)
         if save_mp4:
-            frames.append(rgb_renderer.render(wrapped_env._env, 0)[0])
+            frames.append(rgb_renderer.render(render_inner, 0)[0])
         _pbar.update(1)
     _pbar.close()
 
     if save_mp4 and frames:
         sfx = f"_{video_suffix}" if video_suffix else ""
         noise_tag = f"hnoise{hand_noise_std:.4f}".replace(".", "p")
-        out_mp4 = vid_dir / f"goal_M{mid}_f{fid}_{noise_tag}{sfx}.mp4"
+        vc_tag = vc
+        samp = "_psample" if policy_sample else ""
+        out_mp4 = vid_dir / f"goal_M{mid}_f{fid}_{noise_tag}_{vc_tag}{samp}{sfx}.mp4"
         media.write_video(str(out_mp4), frames, fps=50)
         print(f"Saved video: {out_mp4}")
 

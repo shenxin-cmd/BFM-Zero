@@ -9,6 +9,7 @@ from typing import Any, Dict, Tuple, Union
 import gymnasium
 import humanoidverse
 import hydra
+import mujoco
 import numpy as np
 import torch
 import pydantic
@@ -199,13 +200,54 @@ def get_enabled_dr_dynamics_obs_names(env: LeggedRobotMotions) -> list[str]:
     return dr_dynamics
 
 
+def mj_camera_face_torso(model: mujoco.MjModel, data: mujoco.MjData, *, distance: float = 2.75, elevation_deg: float = 14.0) -> mujoco.MjvCamera:
+    """Look-at 躯干前方：摄像机置于骨盆–躯干大致朝向的反侧（胸口朝向屏幕），随 yaw 转动保持正面。"""
+    torso_name = "torso_link"
+    torso_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, torso_name)
+    if torso_id < 0:
+        torso_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "pelvis")
+    if torso_id < 0:
+        cam = mujoco.MjvCamera()
+        mujoco.mjv_defaultFreeCamera(model, cam)
+        return cam
+
+    tpos = np.asarray(data.xpos[torso_id], dtype=np.float64).copy()
+    R = np.asarray(data.xmat[torso_id], dtype=np.float64).reshape(3, 3)
+    fwd = R @ np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    fwd[2] = 0.0
+    n = float(np.linalg.norm(fwd))
+    if n < 1e-6:
+        fwd = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    else:
+        fwd /= n
+
+    cam = mujoco.MjvCamera()
+    mujoco.mjv_defaultFreeCamera(model, cam)
+    cam.lookat[:] = tpos + np.array([0.0, 0.0, 0.42], dtype=np.float64)
+    cam.distance = distance
+    cam.azimuth = float(np.degrees(np.arctan2(-fwd[1], -fwd[0])))
+    cam.elevation = float(elevation_deg)
+
+    return cam
+
+
 class IsaacRendererWithMuJoco:
     """Renders Isaac state via MuJoCo. Only 29 DOF (36-D qpos: 7 free + 29 joints) is supported."""
 
-    def __init__(self, render_size: int = 512):
+    def __init__(
+        self,
+        render_size: int = 512,
+        *,
+        video_camera: str = "track",
+        face_torso_distance: float = 2.75,
+        face_torso_elevation_deg: float = 14.0,
+    ):
         from humanoidverse.utils.g1_env_config import G1EnvConfig
 
         self.mujoco_env, _ = G1EnvConfig(render_height=render_size, render_width=render_size).build(num_envs=1)
+        self.video_camera = video_camera
+        self.face_torso_distance = face_torso_distance
+        self.face_torso_elevation_deg = face_torso_elevation_deg
 
     def render(self, hv_env: "HumanoidVerseVectorEnv", env_idxs: list[int] | None = None):
         base_pos = hv_env.simulator.robot_root_states[:, [0, 1, 2, 6, 3, 4, 5]].clone().detach().cpu().numpy()
@@ -221,10 +263,21 @@ class IsaacRendererWithMuJoco:
             env_idxs = list(range(hv_env.num_envs))
         elif not isinstance(env_idxs, (list, tuple)):
             env_idxs = [int(env_idxs)]  # e.g. render(env, 0) -> render env 0 only
+        mj_inner = self.mujoco_env.unwrapped
         for env_idx in env_idxs:
-            qvel = self.mujoco_env.unwrapped._mj_data.qvel.copy()
+            qvel = mj_inner._mj_data.qvel.copy()
             self.mujoco_env.reset(options={"qpos": mujoco_qpos[env_idx], "qvel": qvel})
-            all_images.append(self.mujoco_env.render())
+            mujoco.mj_forward(mj_inner.model, mj_inner.data)
+            if self.video_camera == "face_torso":
+                cam = mj_camera_face_torso(
+                    mj_inner.model,
+                    mj_inner.data,
+                    distance=self.face_torso_distance,
+                    elevation_deg=self.face_torso_elevation_deg,
+                )
+                all_images.append(self.mujoco_env.render(camera=cam))
+            else:
+                all_images.append(self.mujoco_env.render())
 
         return all_images
     
