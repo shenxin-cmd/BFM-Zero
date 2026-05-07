@@ -10,6 +10,14 @@ Goal 来源（二选一）
 
 2. **外部文件**：传入 ``--goal-file`` 仍为 .npz / .pkl。
 
+**推理方式**
+------------
+- **打印表格（L2 敏感度）**：对固定 goal 观测做 **开环** ``model.act(obs_actor, z)``，
+  只扰动 ``z_hand``，用于对比动作变化量。
+- **录视频**：必须用 **闭环**：每一步用 MuJoCo 环境返回的
+  ``state`` / ``last_action`` 更新策略输入（与 ``goal_inference`` 类似），否则
+  观测不变则每步动作相同，运动学引擎会重复同一姿态，视频像定格幻灯片。
+
 开环说明、split-z 要求等见脚本后半 docstring 与打印。
 
 用法
@@ -20,11 +28,12 @@ Goal 来源（二选一）
    python -m humanoidverse.split_z_hand_validation \\
      --checkpoint-dir workdir/bfmzero-split-z/<run>/checkpoint
 
-   # 仍可覆盖 hand 噪声与录视频
+   # 只录「无噪 / 大噪」两档短视频（闭环渲染，默认同表用 hand-noise-stds）
    python -m humanoidverse.split_z_hand_validation \\
      --checkpoint-dir ... \\
-     --hand-noise-stds 0.0 0.5 1.0 \\
-     --record-video
+     --hand-noise-stds 0.0 2.0 \\
+     --record-video \\
+     --video-hand-noise-stds 0.0 2.0
 
 注意：``env.root_height_obs`` 与训练 ``config.json`` 一致时，
 ``privileged_state`` 维数才对（通常带 root 高度为 463）。
@@ -366,6 +375,21 @@ def _to_model_obs(d: dict[str, np.ndarray], keys: list[str], device: torch.devic
     return out
 
 
+def _actor_obs_from_g1_step(
+    obs: dict[str, np.ndarray],
+    history_actor_fixed: torch.Tensor,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """用 G1 单步观测更新 state / last_action；history 沿用 goal 初始化（与 humenv 不提供 4 帧栈一致）。"""
+    s = np.asarray(obs["state"], dtype=np.float32).reshape(-1)
+    la = np.asarray(obs["last_action"], dtype=np.float32).reshape(-1)
+    return {
+        "state": torch.from_numpy(s).to(device=device, dtype=torch.float32).unsqueeze(0),
+        "last_action": torch.from_numpy(la).to(device=device, dtype=torch.float32).unsqueeze(0),
+        "history_actor": history_actor_fixed,
+    }
+
+
 def _open_loop_compare(
     model,
     obs_actor: dict[str, torch.Tensor],
@@ -406,7 +430,8 @@ def main(
     seed: int = 0,
     record_video: bool = False,
     video_path: Path | None = None,
-    video_steps_per_noise: int = 80,
+    video_steps_per_noise: int = 200,
+    video_hand_noise_stds: tuple[float, ...] | None = None,
     fps: int = 50,
 ) -> None:
     """CLI：不传 ``goal-file`` 时用内置 MuJoCo 站立 + 本文件顶部 ``STAND_POSE_JOINT_DELTA_RAD``。"""
@@ -480,8 +505,6 @@ def main(
         render_width=640,
         camera="track",
     ).build(num_envs=1)
-    # Gymnasium has no `wrappers.unwrap_env`; use core `unwrapped` (chains through wrappers).
-    env = env_wrapped.unwrapped
 
     out = Path(video_path) if video_path is not None else Path.cwd() / "split_z_hand_sweep.mp4"
     frames: list[np.ndarray] = []
@@ -491,23 +514,31 @@ def main(
     zb = z_ref[:, :z_body_dim]
     zh0 = z_ref[:, z_body_dim:]
 
-    for std in stds:
+    video_stds = list(video_hand_noise_stds) if video_hand_noise_stds is not None else stds
+    history_fixed = obs_actor["history_actor"]
+
+    for std in video_stds:
         noise = torch.randn(zh0.shape, device=zh0.device, dtype=zh0.dtype, generator=rng)
         zh = zh0 + float(std) * noise
         z = model.project_z(torch.cat([zb, zh], dim=-1))
-        env.reset(seed=seed + int(100 * std))
-        frames.append(env.render())
+        obs, _ = env_wrapped.reset(seed=seed + int(100 * std))
+        # 闭环：每步用环境真值 state/last_action，否则动作重复 → 运动学姿态不变（幻灯片）
+        r0 = env_wrapped.render()
+        if r0 is not None:
+            frames.append(np.asarray(r0))
         for _ in range(video_steps_per_noise):
+            obs_t = _actor_obs_from_g1_step(obs, history_fixed, dev)
             with torch.no_grad():
-                action = model.act(obs_actor, z, mean=True)
-            env.step(action.squeeze(0).detach().cpu().numpy())
-            fr = env.render()
+                action = model.act(obs_t, z, mean=True)
+            a_np = action.squeeze(0).detach().cpu().numpy()
+            obs, _r, _te, _tu, _i = env_wrapped.step(a_np)
+            fr = env_wrapped.render()
             if fr is not None:
-                frames.append(fr)
+                frames.append(np.asarray(fr))
 
     if frames:
         media.write_video(str(out), frames, fps=fps)
-        print(f"\nSaved video to {out}")
+        print(f"\nSaved video to {out} ({len(frames)} frames, {video_stds=})")
 
 
 if __name__ == "__main__":
