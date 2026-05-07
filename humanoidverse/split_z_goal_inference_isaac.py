@@ -32,9 +32,53 @@ else:
 
 # -----------------------------------------------------------------------------
 # 用户可编辑：当命令行未传 ``--motion-id`` / ``--goal-frame`` 时使用。
+# - USE_AUTO_ONE_LEG_GOAL=True（默认）：在 lafan 库里扫描，选「双脚 z 高度差大、脚与根速度小」
+#   的帧作为**近似单脚站立**目标，避免 motion_id=0 首帧常为 T 字/大臂张开站立。
+# - 设为 False 时改用下面固定 GOAL_MOTION_ID / GOAL_FRAME_IDX。
+# 命令行仍可 ``--motion-id`` / ``--goal-frame`` 覆盖；仅传 ``--motion-id`` 时会在该条 motion 内自动选帧。
 # -----------------------------------------------------------------------------
+USE_AUTO_ONE_LEG_GOAL = True
 GOAL_MOTION_ID = 0
 GOAL_FRAME_IDX = 0
+
+
+def _pick_one_leg_goal_frame(env, motion_id: int | None) -> tuple[int, int]:
+    """在 motion 库中选一帧：双脚高度差大且脚/根线速度小，用作单脚站立目标近似。"""
+    ml = env._motion_lib
+    feet = env.feet_indices.long()
+    if feet.numel() < 2:
+        raise RuntimeError("feet_indices 至少需要两只脚以自动选单脚站立帧。")
+
+    def best_in_motion(mid: int) -> tuple[int, float]:
+        motion_len = ml._motion_lengths[mid]
+        n = int(torch.ceil(motion_len / env.dt).item())
+        if n < 1:
+            return 0, -1.0
+        t = torch.arange(n, device=env.device, dtype=torch.float32) * env.dt
+        with torch.no_grad():
+            res = ml.get_motion_state(mid, t)
+        rg = res["rg_pos_t"]
+        bv = res["body_vel_t"]
+        zl = rg[:, feet[0], 2]
+        zr = rg[:, feet[1], 2]
+        diff = (zl - zr).abs()
+        v_foot = bv[:, feet].norm(dim=-1).sum(dim=1)
+        v_root = bv[:, 0].norm(dim=-1)
+        score = diff / (0.08 + v_foot + 0.05 * v_root)
+        j = int(score.argmax().item())
+        return j, float(score[j].item())
+
+    if motion_id is not None:
+        fid, _ = best_in_motion(motion_id)
+        return motion_id, fid
+
+    num_motions = int(ml._num_unique_motions)
+    best_mid, best_fid, best_s = 0, 0, -1.0
+    for mid in range(num_motions):
+        fid, s = best_in_motion(mid)
+        if s > best_s:
+            best_mid, best_fid, best_s = mid, fid, s
+    return best_mid, best_fid
 
 
 def main(
@@ -69,6 +113,10 @@ def main(
     **为何不“乱挥”**：策略 ``act(..., mean=True)`` 取 **均值**，无采样噪声；映射到 **有界关节动作**，
     ``z_hand`` 是训练中 **语义空间** 的子向量，并不等于在动作末尾直接加大幅度白噪。
     可试 ``--policy-sample`` 略增手部随机性。
+
+    **默认目标姿态**：模块级 ``USE_AUTO_ONE_LEG_GOAL`` 为 True 时，在未指定 ``--goal-frame`` 的情况下会在
+    lafan 库里自动选取「双脚高度差较大且脚部/根部速度较小」的一帧作为单脚站立近似；关闭则使用
+    ``GOAL_MOTION_ID`` / ``GOAL_FRAME_IDX``。
     """
 
     model_folder = Path(model_folder)
@@ -126,14 +174,26 @@ def main(
     wrapped_env, _ = env_cfg.build(num_envs)
     env = wrapped_env._env
 
-    mid = GOAL_MOTION_ID if motion_id is None else motion_id
-    fid = GOAL_FRAME_IDX if goal_frame is None else goal_frame
+    if goal_frame is not None:
+        mid = GOAL_MOTION_ID if motion_id is None else motion_id
+        fid = goal_frame
+    elif USE_AUTO_ONE_LEG_GOAL:
+        focus = motion_id
+        mid, fid = _pick_one_leg_goal_frame(env, focus)
+    else:
+        mid = GOAL_MOTION_ID if motion_id is None else motion_id
+        fid = GOAL_FRAME_IDX
 
     vc = video_camera.lower().strip()
     if vc not in ("face_torso", "track"):
         raise ValueError("video_camera must be 'face_torso' or 'track'.")
 
-    print(f"motion_id={mid}, goal_frame={fid}, use_root_height_obs={use_root_height_obs}")
+    try:
+        _mkey = env._motion_lib._motion_data_keys[mid]
+        _mkey_s = _mkey.item() if hasattr(_mkey, "item") else str(_mkey)
+    except Exception:
+        _mkey_s = "?"
+    print(f"motion_id={mid}, goal_frame={fid}, motion_key={_mkey_s}, use_root_height_obs={use_root_height_obs}")
     print(f"hand_noise_std={hand_noise_std} | video_camera={vc} | policy_sample={policy_sample}")
 
     env.set_is_evaluating(mid)
