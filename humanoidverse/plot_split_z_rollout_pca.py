@@ -8,8 +8,9 @@
 
 静止图： ``*_zbody_pca.png`` / ``*_zhand_pca.png`` （``--no-save-animation`` 时仅这两项）。
 
-GIF：默认另存 ``*_zbody_pca.gif`` / ``*_zhand_pca.gif``，按 rollout 步数 **累积**显示轨迹；
-可用 ``--anim-stride`` 跳帧、`--anim-max-frames`` 封顶以控制体积。
+GIF：默认另存 ``*_zbody_pca.gif`` / ``*_zhand_pca.gif``，按 rollout 步数累积显示轨迹；可用 ``--anim-stride`` 跳帧、``--anim-max-frames`` 封顶。
+
+参考球：**线框网格**（无材质/填充），GIF 导出更快；``--sphere-wireframe-rstride`` / ``--sphere-wireframe-cstride`` 可再稀疏取样。
 """
 from __future__ import annotations
 
@@ -48,7 +49,7 @@ def _transform_new(X_new: np.ndarray, mean: np.ndarray, V: np.ndarray) -> np.nda
     return (X_new - mean) @ V
 
 
-def _sphere_mesh(radius: float, n_u: int = 44, n_v: int = 30) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _sphere_mesh(radius: float, n_u: int = 24, n_v: int = 16) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     u = np.linspace(0, 2 * np.pi, n_u)
     v = np.linspace(0, np.pi, n_v)
     uu, vv = np.meshgrid(u, v)
@@ -56,36 +57,6 @@ def _sphere_mesh(radius: float, n_u: int = 44, n_v: int = 30) -> tuple[np.ndarra
     y = radius * np.sin(uu) * np.sin(vv)
     z = radius * np.cos(vv)
     return x, y, z
-
-
-def _sphere_facecolors(
-    xs: np.ndarray,
-    ys: np.ndarray,
-    zs: np.ndarray,
-    *,
-    ambient: float = 0.34,
-    diffuse_exp: float = 0.85,
-    light_dir: tuple[float, float, float] = (0.62, -0.42, 0.66),
-    rgba_alpha_scale: float = 0.98,
-) -> np.ndarray:
-    """
-    曲面片近似法线与定向光 Lambert 着色；输出 ``plot_surface(..., facecolors=...)``。
-    Shape (Rv-1, Ru-1, 4)。
-    """
-    L = np.array(light_dir, dtype=np.float64)
-    L /= np.linalg.norm(L) + 1e-9
-    xc = (xs[:-1, :-1] + xs[:-1, 1:] + xs[1:, :-1] + xs[1:, 1:]) * 0.25
-    yc = (ys[:-1, :-1] + ys[:-1, 1:] + ys[1:, :-1] + ys[1:, 1:]) * 0.25
-    zc = (zs[:-1, :-1] + zs[:-1, 1:] + zs[1:, :-1] + zs[1:, 1:]) * 0.25
-    nn = np.sqrt(xc * xc + yc * yc + zc * zc).clip(min=1e-9)
-    nx, ny, nz = xc / nn, yc / nn, zc / nn
-    ndotl = np.clip(nx * L[0] + ny * L[1] + nz * L[2], 0.0, 1.0)
-    shade = ambient + (1.0 - ambient) * np.power(ndotl, diffuse_exp)
-    r = np.clip(shade * 0.84, 0.0, 1.0)
-    g = np.clip(shade * 0.87, 0.0, 1.0)
-    b = np.clip(shade * 0.93, 0.0, 1.0)
-    a = np.full_like(shade, rgba_alpha_scale, dtype=np.float64)
-    return np.stack([r, g, b, a], axis=-1)
 
 
 def _uniform_axis_limits(proj: np.ndarray, radius_ref: float, *, margin_frac: float = 0.12):
@@ -114,7 +85,8 @@ def main(
     anim_max_frames: int | None = None,
     anim_dpi: int = 100,
     perspective: bool = True,
-    sphere_rgb_alpha_scale: float = 0.98,
+    sphere_wireframe_rstride: int = 2,
+    sphere_wireframe_cstride: int = 2,
 ) -> None:
     npz_path = Path(npz_path)
     if not npz_path.is_file():
@@ -147,7 +119,6 @@ def main(
         radius_ref: float,
         title_suffix: str,
     ) -> None:
-        import matplotlib.colors as mcolors
         import matplotlib.pyplot as plt
         from matplotlib import animation as mpl_animation
         from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
@@ -157,10 +128,18 @@ def main(
         xmin, xmax, ymin, ymax, zmin, zmax = _uniform_axis_limits(proj, radius_ref)
 
         sx, sy, sz = _sphere_mesh(radius_ref)
-        sphere_fc = _sphere_facecolors(sx, sy, sz, rgba_alpha_scale=sphere_rgb_alpha_scale)
+
+        rs = max(1, int(sphere_wireframe_rstride))
+        cs = max(1, int(sphere_wireframe_cstride))
+
+        def _draw_sphere(ax_):
+            """仅网格线示意参考球（无曲面、无银色/高光），便于快速画图与导出 GIF。"""
+            ax_.plot_wireframe(sx, sy, sz, rstride=rs, cstride=cs, color="0.72", linewidth=0.65, alpha=0.48)
 
         p_ref = (
-            _transform_new(policy_ref.reshape(1, -1), mean, V)[0] if policy_ref is not None and policy_ref.size > 0 else None
+            _transform_new(policy_ref.reshape(1, -1), mean, V)[0]
+            if policy_ref is not None and policy_ref.size > 0
+            else None
         )
         p_use = (
             _transform_new(policy_used.reshape(1, -1), mean, V)[0]
@@ -177,20 +156,6 @@ def main(
             f"hnoise_std={meta.get('hand_noise_std')}",
         )
         title_base = "\n".join(title_lines)
-
-        def _draw_sphere(ax_):
-            ax_.plot_surface(
-                sx,
-                sy,
-                sz,
-                facecolors=sphere_fc,
-                rstride=1,
-                cstride=1,
-                linewidth=0.16,
-                edgecolor=(0.38, 0.40, 0.43, 0.42),
-                antialiased=True,
-                shade=False,
-            )
 
         def _style_axes(ax_):
             ax_.set_xlim(xmin, xmax)
@@ -243,8 +208,6 @@ def main(
         traj_pc = _draw_trajectory(ax, proj.shape[0])
         ax.set_title(title_base + "\ninferred z(t) cumulative (full rollout)")
         if traj_pc is not None:
-            sm = plt.cm.ScalarMappable(norm=mcolors.Normalize(vmin_s, vmax_s), cmap="viridis")
-            sm.set_array(t_steps)
             fig.colorbar(traj_pc, ax=ax, shrink=0.55, label="step index")
         ax.legend(loc="upper left", fontsize=8)
         out_png = od / f"{npz_path.stem}_{name}_pca.png"
