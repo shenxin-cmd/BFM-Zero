@@ -6,7 +6,10 @@
 
   python -m humanoidverse.plot_split_z_rollout_pca --npz path/to/trace.npz
 
-输出：同目录下 ``*_zbody_pca.png``、``*_zhand_pca.png``（或可指定 ``--out-dir``）。
+静止图： ``*_zbody_pca.png`` / ``*_zhand_pca.png`` （``--no-save-animation`` 时仅这两项）。
+
+GIF：默认另存 ``*_zbody_pca.gif`` / ``*_zhand_pca.gif``，按 rollout 步数 **累积**显示轨迹；
+可用 ``--anim-stride`` 跳帧、`--anim-max-frames`` 封顶以控制体积。
 """
 from __future__ import annotations
 
@@ -15,7 +18,7 @@ from pathlib import Path
 
 import numpy as np
 
-# matplotlib 延迟导入（无 headed 服务器时仍可保存）
+# matplotlib 延迟导入
 
 
 def _pca_fit_transform(X: np.ndarray, n_components: int = 3) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -45,7 +48,7 @@ def _transform_new(X_new: np.ndarray, mean: np.ndarray, V: np.ndarray) -> np.nda
     return (X_new - mean) @ V
 
 
-def _sphere_mesh(radius: float, n_u: int = 28, n_v: int = 18) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _sphere_mesh(radius: float, n_u: int = 44, n_v: int = 30) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     u = np.linspace(0, 2 * np.pi, n_u)
     v = np.linspace(0, np.pi, n_v)
     uu, vv = np.meshgrid(u, v)
@@ -55,12 +58,63 @@ def _sphere_mesh(radius: float, n_u: int = 28, n_v: int = 18) -> tuple[np.ndarra
     return x, y, z
 
 
+def _sphere_facecolors(
+    xs: np.ndarray,
+    ys: np.ndarray,
+    zs: np.ndarray,
+    *,
+    ambient: float = 0.34,
+    diffuse_exp: float = 0.85,
+    light_dir: tuple[float, float, float] = (0.62, -0.42, 0.66),
+    rgba_alpha_scale: float = 0.98,
+) -> np.ndarray:
+    """
+    曲面片近似法线与定向光 Lambert 着色；输出 ``plot_surface(..., facecolors=...)``。
+    Shape (Rv-1, Ru-1, 4)。
+    """
+    L = np.array(light_dir, dtype=np.float64)
+    L /= np.linalg.norm(L) + 1e-9
+    xc = (xs[:-1, :-1] + xs[:-1, 1:] + xs[1:, :-1] + xs[1:, 1:]) * 0.25
+    yc = (ys[:-1, :-1] + ys[:-1, 1:] + ys[1:, :-1] + ys[1:, 1:]) * 0.25
+    zc = (zs[:-1, :-1] + zs[:-1, 1:] + zs[1:, :-1] + zs[1:, 1:]) * 0.25
+    nn = np.sqrt(xc * xc + yc * yc + zc * zc).clip(min=1e-9)
+    nx, ny, nz = xc / nn, yc / nn, zc / nn
+    ndotl = np.clip(nx * L[0] + ny * L[1] + nz * L[2], 0.0, 1.0)
+    shade = ambient + (1.0 - ambient) * np.power(ndotl, diffuse_exp)
+    r = np.clip(shade * 0.84, 0.0, 1.0)
+    g = np.clip(shade * 0.87, 0.0, 1.0)
+    b = np.clip(shade * 0.93, 0.0, 1.0)
+    a = np.full_like(shade, rgba_alpha_scale, dtype=np.float64)
+    return np.stack([r, g, b, a], axis=-1)
+
+
+def _uniform_axis_limits(proj: np.ndarray, radius_ref: float, *, margin_frac: float = 0.12):
+    bmin = proj.min(axis=0)
+    bmax = proj.max(axis=0)
+    ctr = (bmin + bmax) * 0.5
+    half = float(np.maximum((bmax - bmin).max() * 0.5, radius_ref) * (1.0 + margin_frac))
+    return (
+        ctr[0] - half,
+        ctr[0] + half,
+        ctr[1] - half,
+        ctr[1] + half,
+        ctr[2] - half,
+        ctr[2] + half,
+    )
+
+
 def main(
     npz_path: Path,
     out_dir: Path | None = None,
     reference_radius_body: float = 15.0,
     reference_radius_hand: float = 6.0,
-    sphere_alpha: float = 0.12,
+    save_animation: bool = True,
+    anim_fps: float = 22.0,
+    anim_stride: int = 2,
+    anim_max_frames: int | None = None,
+    anim_dpi: int = 100,
+    perspective: bool = True,
+    sphere_rgb_alpha_scale: float = 0.98,
 ) -> None:
     npz_path = Path(npz_path)
     if not npz_path.is_file():
@@ -80,6 +134,11 @@ def main(
         raw = meta_raw.item() if hasattr(meta_raw, "item") else meta_raw
         meta = json.loads(str(raw))
 
+    policy_body_ref = np.asarray(data["policy_goal_z_body"]).reshape(-1) if "policy_goal_z_body" in data else None
+    policy_hand_ref = np.asarray(data["policy_goal_z_hand"]).reshape(-1) if "policy_goal_z_hand" in data else None
+    policy_body_used = np.asarray(data["policy_actor_z_body"]).reshape(-1) if "policy_actor_z_body" in data else None
+    policy_hand_used = np.asarray(data["policy_actor_z_hand"]).reshape(-1) if "policy_actor_z_hand" in data else None
+
     def fig_block(
         name: str,
         Z: np.ndarray,
@@ -88,37 +147,105 @@ def main(
         radius_ref: float,
         title_suffix: str,
     ) -> None:
+        import matplotlib.colors as mcolors
         import matplotlib.pyplot as plt
-        from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 – 注册 3D
+        from matplotlib import animation as mpl_animation
+        from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
-        mean, V, proj, _ = _pca_fit_transform(Z, n_components=3)
+        mean, V, proj = _pca_fit_transform(Z, n_components=3)
 
+        xmin, xmax, ymin, ymax, zmin, zmax = _uniform_axis_limits(proj, radius_ref)
+
+        sx, sy, sz = _sphere_mesh(radius_ref)
+        sphere_fc = _sphere_facecolors(sx, sy, sz, rgba_alpha_scale=sphere_rgb_alpha_scale)
+
+        p_ref = (
+            _transform_new(policy_ref.reshape(1, -1), mean, V)[0] if policy_ref is not None and policy_ref.size > 0 else None
+        )
+        p_use = (
+            _transform_new(policy_used.reshape(1, -1), mean, V)[0]
+            if policy_used is not None and policy_used.size > 0
+            else None
+        )
+
+        t_steps = np.arange(Z.shape[0])
+        vmin_s, vmax_s = 0.0, float(max(Z.shape[0] - 1, 0))
+
+        title_lines = (
+            f"{title_suffix} · PCA rollout inferred z · ref sphere r≈{radius_ref:g}",
+            f"motion={meta.get('motion_id')} · frame={meta.get('goal_frame')} · "
+            f"hnoise_std={meta.get('hand_noise_std')}",
+        )
+        title_base = "\n".join(title_lines)
+
+        def _draw_sphere(ax_):
+            ax_.plot_surface(
+                sx,
+                sy,
+                sz,
+                facecolors=sphere_fc,
+                rstride=1,
+                cstride=1,
+                linewidth=0.16,
+                edgecolor=(0.38, 0.40, 0.43, 0.42),
+                antialiased=True,
+                shade=False,
+            )
+
+        def _style_axes(ax_):
+            ax_.set_xlim(xmin, xmax)
+            ax_.set_ylim(ymin, ymax)
+            ax_.set_zlim(zmin, zmax)
+            ax_.set_xlabel("PC1")
+            ax_.set_ylabel("PC2")
+            ax_.set_zlabel("PC3")
+            ax_.set_box_aspect([1.0, 1.0, 1.0])
+            ax_.tick_params(axis="both", labelsize=8)
+            if perspective:
+                try:
+                    ax_.set_proj_type("persp")
+                    ax_.dist = 10.15
+                except Exception:
+                    pass
+
+        def _draw_trajectory(ax_, end_exclusive: int):
+            """画出 0:end_exclusive；返回 scatter 对应的 PathCollection 供静止图挂 colorbar；无点时返回 None。"""
+            end_exclusive = int(np.clip(end_exclusive, 0, proj.shape[0]))
+            subs = proj[:end_exclusive]
+            ts = t_steps[:end_exclusive]
+            coll = None
+            if end_exclusive > 0:
+                coll = ax_.scatter(
+                    subs[:, 0],
+                    subs[:, 1],
+                    subs[:, 2],
+                    c=ts,
+                    cmap="viridis",
+                    s=26,
+                    vmin=vmin_s,
+                    vmax=max(vmax_s, vmin_s + 1e-6),
+                    alpha=0.96,
+                    depthshade=True,
+                )
+            if end_exclusive >= 2:
+                ax_.plot(subs[:, 0], subs[:, 1], subs[:, 2], color="0.38", linewidth=1.08, alpha=0.72)
+            if p_ref is not None:
+                ax_.scatter([p_ref[0]], [p_ref[1]], [p_ref[2]], c="tab:blue", marker="*", s=200, label="goal policy z (pre-noise)", zorder=20)
+            if p_use is not None:
+                ax_.scatter([p_use[0]], [p_use[1]], [p_use[2]], c="tab:red", marker="X", s=130, label="policy z (actor input)", zorder=21)
+            return coll
+
+        # --------- 静止 PNG ---------
         fig = plt.figure(figsize=(8, 7))
         ax = fig.add_subplot(111, projection="3d")
-
-        # 轨迹（时间上色）
-        t_steps = np.arange(Z.shape[0])
-        sc = ax.scatter(proj[:, 0], proj[:, 1], proj[:, 2], c=t_steps, cmap="viridis", s=16, label="inferred z(t)")
-        ax.plot(proj[:, 0], proj[:, 1], proj[:, 2], color="gray", alpha=0.45, linewidth=0.8)
-
-        if policy_ref is not None and policy_ref.size > 0:
-            p0 = _transform_new(policy_ref.reshape(1, -1), mean, V)[0]
-            ax.scatter([p0[0]], [p0[1]], [p0[2]], c="tab:blue", marker="*", s=220, label="goal policy z (pre-noise)")
-        if policy_used is not None and policy_used.size > 0:
-            p1 = _transform_new(policy_used.reshape(1, -1), mean, V)[0]
-            ax.scatter([p1[0]], [p1[1]], [p1[2]], c="tab:red", marker="X", s=140, label="policy z (actor input)")
-        # 参照球（PCA 空间中的半径取 reference_radius 作为视觉尺度；与高维球半径语义近似）
-        xs, ys, zs = _sphere_mesh(radius_ref, n_u=32, n_v=20)
-        ax.plot_surface(xs, ys, zs, color="lightgray", alpha=sphere_alpha, linewidth=0)
-
-        ax.set_xlabel("PC1")
-        ax.set_ylabel("PC2")
-        ax.set_zlabel("PC3")
-        ax.set_title(
-            f"{title_suffix}  (PCA on rollout inferred z; ref sphere r≈{radius_ref:g} in z-space)\n"
-            f"motion={meta.get('motion_id')} frame={meta.get('goal_frame')} hnoise_std={meta.get('hand_noise_std')}"
-        )
-        fig.colorbar(sc, ax=ax, shrink=0.55, label="step index")
+        _draw_sphere(ax)
+        _style_axes(ax)
+        traj_pc = _draw_trajectory(ax, proj.shape[0])
+        ax.set_title(title_base + "\ninferred z(t) cumulative (full rollout)")
+        if traj_pc is not None:
+            sm = plt.cm.ScalarMappable(norm=mcolors.Normalize(vmin_s, vmax_s), cmap="viridis")
+            sm.set_array(t_steps)
+            fig.colorbar(traj_pc, ax=ax, shrink=0.55, label="step index")
         ax.legend(loc="upper left", fontsize=8)
         out_png = od / f"{npz_path.stem}_{name}_pca.png"
         fig.tight_layout()
@@ -126,10 +253,47 @@ def main(
         plt.close(fig)
         print(f"Saved {out_png}")
 
-    policy_body_ref = np.asarray(data["policy_goal_z_body"]).reshape(-1) if "policy_goal_z_body" in data else None
-    policy_hand_ref = np.asarray(data["policy_goal_z_hand"]).reshape(-1) if "policy_goal_z_hand" in data else None
-    policy_body_used = np.asarray(data["policy_actor_z_body"]).reshape(-1) if "policy_actor_z_body" in data else None
-    policy_hand_used = np.asarray(data["policy_actor_z_hand"]).reshape(-1) if "policy_actor_z_hand" in data else None
+        if not save_animation or proj.shape[0] <= 1:
+            if not save_animation:
+                pass
+            return
+
+        frames = list(range(1, proj.shape[0] + 1, max(anim_stride, 1)))
+        if anim_max_frames is not None and len(frames) > anim_max_frames:
+            pick_every = max(1, len(frames) // anim_max_frames)
+            frames = frames[::pick_every]
+        if frames[-1] != proj.shape[0]:
+            frames.append(proj.shape[0])
+
+        fig_a = plt.figure(figsize=(7.6, 6.9))
+        ax_a = fig_a.add_subplot(111, projection="3d")
+
+        def redraw(upto: int):
+            ax_a.clear()
+            _draw_sphere(ax_a)
+            _style_axes(ax_a)
+            _draw_trajectory(ax_a, upto)
+            ax_a.set_title(title_base + f"\nanimate · cumulative steps 0…{upto - 1}   (GIF: viridis = step)")
+            ax_a.legend(loc="upper left", fontsize=7)
+
+        ani = mpl_animation.FuncAnimation(
+            fig_a,
+            redraw,
+            frames=frames,
+            interval=1000.0 / max(float(anim_fps), 1e-3),
+            blit=False,
+            repeat=False,
+        )
+        gif_path = od / f"{npz_path.stem}_{name}_pca.gif"
+        try:
+            ani.save(str(gif_path), writer="pillow", dpi=anim_dpi)
+        except Exception as e:
+            print(f"GIF 保存失败 ({e})；确认已安装 pillow，或减小 --anim-max-frames")
+            plt.close(fig_a)
+            return
+
+        plt.close(fig_a)
+        print(f"Saved {gif_path}  (~{len(frames)} 关键帧 · {anim_fps:g} fps)")
 
     fig_block(
         "zbody",
