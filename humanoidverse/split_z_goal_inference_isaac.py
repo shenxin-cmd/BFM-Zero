@@ -139,7 +139,9 @@ def main(
 
     goal_observation = {k: v[fid : fid + 1] for k, v in gobs.items()}
     goal_observation = tree_map(
-        lambda x: torch.tensor(x, device=model.device, dtype=torch.float32),
+        lambda x: x.detach().clone().to(device=model.device, dtype=torch.float32)
+        if isinstance(x, torch.Tensor)
+        else torch.as_tensor(x, device=model.device, dtype=torch.float32),
         goal_observation,
     )
 

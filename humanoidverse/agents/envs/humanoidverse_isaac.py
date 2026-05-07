@@ -249,6 +249,14 @@ class IsaacRendererWithMuJoco:
         self.face_torso_distance = face_torso_distance
         self.face_torso_elevation_deg = face_torso_elevation_deg
 
+    @staticmethod
+    def _inner_g1_env(wrapped):
+        """``G1EnvConfig.build`` 外层有 Gymnasium Wrapper，必须用内层 ``G1Base.render(..., camera=)``。"""
+        e = wrapped
+        while hasattr(e, "unwrapped") and e.unwrapped is not e:
+            e = e.unwrapped
+        return e
+
     def render(self, hv_env: "HumanoidVerseVectorEnv", env_idxs: list[int] | None = None):
         base_pos = hv_env.simulator.robot_root_states[:, [0, 1, 2, 6, 3, 4, 5]].clone().detach().cpu().numpy()
         joint_pos = hv_env.simulator.dof_pos.clone().detach().cpu().numpy()
@@ -263,7 +271,9 @@ class IsaacRendererWithMuJoco:
             env_idxs = list(range(hv_env.num_envs))
         elif not isinstance(env_idxs, (list, tuple)):
             env_idxs = [int(env_idxs)]  # e.g. render(env, 0) -> render env 0 only
-        mj_inner = self.mujoco_env.unwrapped
+        g1 = IsaacRendererWithMuJoco._inner_g1_env(self.mujoco_env)
+        mj_inner = g1  # aliases for clearer reset/model access names used below
+
         for env_idx in env_idxs:
             qvel = mj_inner._mj_data.qvel.copy()
             self.mujoco_env.reset(options={"qpos": mujoco_qpos[env_idx], "qvel": qvel})
@@ -275,9 +285,9 @@ class IsaacRendererWithMuJoco:
                     distance=self.face_torso_distance,
                     elevation_deg=self.face_torso_elevation_deg,
                 )
-                all_images.append(self.mujoco_env.render(camera=cam))
+                all_images.append(g1.render(camera=cam))
             else:
-                all_images.append(self.mujoco_env.render())
+                all_images.append(g1.render())
 
         return all_images
     
@@ -295,7 +305,8 @@ class IsaacRendererWithMuJoco:
                     "23-DOF / 30-D qpos is not supported."
                 )
             self.mujoco_env.reset(options={"qpos": q})
-            frames.append(self.mujoco_env.render())
+            g1 = IsaacRendererWithMuJoco._inner_g1_env(self.mujoco_env)
+            frames.append(g1.render())
         return frames
 
 
