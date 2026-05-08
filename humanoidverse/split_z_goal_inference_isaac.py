@@ -119,6 +119,12 @@ GOAL_POSE_JOINT_ABS_RAD: dict[str, float] = {}
 # Isaac eval 装载的参考 motion 数据集起始 id（与 goal z 无关，仅初始化 tracking 环境）。
 ROLLOUT_REF_MOTION_ID = 0
 
+# Isaac 训练中 privileged_state 常为 31 个 body（g1 yaml 的 nums_extend_bodies + 虚拟 head）。
+# MuJoCo 29dof MJCF 往往只有 30 个 link（无名为 head_link 的 body）；与 LeggedRobotMotions.extend_config 对齐补一条静止 head。
+_VIRTUAL_HEAD_PARENT = "torso_link"
+_VIRTUAL_HEAD_OFFSET_PARENT_MU = (0.0, 0.0, 0.35)
+_VIRTUAL_HEAD_REL_QUAT_WLAST = (0.0, 0.0, 0.0, 1.0)  # xyzw · w_last
+
 # -----------------------------------------------------------------------------
 # Goal 观测：按 env.py 逻辑从 MuJoCo 状态拼装（与 inference_tutorial + env.py 一致思路）
 # -----------------------------------------------------------------------------
@@ -184,8 +190,49 @@ def _set_mujoco_pose_from_abs(
     mujoco.mj_forward(mj_model, mj_data)
 
 
+def _mj_body_names_for_indices(mj_model: mujoco.MjModel, body_ids: np.ndarray) -> list[str | None]:
+    out: list[str | None] = []
+    for bid in np.asarray(body_ids, dtype=np.int64).tolist():
+        try:
+            out.append(mujoco.mj_id2name(mj_model, mujoco.mjtObj.mjOBJ_BODY, int(bid)))
+        except Exception:
+            out.append(None)
+    return out
+
+
+def _append_virtual_head_for_privileged_tensors(
+    body_pos_t: torch.Tensor,
+    body_rot_t: torch.Tensor,
+    body_vel_t: torch.Tensor,
+    body_ang_vel_t: torch.Tensor,
+    torso_row: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """与 Isaac LeggedRobotMotions.extend 一致：末端补 head_link 位姿，线速度/角速度为 0。"""
+    from humanoidverse.utils.torch_utils import my_quat_rotate, quat_mul
+
+    dev = body_pos_t.device
+    dt = body_pos_t.dtype
+    pr = body_rot_t[:, torso_row, :].reshape(1, 4)
+    ppos = body_pos_t[:, torso_row, :].reshape(1, 3)
+    off = torch.tensor([_VIRTUAL_HEAD_OFFSET_PARENT_MU], device=dev, dtype=dt)
+    rel = torch.tensor([_VIRTUAL_HEAD_REL_QUAT_WLAST], device=dev, dtype=dt)
+
+    rotated = my_quat_rotate(pr, off)
+    head_world = my_quat_rotate(rel, rotated) + ppos
+    head_pos = head_world.unsqueeze(1)
+    head_rot = quat_mul(pr, rel, w_last=True).unsqueeze(1)
+    zero = torch.zeros((1, 1, 3), device=dev, dtype=dt)
+
+    return (
+        torch.cat([body_pos_t, head_pos], dim=1),
+        torch.cat([body_rot_t, head_rot], dim=1),
+        torch.cat([body_vel_t, zero], dim=1),
+        torch.cat([body_ang_vel_t, zero], dim=1),
+    )
+
+
 def _get_privileged_state_env_style(mj_model: mujoco.MjModel, mj_data: mujoco.MjData, holder: _PrivilegedPrevHolder, dt_stub: float) -> np.ndarray:
-    """等价 env.py ``get_privileged_state``（首次调用速度与角速度视为 0）。"""
+    """等价 env.py ``get_privileged_state``（首次调用速度与角速度视为 0）；必要时补虚拟 head_link 对齐训练维数。"""
     total_bodies = mj_model.nbody
     valid_body_indices: list[int] = []
     head_link_idx: int | None = None
@@ -229,6 +276,18 @@ def _get_privileged_state_env_style(mj_model: mujoco.MjModel, mj_data: mujoco.Mj
     body_rot_t = torch.from_numpy(body_quat_wxyz[:, [1, 2, 3, 0]].copy()).unsqueeze(0).float()
     body_vel_t = torch.from_numpy(body_vel).unsqueeze(0).float()
     body_ang_vel_t = torch.from_numpy(body_ang_vel).unsqueeze(0).float()
+
+    names_ordered = _mj_body_names_for_indices(mj_model, valid_body_indices_np)
+    if (
+        num_bodies == 30
+        and head_link_idx is None
+        and _VIRTUAL_HEAD_PARENT in names_ordered
+    ):
+        torso_row = names_ordered.index(_VIRTUAL_HEAD_PARENT)
+        body_pos_t, body_rot_t, body_vel_t, body_ang_vel_t = _append_virtual_head_for_privileged_tensors(
+            body_pos_t, body_rot_t, body_vel_t, body_ang_vel_t, torso_row
+        )
+        num_bodies = body_pos_t.shape[1]
 
     root_pos = body_pos_t[:, 0:1, :]
     root_rot = body_rot_t[:, 0:1, :]
