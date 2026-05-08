@@ -233,7 +233,8 @@ def _get_privileged_state_env_style(mj_model: mujoco.MjModel, mj_data: mujoco.Mj
     root_pos = body_pos_t[:, 0:1, :]
     root_rot = body_rot_t[:, 0:1, :]
 
-    heading_rot_inv = calc_heading_quat_inv(root_rot, w_last=True)
+    # calc_heading_quat_inv → my_quat_rotate 仅用 q[:, :3]，要求 q 形如 (N, 4)，不能是 (1, 1, 4)。
+    heading_rot_inv = calc_heading_quat_inv(root_rot.reshape(-1, 4), w_last=True).view_as(root_rot)
     heading_rot_inv_expand = heading_rot_inv.repeat(1, num_bodies, 1)
     flat_heading_rot_inv = heading_rot_inv_expand.reshape(-1, 4)
 
