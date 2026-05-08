@@ -348,7 +348,7 @@ def main(
     默认写 mp4 与 ``--z-trace-out`` / 默认路径下的 rollout z ``.npz``。
     """
     model_folder = Path(model_folder)
-    vid_dir = Path(video_folder) if video_folder is not None else model_folder / "split_z_goal_isaac" / "videos"
+    vid_dir = Path(video_folder) if video_folder is not None else model_folder / "split_z_goal_isaac3" / "videos"
     vid_dir.mkdir(parents=True, exist_ok=True)
 
     model = load_model_from_checkpoint_dir(model_folder / "checkpoint", device=device)
