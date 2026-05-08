@@ -200,7 +200,14 @@ def get_enabled_dr_dynamics_obs_names(env: LeggedRobotMotions) -> list[str]:
     return dr_dynamics
 
 
-def mj_camera_face_torso(model: mujoco.MjModel, data: mujoco.MjData, *, distance: float = 2.75, elevation_deg: float = 14.0) -> mujoco.MjvCamera:
+def mj_camera_face_torso(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    *,
+    distance: float = 2.75,
+    elevation_deg: float = 14.0,
+    lookat_height_above_torso_m: float = 0.42,
+) -> mujoco.MjvCamera:
     """Look-at 躯干前方：摄像机置于骨盆–躯干大致朝向的反侧（胸口朝向屏幕），随 yaw 转动保持正面。"""
     torso_name = "torso_link"
     torso_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, torso_name)
@@ -223,7 +230,7 @@ def mj_camera_face_torso(model: mujoco.MjModel, data: mujoco.MjData, *, distance
 
     cam = mujoco.MjvCamera()
     mujoco.mjv_defaultFreeCamera(model, cam)
-    cam.lookat[:] = tpos + np.array([0.0, 0.0, 0.42], dtype=np.float64)
+    cam.lookat[:] = tpos + np.array([0.0, 0.0, float(lookat_height_above_torso_m)], dtype=np.float64)
     cam.distance = distance
     cam.azimuth = float(np.degrees(np.arctan2(-fwd[1], -fwd[0])))
     cam.elevation = float(elevation_deg)
@@ -241,6 +248,7 @@ class IsaacRendererWithMuJoco:
         video_camera: str = "track",
         face_torso_distance: float = 2.75,
         face_torso_elevation_deg: float = 14.0,
+        face_torso_lookat_height_above_torso_m: float = 0.42,
     ):
         from humanoidverse.utils.g1_env_config import G1EnvConfig
 
@@ -248,6 +256,7 @@ class IsaacRendererWithMuJoco:
         self.video_camera = video_camera
         self.face_torso_distance = face_torso_distance
         self.face_torso_elevation_deg = face_torso_elevation_deg
+        self.face_torso_lookat_height_above_torso_m = face_torso_lookat_height_above_torso_m
 
     @staticmethod
     def _inner_g1_env(wrapped):
@@ -284,13 +293,94 @@ class IsaacRendererWithMuJoco:
                     mj_inner.data,
                     distance=self.face_torso_distance,
                     elevation_deg=self.face_torso_elevation_deg,
+                    lookat_height_above_torso_m=self.face_torso_lookat_height_above_torso_m,
                 )
                 all_images.append(g1.render(camera=cam))
             else:
                 all_images.append(g1.render())
 
         return all_images
-    
+
+    @staticmethod
+    def _estimate_foreground_mask(frame: np.ndarray) -> np.ndarray:
+        corners = np.concatenate(
+            [
+                frame[:20, :20].reshape(-1, 3),
+                frame[:20, -20:].reshape(-1, 3),
+                frame[-20:, :20].reshape(-1, 3),
+                frame[-20:, -20:].reshape(-1, 3),
+            ],
+            axis=0,
+        )
+        background = np.median(corners.astype(np.float32), axis=0)
+        diff = np.linalg.norm(frame.astype(np.float32) - background[None, None, :], axis=-1)
+        return diff > 28.0
+
+    @staticmethod
+    def _overlay_goal_frame(
+        current_frame: np.ndarray, goal_frame: np.ndarray, *, overlay_alpha: float = 0.42
+    ) -> np.ndarray:
+        mask = IsaacRendererWithMuJoco._estimate_foreground_mask(goal_frame)
+        tinted_goal = goal_frame.astype(np.float32).copy()
+        blue_tint = np.array([90.0, 185.0, 255.0], dtype=np.float32)
+        tinted_goal = 0.25 * tinted_goal + 0.75 * blue_tint
+        out = current_frame.astype(np.float32).copy()
+        alpha = float(overlay_alpha)
+        out[mask] = (1.0 - alpha) * out[mask] + alpha * tinted_goal[mask]
+        return np.clip(out, 0, 255).astype(np.uint8)
+
+    def render_with_goal_dof_overlay(
+        self,
+        hv_env: tp.Any,
+        env_idx: int,
+        goal_dof_pos: np.ndarray,
+        *,
+        overlay_alpha: float = 0.42,
+    ) -> np.ndarray:
+        """与当前仿真根姿态一致，将 29-D 关节设为目标铰链角，用半透明青色叠在 MuJoCo 画上（结构化 z probe 思路）。"""
+        base_pos = hv_env.simulator.robot_root_states[:, [0, 1, 2, 6, 3, 4, 5]].clone().detach().cpu().numpy()
+        joint_pos = hv_env.simulator.dof_pos.clone().detach().cpu().numpy()
+        if joint_pos.shape[1] != 29:
+            raise ValueError(f"Expected 29 DOF dof_pos; got shape {joint_pos.shape}.")
+        q_cur = np.concatenate([base_pos[env_idx].astype(np.float32), joint_pos[env_idx].astype(np.float32)], axis=-1)
+
+        gd = np.asarray(goal_dof_pos, dtype=np.float32).reshape(-1)
+        if gd.size != 29:
+            raise ValueError(f"goal_dof_pos must have 29 elements; got shape {gd.shape}.")
+        q_goal = np.concatenate([q_cur[:7].astype(np.float32), gd], axis=-1)
+
+        g1 = IsaacRendererWithMuJoco._inner_g1_env(self.mujoco_env)
+        mj_inner = g1
+
+        cam = None
+        qvel = mj_inner._mj_data.qvel.copy()
+        self.mujoco_env.reset(options={"qpos": q_cur, "qvel": qvel})
+        mujoco.mj_forward(mj_inner.model, mj_inner.data)
+
+        if self.video_camera == "face_torso":
+            cam = mj_camera_face_torso(
+                mj_inner.model,
+                mj_inner.data,
+                distance=self.face_torso_distance,
+                elevation_deg=self.face_torso_elevation_deg,
+                lookat_height_above_torso_m=self.face_torso_lookat_height_above_torso_m,
+            )
+
+        rgb_cur = g1.render(camera=cam)
+
+        qvel_goal = mj_inner._mj_data.qvel.copy()
+        self.mujoco_env.reset(options={"qpos": q_goal, "qvel": qvel_goal})
+        mujoco.mj_forward(mj_inner.model, mj_inner.data)
+
+        rgb_goal = g1.render(camera=cam)
+
+        overlay = IsaacRendererWithMuJoco._overlay_goal_frame(rgb_cur, rgb_goal, overlay_alpha=overlay_alpha)
+        # 恢复 MuJoCo 与当前仿真一致（便于下一帧继续使用同一 renderer）
+        self.mujoco_env.reset(options={"qpos": q_cur, "qvel": qvel})
+        mujoco.mj_forward(mj_inner.model, mj_inner.data)
+
+        return overlay
+
     def from_qpos(self, qpos):
         """Render frames for each qpos. Only 36-D qpos (7 free + 29 joints) is supported."""
         frames = []

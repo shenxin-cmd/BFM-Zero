@@ -1,6 +1,9 @@
 """
 Isaac 上 Split-z：**单一 MuJoCo 关节目标** → ``goal_inference`` 得 z → 策略与环境闭环 rollout，
-录 mp4 并保存 rollout 过程的 z trace（``.npz``）。
+录 mp4（可选半透明蓝色 goal 叠画）、关节跟踪误差曲线图，并保存 z trace（``.npz``）。
+
+视频与默认附图目录通过 Tyro 参数 ``--video-folder``（或 ``video_folder``）指定；不写则落到
+``模型目录/split_z_goal_isaac3/videos``。
 
 Goal 观测的构造对齐仓库根目录 ``env.py`` 中 ``MuJoCoBFMZeroEnv._create_observation_backward`` /
 ``get_privileged_state``（单位重力投影 ``[0,0,-1]``、静态姿态下速度与 ``last_action`` 置零）。
@@ -124,6 +127,20 @@ ROLLOUT_REF_MOTION_ID = 0
 _VIRTUAL_HEAD_PARENT = "torso_link"
 _VIRTUAL_HEAD_OFFSET_PARENT_MU = (0.0, 0.0, 0.35)
 _VIRTUAL_HEAD_REL_QUAT_WLAST = (0.0, 0.0, 0.0, 1.0)  # xyzw · w_last
+
+# 与训练中 body / right-arm 分拆一致：dof 向量下标 22..28 为右臂 7 关节，其余为非右臂 body 关节。
+DOF_SPLIT_BODY_EXCL_RIGHT_ARM_SLICE = slice(0, 22)
+DOF_SPLIT_RIGHT_ARM_7_SLICE = slice(22, 29)
+
+
+def _dof_mean_abs_tracking_error(sim_dof: np.ndarray, goal_dof_abs: np.ndarray) -> tuple[float, float]:
+    """(右臂 7 关节平均绝对角误差, 其余 22 body 关节平均绝对角误差)，弧度。"""
+    d = np.asarray(sim_dof).reshape(-1).astype(np.float64)
+    g = np.asarray(goal_dof_abs).reshape(-1).astype(np.float64)
+    right = d[DOF_SPLIT_RIGHT_ARM_7_SLICE] - g[DOF_SPLIT_RIGHT_ARM_7_SLICE]
+    body = d[DOF_SPLIT_BODY_EXCL_RIGHT_ARM_SLICE] - g[DOF_SPLIT_BODY_EXCL_RIGHT_ARM_SLICE]
+    return float(np.mean(np.abs(right))), float(np.mean(np.abs(body)))
+
 
 # -----------------------------------------------------------------------------
 # Goal 观测：按 env.py 逻辑从 MuJoCo 状态拼装（与 inference_tutorial + env.py 一致思路）
@@ -379,6 +396,32 @@ def _build_goal_observation(
     return {k: v.to(device=device, dtype=torch.float32) for k, v in raw.items()}
 
 
+def _save_dof_tracking_curve_plot(
+    t_s: np.ndarray,
+    err_right_arm7: np.ndarray,
+    err_body_excl_right: np.ndarray,
+    path: Path,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(10, 5), dpi=140)
+    ax.plot(t_s, err_right_arm7, label="右臂 7 关节 |Δq| 平均 (rad)", lw=1.6)
+    ax.plot(t_s, err_body_excl_right, label="其余 body（22 关节）|Δq| 平均 (rad)", lw=1.6)
+    ax.set_xlabel("时间 (s)")
+    ax.set_ylabel("平均绝对关节角误差 (rad)")
+    ax.legend(loc="best")
+    ax.grid(True, alpha=0.35)
+    fig.tight_layout()
+    fig.savefig(str(path))
+    plt.close(fig)
+    print(
+        f"关节跟踪误差曲线图: {path} "
+        f"(末帧右臂7={err_right_arm7[-1]:.5f} rad, 其余22={err_body_excl_right[-1]:.5f} rad)"
+    )
+
+
 def main(
     model_folder: Path,
     data_path: Path | None = None,
@@ -398,6 +441,11 @@ def main(
     video_camera: str = "face_torso",
     face_torso_camera_distance: float = 2.75,
     face_torso_camera_elevation_deg: float = 14.0,
+    face_torso_lookat_height_above_torso_m: float = 0.12,
+    visualize_goal_blue_overlay: bool = True,
+    goal_overlay_alpha: float = 0.42,
+    save_dof_tracking_plot: bool = True,
+    dof_tracking_plot_path: Path | None = None,
     policy_sample: bool = False,
     save_z_trace: bool = True,
     z_trace_out: Path | None = None,
@@ -405,7 +453,14 @@ def main(
     """
     从模块级 ``GOAL_POSE_JOINT_ABS_RAD`` 定义目标铰链角，经 ``env.py`` 风格 backward 观测做 ``goal_inference``，
     再 ``project_z(act on z_hand 噪声同上)`` 与 Isaac env 闭环 ``episode_len`` 步；
-    默认写 mp4 与 ``--z-trace-out`` / 默认路径下的 rollout z ``.npz``。
+    默认写 mp4（可选叠画半透明蓝色 goal）、z trace `.npz`、关节平均跟踪误差曲线图。
+
+    终端常用参数示例（Tyro，下划线等价于 `--kebab-case`）：
+
+    - ``--video-folder``: 录制 mp4、默认 dof 跟踪图与 z trace（未指定 `--z-trace-out` / ``--dof-tracking-plot-path``）的目录；
+    - ``--face-torso-lookat-height-above-torso-m``: 躯干 lookat 点相对 torso 高度的 z 偏移（米）；默认 ``0.12`` 相对旧版 ``0.42``
+      等价于镜头视野下移约 30cm；
+    - ``--no-visualize-goal-blue-overlay`` / ``--no-save-dof-tracking-plot``: 关掉 goal 叠加或误差曲线；
     """
     model_folder = Path(model_folder)
     vid_dir = Path(video_folder) if video_folder is not None else model_folder / "split_z_goal_isaac3" / "videos"
@@ -447,6 +502,7 @@ def main(
 
     backward_keys = ["state", "last_action", "privileged_state"]
     goal_observation = _build_goal_observation(xml_goal, model.device, use_root_height_obs=use_root_height_obs)
+    goal_dof_abs_np = _absolute_dof_array(GOAL_POSE_JOINT_ABS_RAD).astype(np.float64)
 
     print(
         f"goal=Mujoco(env.py-style) xml={xml_goal} · rollout_motion_id={rollout_mid} · "
@@ -456,6 +512,8 @@ def main(
     if vc not in ("face_torso", "track"):
         raise ValueError("video_camera must be 'face_torso' or 'track'.")
     print(f"hand_noise_std={hand_noise_std} · video_camera={vc} · policy_sample={policy_sample}")
+    if visualize_goal_blue_overlay and not save_mp4:
+        print("提示: visualize_goal_blue_overlay=True 仅在 save_mp4=True 时生效，已跳过叠画。")
 
     env.set_is_evaluating(rollout_mid)
 
@@ -499,6 +557,8 @@ def main(
     inferred_b: list[np.ndarray] = []
     inferred_h: list[np.ndarray] = []
     inferred_f: list[np.ndarray] = []
+    dof_err_right_arm: list[float] = []
+    dof_err_body_excl_right: list[float] = []
 
     if save_mp4:
         rgb_renderer = IsaacRendererWithMuJoco(
@@ -506,12 +566,15 @@ def main(
             video_camera=vc,
             face_torso_distance=face_torso_camera_distance,
             face_torso_elevation_deg=face_torso_camera_elevation_deg,
+            face_torso_lookat_height_above_torso_m=face_torso_lookat_height_above_torso_m,
         )
 
     observation, _ = wrapped_env.reset(to_numpy=False)
     observation, _ = wrapped_env.reset(to_numpy=False)
     observation, _ = wrapped_env.reset(to_numpy=False)
     observation, _ = wrapped_env.reset(to_numpy=False)
+
+    ctrl_dt = float(getattr(env, "dt", 0.02))
 
     frames: list = []
     zn = z.repeat(env.num_envs, 1)
@@ -523,6 +586,12 @@ def main(
         inferred_b.append(b0)
         inferred_h.append(h0)
         inferred_f.append(f0)
+        d0 = env.simulator.dof_pos[0].detach().cpu().numpy()
+        eh0, eb0 = _dof_mean_abs_tracking_error(d0, goal_dof_abs_np)
+        dof_err_right_arm.append(eh0)
+        dof_err_body_excl_right.append(eb0)
+
+    do_overlay = bool(save_mp4 and visualize_goal_blue_overlay)
 
     for _counter in infer_n:
         action = model.act(observation, zn, mean=act_mean)
@@ -532,8 +601,31 @@ def main(
             inferred_b.append(b1)
             inferred_h.append(h1)
             inferred_f.append(f1)
+        dk = env.simulator.dof_pos[0].detach().cpu().numpy()
+        ehr, ebr = _dof_mean_abs_tracking_error(dk, goal_dof_abs_np)
+        dof_err_right_arm.append(ehr)
+        dof_err_body_excl_right.append(ebr)
         if save_mp4:
-            frames.append(rgb_renderer.render(env, 0)[0])
+            if do_overlay:
+                frames.append(
+                    rgb_renderer.render_with_goal_dof_overlay(
+                        env, 0, goal_dof_abs_np, overlay_alpha=goal_overlay_alpha
+                    )
+                )
+            else:
+                frames.append(rgb_renderer.render(env, 0)[0])
+
+    er_track = np.asarray(dof_err_right_arm, dtype=np.float64)
+    eb_track = np.asarray(dof_err_body_excl_right, dtype=np.float64)
+    t_track = np.arange(er_track.shape[0], dtype=np.float64) * ctrl_dt
+
+    if save_dof_tracking_plot:
+        pplot = dof_tracking_plot_path
+        if pplot is None:
+            sfx_plt = f"_{video_suffix}" if video_suffix else ""
+            noise_tag_plt = f"hnoise{hand_noise_std:.4f}".replace(".", "p")
+            pplot = vid_dir / f"dof_tracking_{noise_tag_plt}_{vc}{sfx_plt}.png"
+        _save_dof_tracking_curve_plot(t_track, er_track, eb_track, pplot)
 
     tag = "mujoco_env_py_goal"
     if save_z_trace:
@@ -562,6 +654,10 @@ def main(
             inferred_z_body=zb_arr,
             inferred_z_hand=zh_arr,
             inferred_z_full=zf_arr,
+            dof_err_right_arm_mean_rad=er_track.astype(np.float32),
+            dof_err_body_excl_right_mean_rad=eb_track.astype(np.float32),
+            dof_tracking_time_s=t_track.astype(np.float32),
+            ctrl_dt=np.float32(ctrl_dt),
             policy_goal_z_body=policy_goal_z_body_np,
             policy_goal_z_hand=policy_goal_z_hand_np,
             policy_goal_z_full=z_ref.detach().cpu().numpy().reshape(-1).astype(np.float32),
