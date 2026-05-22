@@ -15,7 +15,10 @@
 必备键（不区分大小写；``last action`` → ``last_action``；兼容 ``priviledged_state``）：
   - ``state``          形状 ``(T, 64)``
   - ``last_action``   形状 ``(T, 29)``
-  - ``privileged_state`` 形状 ``(T, 527)`` 或 ``(T, 462/463)``（与 checkpoint 一致）
+  - ``privileged_state`` 通常为 ``compute_humanoid_observations_max`` 拼出的维度：
+      训练若 ``root_height_obs=True`` 常为 **463**（30 体 + 扩展 ``head_link``）或 **448**（无扩展体）；
+      若 ``root_height_obs=False`` 则对应 **462** / **447**。
+    脚本会按 checkpoint 的 ``obs_space`` **自动对齐**：若轨迹比模型多一整块末端刚体观测（常见于多录了虚拟头），会自动裁掉等价于 Isaac **``nums_extend_bodies=1``** 的那一段。
 
 可选键（若提供则用于更准确的 MuJoCo 专家侧）：
   - ``mujoco_qpos`` 形状 ``(T, 36)``：7 自由根 + 29 关节，与 ``IsaacRendererWithMuJoco`` 一致。
@@ -112,6 +115,73 @@ def traj_to_backward_batch(traj: dict[str, np.ndarray], device: torch.device) ->
         k: torch.from_numpy(traj[k]).to(device=device, dtype=torch.float32)
         for k in _BACKWARD_KEYS
     }
+
+
+def _privileged_dim_from_model(model) -> int:
+    sp = model.obs_space
+    if getattr(sp, "spaces", None) is None:
+        raise TypeError(f"模型 obs_space 非 Dict（{type(sp)}）；无法获知 privileged_state 期望维数")
+    priv = sp.spaces.get("privileged_state")
+    if priv is None:
+        keys = getattr(sp, "spaces", {}).keys()
+        raise KeyError(f"obs_space 中没有 privileged_state，现有键: {list(keys)}")
+    return int(priv.shape[0])
+
+
+def _drop_last_body_max_local_slices(priv: np.ndarray, *, root_height_obs: bool) -> np.ndarray:
+    """移除 ``max_local_self`` 中末尾刚体的一块（通常为 ``head_link`` 扩展），与 ``legged_robot_motions.compute_humanoid_observations_max`` 拼接顺序一致。"""
+    assert priv.ndim == 2
+    idx = int(root_height_obs)
+    slices: list[np.ndarray] = []
+    seg_dims = [(90, 3), (186, 6), (93, 3), (93, 3)]  # (length, chop from end)
+
+    offset = idx
+    for length, chop in seg_dims:
+        seg = priv[:, offset : offset + length]
+        slices.append(seg[:, :-chop])
+        offset += length
+    tail = idx + sum(d for d, _ in seg_dims)
+    assert offset == tail and tail == priv.shape[-1]
+
+    heads = [priv[:, :1]] if root_height_obs else []
+    merged = np.concatenate(heads + slices, axis=-1)
+    assert merged.ndim == 2
+    return np.ascontiguousarray(merged.astype(np.float32))
+
+
+def align_traj_privileged_for_model(traj: dict[str, np.ndarray], model) -> dict[str, np.ndarray]:
+    """
+    将 ``privileged_state`` 维数对齐到 checkpoint 的 BatchNorm / B 网络。
+
+    支持：463→448、462→447（即多 1 个刚体 × 局部 pos/rot/vel/ang_vel，与 yaml 里 ``nums_extend_bodies: 1`` 一致）。
+    """
+    exp = _privileged_dim_from_model(model)
+    p = traj["privileged_state"]
+    d = int(p.shape[-1])
+    if d == exp:
+        return traj
+
+    trim_from: dict[tuple[int, int], bool] = {
+        (463, 448): True,
+        (462, 447): False,
+    }
+    key = (d, exp)
+    if key not in trim_from:
+        raise ValueError(
+            f"privileged_state 维数 {d} 与 checkpoint 期望 {exp} 不符，且无法自动转换。"
+            f" 若为刚体数不一致，请用与训练相同 body 配置的轨迹，或另行重算 max_local_self。"
+        )
+    new_p = _drop_last_body_max_local_slices(p, root_height_obs=trim_from[key])
+    if new_p.shape[-1] != exp:
+        raise RuntimeError(f"对齐后 privileged 维数为 {new_p.shape[-1]}，仍不等于模型期望 {exp}")
+
+    out = dict(traj)
+    out["privileged_state"] = new_p
+    print(
+        f"提示: privileged_state {d} → {exp}（按末端刚体块裁剪，root_height_obs={trim_from[key]}），"
+        "与仅 30 个实体刚体的 checkpoint 对齐。"
+    )
+    return out
 
 
 def _build_expert_qpos(
@@ -266,7 +336,7 @@ def main(
 
     for traj_path in paths:
         print(f"Load trajectory: {traj_path}")
-        traj_np = load_traj_obs_file(traj_path)
+        traj_np = align_traj_privileged_for_model(load_traj_obs_file(traj_path), model)
         obs_full = traj_to_backward_batch(traj_np, dev)
         z = tracking_inference(tree_map(lambda x: x[1:], obs_full))
         stem = re.sub(r"[^\w\-.]+", "_", traj_path.stem)
