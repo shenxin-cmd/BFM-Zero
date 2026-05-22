@@ -10,6 +10,8 @@
   - ``.pkl``：``joblib`` 或 pickle，内容为 dict；或长度为 T 的 list，每项为帧级 dict。
   - ``.npz``：每组一个数组，维度为 ``(T, dim)``.
 
+默认按 ``*.npz`` 扫描；若 ``*.npz`` 无文件且模式为 ``*.npz`` 或 ``*.pkl``，会自动尝试另一种扩展名。
+
 必备键（不区分大小写；``last action`` → ``last_action``；兼容 ``priviledged_state``）：
   - ``state``          形状 ``(T, 64)``
   - ``last_action``   形状 ``(T, 29)``
@@ -177,7 +179,7 @@ def _build_expert_qpos(
 def main(
     model_folder: Path,
     traj_obs_dir: Path,
-    traj_glob: str = "*.pkl",
+    traj_glob: str = "*.npz",
     data_path: Path | None = None,
     headless: bool = True,
     device: str = "cuda",
@@ -247,8 +249,16 @@ def main(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     paths = sorted(traj_obs_dir.glob(traj_glob))
+    if not paths and traj_glob in ("*.pkl", "*.npz"):
+        alt = "*.npz" if traj_glob == "*.pkl" else "*.pkl"
+        paths = sorted(traj_obs_dir.glob(alt))
+        if paths:
+            print(f"提示: {traj_glob!r} 无匹配，已改用 {alt!r}，共 {len(paths)} 个文件。")
     if not paths:
-        raise FileNotFoundError(f"在 {traj_obs_dir} 下未找到匹配 {traj_glob!r} 的文件")
+        raise FileNotFoundError(
+            f"在 {traj_obs_dir} 下未找到匹配 {traj_glob!r} 的文件"
+            f"（若轨迹为另一种格式，请显式设置 --traj-glob，例如 '*.npz' 或 '*.pkl'）"
+        )
 
     last_z: torch.Tensor | None = None
     last_traj_np: dict[str, np.ndarray] | None = None
