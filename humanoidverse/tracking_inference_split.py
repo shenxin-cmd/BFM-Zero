@@ -184,6 +184,22 @@ def align_traj_privileged_for_model(traj: dict[str, np.ndarray], model) -> dict[
     return out
 
 
+def _base_init_root_pose_7(env) -> np.ndarray:
+    """``LeggedRobotBase.base_init_state`` 多为 ``(13,)``，部分后端可能为 ``(N,13)``；取 pos+quat (7,)。"""
+    bis = env.base_init_state.detach().float()
+    if bis.ndim == 1:
+        if bis.shape[0] < 7:
+            raise ValueError(f"base_init_state 维数 {bis.shape[0]} < 7")
+        root7 = bis[:7]
+    elif bis.ndim >= 2:
+        if bis.shape[-1] < 7:
+            raise ValueError(f"base_init_state 最后一维 {bis.shape[-1]} < 7")
+        root7 = bis[0, :7]
+    else:
+        raise ValueError(f"无法解析 base_init_state，ndim={bis.ndim}")
+    return root7.cpu().numpy().astype(np.float32)
+
+
 def _build_expert_qpos(
     traj: dict[str, np.ndarray],
     *,
@@ -205,7 +221,11 @@ def _build_expert_qpos(
         raise ValueError(
             f"state 第二维至少 58（29 相对关节 + 29 关节速度 + …），当前 {st.shape[1]}"
         )
-    default_dof = env.default_dof_pos[0].detach().float().cpu().numpy()
+    ddp = env.default_dof_pos.detach().float()
+    if ddp.ndim == 1:
+        default_dof = ddp.cpu().numpy()
+    else:
+        default_dof = ddp[0].cpu().numpy()
 
     if "mujoco_qpos" in traj:
         q = np.asarray(traj["mujoco_qpos"], dtype=np.float64)
@@ -220,9 +240,9 @@ def _build_expert_qpos(
     else:
         dof_rel = st[:, :29].astype(np.float64)
         dof_abs = dof_rel + default_dof[None, :]
-        root_template = env.base_init_state[0, :7].detach().cpu().numpy()
-        root_pos = root_template[:3].astype(np.float32)
-        root_quat = root_template[3:7].astype(np.float32)
+        root_template = _base_init_root_pose_7(env)
+        root_pos = root_template[:3]
+        root_quat = root_template[3:7]
         expert_qpos = np.zeros((T, 36), dtype=np.float32)
         expert_qpos[:, :3] = root_pos
         expert_qpos[:, 3:7] = root_quat
