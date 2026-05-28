@@ -836,11 +836,16 @@ class SplitBackwardMap(nn.Module):
 
 
 class SplitForwardArchiConfig(BaseConfig):
-    """Config for the split F-network: shared trunk + hand head + body head."""
+    """Config for the split F-network: independent residual dual-path branches for body and hand.
+
+    Body branch uses hidden_dim; hand branch uses the smaller hand_hidden_dim.
+    hidden_layers must be >= 2 (required by residual_embedding).
+    """
 
     name: tp.Literal["SplitForwardArchi"] = "SplitForwardArchi"
-    hidden_dim: int = 1024
-    trunk_hidden_dim: int = 256
+    hidden_dim: int = 1024       # body branch hidden size
+    hand_hidden_dim: int = 512   # hand branch hidden size (smaller, z_hand is only 36-dim)
+    hidden_layers: int = 2       # shared by residual_embedding and the Fs trunk (>= 2)
     num_parallel: int = 2
     input_filter: NNFilter = IdentityInputFilterConfig()
     z_body_dim: int = 225
@@ -851,76 +856,56 @@ class SplitForwardArchiConfig(BaseConfig):
         return SplitForwardMap(obs_space, action_dim, self)
 
 
-class _SingleSplitForwardMap(nn.Module):
-    """One instance of the split F-network (no ensemble).
+class SplitForwardMap(nn.Module):
+    """Split F-network with DenseParallel ensemble.
 
-    Input : obs (filtered flat), z=[z_body, z_hand], action
-    Output: [F_body (z_body_dim), F_hand (z_hand_dim)]
+    Each branch mirrors ResidualForwardMap's dual-path structure
+    (embed_sa + embed_z → Fs) but operates on the body/hand sub-spaces
+    independently.
+
+    Body branch: embed_sa_body(obs, a_body) + embed_z_body(obs, z_body) → Fs_body → z_body_dim
+    Hand branch: embed_sa_hand(obs, a_hand) + embed_z_hand(obs, z_hand) → Fs_hand → z_hand_dim
+
+    Output shape: num_parallel × batch × (z_body_dim + z_hand_dim)
+    Compatible with existing code that expects num_parallel × batch × z_dim.
     """
 
     def __init__(self, obs_space, action_dim: int, cfg: SplitForwardArchiConfig) -> None:
         super().__init__()
+
         self.input_filter = cfg.input_filter.build(obs_space)
         filtered_space = self.input_filter.output_space
         assert isinstance(filtered_space, gymnasium.spaces.Box), (
             "SplitForwardMap: set input_filter to DictInputFilterConfig with keys="
             "[\"state\", \"privileged_state\", \"last_action\", \"history_actor\"]."
         )
+        assert len(filtered_space.shape) == 1, "SplitForwardMap: filtered_space must be 1D"
         obs_dim = filtered_space.shape[0]
 
         self.z_body_dim = cfg.z_body_dim
         self.z_hand_dim = cfg.z_hand_dim
         self.hand_action_dim = cfg.hand_action_dim
         self.body_action_dim = action_dim - cfg.hand_action_dim
-
-        trunk_dim = cfg.trunk_hidden_dim
-        h = cfg.hidden_dim
-
-        self.trunk = nn.Sequential(
-            nn.Linear(obs_dim, h), nn.LayerNorm(h), nn.Tanh(),
-            nn.Linear(h, trunk_dim), nn.ReLU(),
-        )
-        self.hand_head = nn.Sequential(
-            nn.Linear(trunk_dim + cfg.hand_action_dim + cfg.z_hand_dim, h), nn.ReLU(),
-            nn.Linear(h, cfg.z_hand_dim),
-        )
-        self.body_head = nn.Sequential(
-            nn.Linear(trunk_dim + self.body_action_dim + cfg.z_body_dim, h), nn.ReLU(),
-            nn.Linear(h, cfg.z_body_dim),
-        )
-
-    def forward(
-        self,
-        obs: torch.Tensor | dict[str, torch.Tensor],
-        z: torch.Tensor,
-        action: torch.Tensor,
-    ) -> torch.Tensor:
-        x = self.input_filter(obs)
-        e_ctx = self.trunk(x)
-
-        z_body = z[:, : self.z_body_dim]
-        z_hand = z[:, self.z_body_dim :]
-        a_body = action[:, : self.body_action_dim]
-        a_hand = action[:, -self.hand_action_dim :]
-
-        f_body = self.body_head(torch.cat([e_ctx, a_body, z_body], dim=-1))
-        f_hand = self.hand_head(torch.cat([e_ctx, a_hand, z_hand], dim=-1))
-        return torch.cat([f_body, f_hand], dim=-1)
-
-
-class SplitForwardMap(nn.Module):
-    """Ensembled SplitForwardMap (num_parallel independent instances).
-
-    Output shape: num_parallel × batch × (z_body_dim + z_hand_dim)
-    Compatible with the existing code that expects num_parallel × batch × z_dim.
-    """
-
-    def __init__(self, obs_space, action_dim: int, cfg: SplitForwardArchiConfig) -> None:
-        super().__init__()
         self.num_parallel = cfg.num_parallel
-        self.models = nn.ModuleList(
-            [_SingleSplitForwardMap(obs_space, action_dim, cfg) for _ in range(cfg.num_parallel)]
-        )
+
+        P = cfg.num_parallel
+        h_body = cfg.hidden_dim
+        h_hand = cfg.hand_hidden_dim
+        hl = cfg.hidden_layers
+
+        # Body branch — mirrors ResidualForwardMap with DenseParallel
+        self.embed_z_body  = residual_embedding(obs_dim + cfg.z_body_dim,          h_body, hl, P)
+        self.embed_sa_body = residual_embedding(obs_dim + self.body_action_dim,     h_body, hl, P)
+        seq_body = [ResidualBlock(h_body, P) for _ in range(hl)]
+        seq_body += [Block(h_body, cfg.z_body_dim, False, P)]
+        self.Fs_body = nn.Sequential(*seq_body)
+
+        # Hand branch — same structure, smaller hidden size
+        self.embed_z_hand  = residual_embedding(obs_dim + cfg.z_hand_dim,           h_hand, hl, P)
+        self.embed_sa_hand = residual_embedding(obs_dim + cfg.hand_action_dim,       h_hand, hl, P)
+        seq_hand = [ResidualBlock(h_hand, P) for _ in range(hl)]
+        seq_hand += [Block(h_hand, cfg.z_hand_dim, False, P)]
+        self.Fs_hand = nn.Sequential(*seq_hand)
 
     def forward(
         self,
@@ -928,16 +913,42 @@ class SplitForwardMap(nn.Module):
         z: torch.Tensor,
         action: torch.Tensor,
     ) -> torch.Tensor:
-        outputs = [m(obs, z, action) for m in self.models]
-        return torch.stack(outputs)  # num_parallel × batch × total_z_dim
+        obs = self.input_filter(obs)
+        if self.num_parallel > 1:
+            obs    = obs.expand(self.num_parallel, -1, -1)
+            z      = z.expand(self.num_parallel, -1, -1)
+            action = action.expand(self.num_parallel, -1, -1)
+
+        z_body = z[..., : self.z_body_dim]
+        z_hand = z[..., self.z_body_dim :]
+        a_body = action[..., : self.body_action_dim]
+        a_hand = action[..., -self.hand_action_dim :]
+
+        # Body branch: embed then joint encode
+        emb_sa_body = self.embed_sa_body(torch.cat([obs, a_body], dim=-1))  # P × B × h_body//2
+        emb_z_body  = self.embed_z_body(torch.cat([obs, z_body], dim=-1))   # P × B × h_body//2
+        f_body = self.Fs_body(torch.cat([emb_sa_body, emb_z_body], dim=-1)) # P × B × z_body_dim
+
+        # Hand branch: embed then joint encode
+        emb_sa_hand = self.embed_sa_hand(torch.cat([obs, a_hand], dim=-1))  # P × B × h_hand//2
+        emb_z_hand  = self.embed_z_hand(torch.cat([obs, z_hand], dim=-1))   # P × B × h_hand//2
+        f_hand = self.Fs_hand(torch.cat([emb_sa_hand, emb_z_hand], dim=-1)) # P × B × z_hand_dim
+
+        return torch.cat([f_body, f_hand], dim=-1)  # P × B × (z_body_dim + z_hand_dim)
 
 
 class SplitActorArchiConfig(BaseConfig):
-    """Config for the split Actor: shared trunk + hand policy + body policy."""
+    """Config for the split Actor: independent residual dual-path branches for body and hand.
+
+    Body branch uses hidden_dim; hand branch uses the smaller hand_hidden_dim.
+    embedding_layers must be >= 2 (required by residual_embedding).
+    """
 
     name: tp.Literal["SplitActorArchi"] = "SplitActorArchi"
-    hidden_dim: int = 1024
-    trunk_hidden_dim: int = 256
+    hidden_dim: int = 1024       # body branch hidden size
+    hand_hidden_dim: int = 512   # hand branch hidden size
+    hidden_layers: int = 1       # ResidualBlocks in policy trunk
+    embedding_layers: int = 2    # layers inside residual_embedding (>= 2)
     input_filter: NNFilter = IdentityInputFilterConfig()
     z_body_dim: int = 225
     z_hand_dim: int = 36
@@ -948,7 +959,13 @@ class SplitActorArchiConfig(BaseConfig):
 
 
 class SplitActor(nn.Module):
-    """Split Actor: shared trunk extracts context, then separate policies for hand / body.
+    """Split Actor: independent residual dual-path branches for body and hand.
+
+    Each branch mirrors ResidualActor's structure (embed_s + embed_z → policy)
+    but operates on the body/hand sub-spaces independently.
+
+    Body branch: embed_s_body(obs) + embed_z_body(obs, z_body) → body_policy → a_body
+    Hand branch: embed_s_hand(obs) + embed_z_hand(obs, z_hand) → hand_policy → a_hand
 
     Output action layout: [mu_body (body_action_dim), mu_hand (hand_action_dim)]
     — matches dof_names order where right arm is last.
@@ -962,6 +979,7 @@ class SplitActor(nn.Module):
             "SplitActor: set input_filter to DictInputFilterConfig with keys="
             "[\"state\", \"privileged_state\", \"last_action\", \"history_actor\"]."
         )
+        assert len(filtered_space.shape) == 1, "SplitActor: filtered_space must be 1D"
         obs_dim = filtered_space.shape[0]
 
         self.z_body_dim = cfg.z_body_dim
@@ -969,21 +987,24 @@ class SplitActor(nn.Module):
         self.hand_action_dim = cfg.hand_action_dim
         self.body_action_dim = action_dim - cfg.hand_action_dim
 
-        trunk_dim = cfg.trunk_hidden_dim
-        h = cfg.hidden_dim
+        h_body = cfg.hidden_dim
+        h_hand = cfg.hand_hidden_dim
+        el = cfg.embedding_layers
+        hl = cfg.hidden_layers
 
-        self.trunk = nn.Sequential(
-            nn.Linear(obs_dim, h), nn.LayerNorm(h), nn.Tanh(),
-            nn.Linear(h, trunk_dim), nn.ReLU(),
-        )
-        self.hand_policy = nn.Sequential(
-            nn.Linear(trunk_dim + cfg.z_hand_dim, h), nn.ReLU(),
-            nn.Linear(h, cfg.hand_action_dim),
-        )
-        self.body_policy = nn.Sequential(
-            nn.Linear(trunk_dim + cfg.z_body_dim, h), nn.ReLU(),
-            nn.Linear(h, self.body_action_dim),
-        )
+        # Body branch — mirrors ResidualActor
+        self.embed_s_body = residual_embedding(obs_dim,                        h_body, el)
+        self.embed_z_body = residual_embedding(obs_dim + cfg.z_body_dim,       h_body, el)
+        seq_body = [ResidualBlock(h_body) for _ in range(hl)]
+        seq_body += [Block(h_body, self.body_action_dim, False)]
+        self.body_policy = nn.Sequential(*seq_body)
+
+        # Hand branch — same structure, smaller hidden size
+        self.embed_s_hand = residual_embedding(obs_dim,                        h_hand, el)
+        self.embed_z_hand = residual_embedding(obs_dim + cfg.z_hand_dim,       h_hand, el)
+        seq_hand = [ResidualBlock(h_hand) for _ in range(hl)]
+        seq_hand += [Block(h_hand, cfg.hand_action_dim, False)]
+        self.hand_policy = nn.Sequential(*seq_hand)
 
     def forward(
         self,
@@ -991,16 +1012,26 @@ class SplitActor(nn.Module):
         z: torch.Tensor,
         std: float,
     ) -> "TruncatedNormal":
-        x = self.input_filter(obs)
-        e_ctx = self.trunk(x)
+        obs = self.input_filter(obs)
 
         z_body = z[:, : self.z_body_dim]
         z_hand = z[:, self.z_body_dim :]
 
-        mu_body = self.body_policy(torch.cat([e_ctx, z_body], dim=-1))
-        mu_hand = self.hand_policy(torch.cat([e_ctx, z_hand], dim=-1))
-        mu = torch.tanh(torch.cat([mu_body, mu_hand], dim=-1))  # 29 dims: body first, hand last
+        # Body branch: embed obs and (obs, z_body) separately, then concat and decode
+        emb_body = torch.cat(
+            [self.embed_s_body(obs), self.embed_z_body(torch.cat([obs, z_body], dim=-1))],
+            dim=-1,
+        )  # bs × h_body
+        mu_body = self.body_policy(emb_body)
 
+        # Hand branch: embed obs and (obs, z_hand) separately, then concat and decode
+        emb_hand = torch.cat(
+            [self.embed_s_hand(obs), self.embed_z_hand(torch.cat([obs, z_hand], dim=-1))],
+            dim=-1,
+        )  # bs × h_hand
+        mu_hand = self.hand_policy(emb_hand)
+
+        mu = torch.tanh(torch.cat([mu_body, mu_hand], dim=-1))
         std_tensor = torch.ones_like(mu) * std
         return TruncatedNormal(mu, std_tensor)
 
