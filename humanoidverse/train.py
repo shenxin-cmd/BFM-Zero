@@ -731,8 +731,8 @@ def train_bfm_zero_split_z():
 
     z is split into:
       - z_body (225 dims): controls all body joints except right arm
-      - z_hand (36 dims):  controls right arm (7 joints, indices 22-28)
-    Total z_dim = 261.
+      - z_hand (64 dims):  controls right arm (7 joints, indices 22-28)
+    Total z_dim = 289.
 
     Key architecture changes vs train_bfm_zero():
       - B network  : SplitBackwardMap  (hand/body independent MLPs)
@@ -768,7 +768,7 @@ def train_bfm_zero_split_z():
                     name='FBcprAuxModelArchiConfig',
                     # --- Split z configuration ---
                     z_body_dim=225,
-                    z_hand_dim=36,
+                    z_hand_dim=64,
                     norm_z=True,
                     # B network: decoupled hand / body branches
                     b=SplitBackwardArchiConfig(
@@ -971,7 +971,7 @@ if __name__ == "__main__":
     # launch your experiments from Python code (e.g., see under "scripts")
     #
     # train_bfm_zero()          ← original baseline (z_dim=256, no split)
-    # train_bfm_zero_split_z()  ← split-z experiment (z_body=225, z_hand=36)
+    # train_bfm_zero_split_z()  ← split-z experiment (z_body=225, z_hand=64)
     train_bfm_zero_split_z()
 
 # uv run --no-cache -m humanoidverse.meta_online_entry_point

@@ -777,7 +777,7 @@ class SplitBackwardArchiConfig(BaseConfig):
     norm: bool = True
     input_filter: NNFilter = IdentityInputFilterConfig()
     z_body_dim: int = 225
-    z_hand_dim: int = 36
+    z_hand_dim: int = 64
     # Observation indices in the concatenated [state, privstate] vector.
     # Leave empty to use the G1 29-DOF defaults (_G1_HAND_IDX_B / _G1_BODY_IDX_B).
     hand_obs_indices: list[int] = []
@@ -844,7 +844,7 @@ class SplitForwardArchiConfig(BaseConfig):
     num_parallel: int = 2
     input_filter: NNFilter = IdentityInputFilterConfig()
     z_body_dim: int = 225
-    z_hand_dim: int = 36
+    z_hand_dim: int = 64
     hand_action_dim: int = 7  # right arm: last 7 action dims
 
     def build(self, obs_space, z_dim: int, action_dim: int, output_dim=None) -> "SplitForwardMap":
@@ -940,7 +940,7 @@ class SplitActorArchiConfig(BaseConfig):
     trunk_hidden_dim: int = 256
     input_filter: NNFilter = IdentityInputFilterConfig()
     z_body_dim: int = 225
-    z_hand_dim: int = 36
+    z_hand_dim: int = 64
     hand_action_dim: int = 7  # right arm: last 7 action dims
 
     def build(self, obs_space, z_dim: int, action_dim: int) -> "SplitActor":
