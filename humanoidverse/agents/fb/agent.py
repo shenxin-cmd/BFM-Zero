@@ -42,6 +42,13 @@ class FBAgentTrainConfig(BaseConfig):
     rollout_expert_trajectories: bool = False
     rollout_expert_trajectories_length: int = 250
     rollout_expert_trajectories_percentage: float = 0.25
+    # Split-z hand MSE weights.
+    # fb_hand_mse_weight  : flat coefficient applied to hand MSE in the FB update.
+    #                       Both sub-space losses are O(1) at init, so 1.0 keeps them balanced.
+    # actor_hand_mse_weight: multiplied on top of Q_body.abs().mean() (adaptive base scale),
+    #                        making the hand gradient always commensurate with the body Q gradient.
+    fb_hand_mse_weight: float = 1.0
+    actor_hand_mse_weight: float = 1.0
 
 
 class FBAgentConfig(BaseConfig):
@@ -265,14 +272,12 @@ class FBAgent:
 
                 if is_split:
                     target_Fs_body = target_Fs[..., :z_body_dim]
-                    target_Fs_hand = target_Fs[..., z_body_dim:]
+                    target_Fs_hand = target_Fs[..., z_body_dim:]   # kept for q_loss compatibility
                     target_B_body = target_B[:, :z_body_dim]
-                    target_B_hand = target_B[:, z_body_dim:]
+                    target_B_hand = target_B[:, z_body_dim:]        # direct MSE target for hand fb_loss
                     target_Ms_body = torch.matmul(target_Fs_body, target_B_body.T)
-                    target_Ms_hand = torch.matmul(target_Fs_hand, target_B_hand.T)
                     _, _, target_M_body = self.get_targets_uncertainty(target_Ms_body, self.cfg.train.fb_pessimism_penalty)
-                    _, _, target_M_hand = self.get_targets_uncertainty(target_Ms_hand, self.cfg.train.fb_pessimism_penalty)
-                    # keep a combined target_M for metrics only
+                    # combined target_M for metrics only (hand M matrix no longer used in loss)
                     target_Ms_all = torch.matmul(target_Fs, target_B.T)
                     _, _, target_M = self.get_targets_uncertainty(target_Ms_all, self.cfg.train.fb_pessimism_penalty)
                 else:
@@ -284,31 +289,34 @@ class FBAgent:
             B = self._model._backward_map(goal)  # batch x z_dim
 
             if is_split:
-                hand_weight = self.cfg.model.archi.z_body_dim / self.cfg.model.archi.z_hand_dim  # ≈6.25
-
                 Fs_body = Fs[..., :z_body_dim]
                 Fs_hand = Fs[..., z_body_dim:]
                 B_body = B[:, :z_body_dim]
                 B_hand = B[:, z_body_dim:]
 
+                # Body: standard FB bilinear contrastive loss (unchanged)
                 fb_loss_body, Ms_body, fb_diag_body, fb_offdiag_body = self._fb_loss_single(
                     Fs_body, B_body, discount, target_M_body
                 )
-                fb_loss_hand, Ms_hand, fb_diag_hand, fb_offdiag_hand = self._fb_loss_single(
-                    Fs_hand, B_hand, discount, target_M_hand
-                )
-                fb_loss = fb_loss_body + hand_weight * fb_loss_hand
 
-                # orthonormality losses (independent per sub-space)
+                # Hand: per-head MSE regression — every parallel F_hand head → target_B_hand
+                # Both losses are O(1) at init; flat weight keeps them balanced.
+                fb_loss_hand = F.mse_loss(
+                    Fs_hand,
+                    target_B_hand.unsqueeze(0).expand_as(Fs_hand),
+                )
+                fb_loss = fb_loss_body + self.cfg.train.fb_hand_mse_weight * fb_loss_hand
+
+                # orthonormality losses (independent per sub-space; B_hand still needs diversity)
                 orth_loss_body, orth_diag_body, orth_offdiag_body = self._orth_loss_single(B_body)
                 orth_loss_hand, orth_diag_hand, orth_offdiag_hand = self._orth_loss_single(B_hand)
                 orth_loss = orth_loss_body + orth_loss_hand
                 fb_loss += self.cfg.train.ortho_coef * orth_loss
 
-                # reuse first parallel slice for metrics
-                Ms = torch.cat([Ms_body, Ms_hand], dim=-1)
-                fb_diag = fb_diag_body + hand_weight * fb_diag_hand
-                fb_offdiag = fb_offdiag_body + hand_weight * fb_offdiag_hand
+                # Metrics: hand M matrix is no longer computed
+                Ms = Ms_body
+                fb_diag = fb_diag_body
+                fb_offdiag = fb_offdiag_body
                 orth_loss_diag = orth_diag_body + orth_diag_hand
                 orth_loss_offdiag = orth_offdiag_body + orth_offdiag_hand
             else:
@@ -329,8 +337,8 @@ class FBAgent:
                 with torch.no_grad():
                     if is_split:
                         z_body = z[:, :z_body_dim]
-                        z_hand = z[:, z_body_dim:]
-                        next_Qs = (target_Fs_body * z_body).sum(dim=-1) + hand_weight * (target_Fs_hand * z_hand).sum(dim=-1)
+                        # hand uses MSE (no bilinear Q); q_loss applies to body sub-space only
+                        next_Qs = (target_Fs_body * z_body).sum(dim=-1)
                     else:
                         next_Qs = (target_Fs * z).sum(dim=-1)  # num_parallel x batch
                     _, _, next_Q = self.get_targets_uncertainty(next_Qs, self.cfg.train.fb_pessimism_penalty)
@@ -341,9 +349,7 @@ class FBAgent:
                     target_Q = implicit_reward.detach() + discount.squeeze() * next_Q  # batch
                     expanded_targets = target_Q.expand(Fs.shape[0], -1)
                 if is_split:
-                    Qs_body = (Fs_body * z_body).sum(dim=-1)
-                    Qs_hand = (Fs_hand * z_hand).sum(dim=-1)
-                    Qs = Qs_body + hand_weight * Qs_hand
+                    Qs = (Fs_body * z_body).sum(dim=-1)  # body only; hand excluded in MSE mode
                 else:
                     Qs = (Fs * z).sum(dim=-1)  # num_parallel x batch
                 q_loss = 0.5 * Fs.shape[0] * F.mse_loss(Qs, expanded_targets)
@@ -385,14 +391,12 @@ class FBAgent:
                     "B_hand_norm": torch.norm(B_hand, dim=-1).mean(),
                     # FB losses per sub-space
                     "fb_body_loss": fb_loss_body,
-                    "fb_hand_loss": fb_loss_hand,
+                    "fb_hand_mse": fb_loss_hand,    # hand uses direct MSE regression (no bilinear)
                     "fb_total_loss": fb_loss,
-                    # FB diag/offdiag (for train_log / plotting)
+                    # Body FB diag/offdiag (hand M matrix no longer computed)
                     "fb_loss_offdiag": fb_offdiag,
                     "fb_body_loss_offdiag": fb_offdiag_body,
-                    "fb_hand_loss_offdiag": fb_offdiag_hand,
                     "fb_body_loss_diag": fb_diag_body,
-                    "fb_hand_loss_diag": fb_diag_hand,
                     # orthonormality losses per sub-space
                     "orth_body_loss": orth_loss_body,
                     "orth_hand_loss": orth_loss_hand,
@@ -423,19 +427,28 @@ class FBAgent:
 
             if is_split:
                 z_body_dim = self.cfg.model.archi.z_body_dim
-                hand_weight = self.cfg.model.archi.z_body_dim / self.cfg.model.archi.z_hand_dim
                 z_body = z[:, :z_body_dim]
                 z_hand = z[:, z_body_dim:]
+
+                # Body: standard dot product Q (unchanged)
                 Qs_body = (Fs[..., :z_body_dim] * z_body).sum(-1)  # num_parallel x batch
-                Qs_hand = (Fs[..., z_body_dim:] * z_hand).sum(-1)
                 _, _, Q_body = self.get_targets_uncertainty(Qs_body, self.cfg.train.actor_pessimism_penalty)
-                _, _, Q_hand = self.get_targets_uncertainty(Qs_hand, self.cfg.train.actor_pessimism_penalty)
-                Q = Q_body + hand_weight * Q_hand
+
+                # Hand: per-head MSE regression — every parallel F_hand head → z_hand
+                # Adaptive weight: scale hand term with |Q_body| so hand gradient is always
+                # commensurate with body gradient regardless of Q magnitude.
+                actor_loss_hand_mse = F.mse_loss(
+                    Fs[..., z_body_dim:],
+                    z_hand.unsqueeze(0).expand_as(Fs[..., z_body_dim:]),
+                )
+                hand_weight = Q_body.abs().mean().detach() * self.cfg.train.actor_hand_mse_weight
+
+                # Maximize Q_body; minimize hand MSE (scaled to same magnitude as body term)
+                actor_loss = -Q_body.mean() + hand_weight * actor_loss_hand_mse
             else:
                 Qs = (Fs * z).sum(-1)  # num_parallel x batch
                 _, _, Q = self.get_targets_uncertainty(Qs, self.cfg.train.actor_pessimism_penalty)
-
-            actor_loss = -Q.mean()
+                actor_loss = -Q.mean()
 
         # optimize actor
         self.actor_optimizer.zero_grad(set_to_none=True)
@@ -444,13 +457,15 @@ class FBAgent:
             torch.nn.utils.clip_grad_norm_(self._model._actor.parameters(), clip_grad_norm)
         self.actor_optimizer.step()
 
-        output_metrics = {"actor_loss": actor_loss.detach(), "q": Q.mean().detach()}
         if is_split:
-            output_metrics.update({
+            output_metrics = {
+                "actor_loss": actor_loss.detach(),
+                "q": Q_body.mean().detach(),
                 "q_body": Q_body.mean().detach(),
-                "q_hand": Q_hand.mean().detach(),
-                "q_total": Q.mean().detach(),
-            })
+                "actor_hand_mse": actor_loss_hand_mse.detach(),
+            }
+        else:
+            output_metrics = {"actor_loss": actor_loss.detach(), "q": Q.mean().detach()}
         return output_metrics
 
     def get_targets_uncertainty(

@@ -424,20 +424,34 @@ class FBcprAgent(FBAgent):
             Fs = self._model._forward_map(obs, z, action)  # num_parallel x batch x z_dim
             if is_split:
                 z_body_dim = self.cfg.model.archi.z_body_dim
-                hand_weight = self.cfg.model.archi.z_body_dim / self.cfg.model.archi.z_hand_dim
                 z_body = z[:, :z_body_dim]
                 z_hand = z[:, z_body_dim:]
+
+                # Body: standard dot product Q (unchanged)
                 Qs_fb_body = (Fs[..., :z_body_dim] * z_body).sum(-1)
-                Qs_fb_hand = (Fs[..., z_body_dim:] * z_hand).sum(-1)
                 _, _, Q_fb_body = self.get_targets_uncertainty(Qs_fb_body, self.cfg.train.actor_pessimism_penalty)
-                _, _, Q_fb_hand = self.get_targets_uncertainty(Qs_fb_hand, self.cfg.train.actor_pessimism_penalty)
-                Q_fb = Q_fb_body + hand_weight * Q_fb_hand
+
+                # Hand: per-head MSE regression — every parallel F_hand head → z_hand
+                actor_loss_hand_mse = F.mse_loss(
+                    Fs[..., z_body_dim:],
+                    z_hand.unsqueeze(0).expand_as(Fs[..., z_body_dim:]),
+                )
+                # Adaptive weight: makes hand gradient commensurate with body Q gradient
+                hand_weight = Q_fb_body.abs().mean().detach() * self.cfg.train.actor_hand_mse_weight
             else:
                 Qs_fb = (Fs * z).sum(-1)  # num_parallel x batch
                 _, _, Q_fb = self.get_targets_uncertainty(Qs_fb, self.cfg.train.actor_pessimism_penalty)
 
-            weight = Q_fb.abs().mean().detach() if self.cfg.train.scale_reg else 1.0
-            actor_loss = -Q_discriminator.mean() * self.cfg.train.reg_coeff * weight - Q_fb.mean()
+            if is_split:
+                weight = Q_fb_body.abs().mean().detach() if self.cfg.train.scale_reg else 1.0
+                actor_loss = (
+                    -Q_discriminator.mean() * self.cfg.train.reg_coeff * weight
+                    - Q_fb_body.mean()
+                    + hand_weight * actor_loss_hand_mse
+                )
+            else:
+                weight = Q_fb.abs().mean().detach() if self.cfg.train.scale_reg else 1.0
+                actor_loss = -Q_discriminator.mean() * self.cfg.train.reg_coeff * weight - Q_fb.mean()
 
         # optimize actor
         self.actor_optimizer.zero_grad(set_to_none=True)
@@ -450,12 +464,11 @@ class FBcprAgent(FBAgent):
             output_metrics = {
                 "actor_loss": actor_loss.detach(),
                 "Q_discriminator": Q_discriminator.mean().detach(),
-                "Q_fb": Q_fb.mean().detach(),
+                "Q_fb": Q_fb_body.mean().detach() if is_split else Q_fb.mean().detach(),
             }
             if is_split:
                 output_metrics.update({
                     "Q_fb_body": Q_fb_body.mean().detach(),
-                    "Q_fb_hand": Q_fb_hand.mean().detach(),
-                    "Q_fb_total": Q_fb.mean().detach(),
+                    "actor_hand_mse": actor_loss_hand_mse.detach(),
                 })
         return output_metrics
