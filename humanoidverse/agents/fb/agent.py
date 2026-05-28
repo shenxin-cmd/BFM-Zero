@@ -387,6 +387,12 @@ class FBAgent:
                     "fb_body_loss": fb_loss_body,
                     "fb_hand_loss": fb_loss_hand,
                     "fb_total_loss": fb_loss,
+                    # FB diag/offdiag (for train_log / plotting)
+                    "fb_loss_offdiag": fb_offdiag,
+                    "fb_body_loss_offdiag": fb_offdiag_body,
+                    "fb_hand_loss_offdiag": fb_offdiag_hand,
+                    "fb_body_loss_diag": fb_diag_body,
+                    "fb_hand_loss_diag": fb_diag_hand,
                     # orthonormality losses per sub-space
                     "orth_body_loss": orth_loss_body,
                     "orth_hand_loss": orth_loss_hand,
