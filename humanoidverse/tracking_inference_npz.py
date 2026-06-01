@@ -260,7 +260,25 @@ def _rescale_privileged_vel(
 # 右手末端轨迹工具
 # ---------------------------------------------------------------------------
 
-def _fk_ee_positions(
+def _quat_wxyz_inv_rotate(quat_wxyz: np.ndarray, vec: np.ndarray) -> np.ndarray:
+    """用四元数逆旋转将世界系向量变到基座系。quat 格式 MuJoCo wxyz。"""
+    q_w, q_vec = float(quat_wxyz[0]), quat_wxyz[1:4]
+    a = vec * (2.0 * q_w ** 2 - 1.0)
+    b = np.cross(q_vec, vec) * (2.0 * q_w)
+    c = q_vec * (2.0 * np.dot(q_vec, vec))
+    return a - b + c
+
+
+def _world_to_base(
+    ee_world: np.ndarray,
+    root_pos: np.ndarray,
+    root_quat_wxyz: np.ndarray,
+) -> np.ndarray:
+    """世界系 EE 位置 → 基座（pelvis）局部坐标系。"""
+    return _quat_wxyz_inv_rotate(root_quat_wxyz, ee_world - root_pos)
+
+
+def _fk_ee_positions_base(
     fk_model: "mujoco.MjModel",
     fk_data: "mujoco.MjData",
     ee_id: int,
@@ -268,9 +286,52 @@ def _fk_ee_positions(
     dof_abs_arr: np.ndarray,   # (N, 29)
 ) -> np.ndarray:
     """
-    批量 FK：返回 (N, 3) EE 世界坐标。
-    根固定在 qpos7_root，仅关节角按帧变化。
+    批量 FK：返回 (N, 3) EE 在基座（pelvis）局部坐标系下的位置。
+    每帧用该帧 root 位姿做 world→base 变换（专家根固定时等价于固定基座系）。
     """
+    N = dof_abs_arr.shape[0]
+    out = np.zeros((N, 3), dtype=np.float64)
+    for i in range(N):
+        fk_data.qpos[:7] = qpos7_root
+        fk_data.qpos[7:] = dof_abs_arr[i]
+        fk_data.qvel[:] = 0.0
+        mujoco.mj_forward(fk_model, fk_data)
+        ee_world = fk_data.xpos[ee_id].copy()
+        root_pos = fk_data.qpos[:3].copy()
+        root_quat = fk_data.qpos[3:7].copy()
+        out[i] = _world_to_base(ee_world, root_pos, root_quat)
+    return out
+
+
+def _fk_one_step_base(
+    fk_model: "mujoco.MjModel",
+    fk_data: "mujoco.MjData",
+    ee_id: int,
+    root_states_row: np.ndarray,  # (>=13,) Isaac 格式 [x,y,z, qx,qy,qz,qw, ...]
+    dof_pos: np.ndarray,          # (29,)
+) -> np.ndarray:
+    """
+    单步 FK，返回 EE 在基座局部坐标系下的位置 (3,)。
+    Isaac root_states 索引 [0,1,2,6,3,4,5] → MuJoCo [x,y,z,qw,qx,qy,qz]。
+    """
+    fk_data.qpos[:7] = root_states_row[[0, 1, 2, 6, 3, 4, 5]]
+    fk_data.qpos[7:] = dof_pos
+    fk_data.qvel[:] = 0.0
+    mujoco.mj_forward(fk_model, fk_data)
+    ee_world = fk_data.xpos[ee_id].copy()
+    root_pos = fk_data.qpos[:3].copy()
+    root_quat = fk_data.qpos[3:7].copy()
+    return _world_to_base(ee_world, root_pos, root_quat)
+
+
+def _fk_ee_positions(
+    fk_model: "mujoco.MjModel",
+    fk_data: "mujoco.MjData",
+    ee_id: int,
+    qpos7_root: np.ndarray,    # (7,) [x,y,z,qw,qx,qy,qz]  MuJoCo 格式
+    dof_abs_arr: np.ndarray,   # (N, 29)
+) -> np.ndarray:
+    """批量 FK：返回 (N, 3) EE 世界坐标（保留供调试）。"""
     N = dof_abs_arr.shape[0]
     out = np.zeros((N, 3), dtype=np.float64)
     for i in range(N):
@@ -286,13 +347,10 @@ def _fk_one_step(
     fk_model: "mujoco.MjModel",
     fk_data: "mujoco.MjData",
     ee_id: int,
-    root_states_row: np.ndarray,  # (>=13,) Isaac 格式 [x,y,z, qx,qy,qz,qw, vx,vy,vz,wx,wy,wz]
-    dof_pos: np.ndarray,          # (29,)
+    root_states_row: np.ndarray,
+    dof_pos: np.ndarray,
 ) -> np.ndarray:
-    """
-    单步 FK，返回 EE 世界坐标 (3,)。
-    Isaac root_states 索引 [0,1,2,6,3,4,5] → MuJoCo [x,y,z,qw,qx,qy,qz]。
-    """
+    """单步 FK，返回 EE 世界坐标 (3,)（保留供调试）。"""
     fk_data.qpos[:7] = root_states_row[[0, 1, 2, 6, 3, 4, 5]]
     fk_data.qpos[7:] = dof_pos
     fk_data.qvel[:] = 0.0
@@ -365,47 +423,49 @@ def _render_with_ee_sphere(
 
 
 def _save_ee_traj_plot(
-    expert_ee: np.ndarray,   # (N, 3) 世界坐标
-    policy_ee: np.ndarray,   # (M, 3) 世界坐标
+    expert_ee_base: np.ndarray,   # (N, 3) 基座系
+    policy_ee_base: np.ndarray,   # (M, 3) 基座系
     out_path: Path,
     title: str = "",
 ) -> None:
     """
-    将专家轨迹（蓝色虚线）和 policy 轨迹（红色实线）投影到 Y-Z 平面绘制并保存。
-    圆形轨迹在 Y-Z 平面上应呈现为圆，方便直接判断跟踪是否准确。
+    将专家轨迹（蓝色虚线）和 policy 轨迹（红色实线）投影到
+    **机器人基座（pelvis）局部坐标系的 Y-Z 平面** 绘制并保存。
+
+    每帧 EE 位置先变换到该帧 pelvis 局部系，再取 Y、Z 分量作图，
+    避免 inference 时 base 漂移导致世界系投影失真。
     """
     fig, ax = plt.subplots(figsize=(7, 7))
 
     ax.plot(
-        expert_ee[:, 1], expert_ee[:, 2],
+        expert_ee_base[:, 1], expert_ee_base[:, 2],
         color="#1D7FD4", lw=1.8, linestyle="--", alpha=0.9,
-        label=f"Expert / NPZ FK  (T={len(expert_ee)})",
+        label=f"Expert / NPZ FK  (T={len(expert_ee_base)})",
     )
-    ax.scatter(expert_ee[0, 1], expert_ee[0, 2],
+    ax.scatter(expert_ee_base[0, 1], expert_ee_base[0, 2],
                marker="*", s=220, color="#1D7FD4", zorder=8, label="expert start")
 
     ax.plot(
-        policy_ee[:, 1], policy_ee[:, 2],
+        policy_ee_base[:, 1], policy_ee_base[:, 2],
         color="#E63946", lw=2.0, linestyle="-", alpha=0.9,
-        label=f"Policy rollout FK  (T={len(policy_ee)})",
+        label=f"Policy rollout FK  (T={len(policy_ee_base)})",
     )
-    ax.scatter(policy_ee[0, 1], policy_ee[0, 2],
+    ax.scatter(policy_ee_base[0, 1], policy_ee_base[0, 2],
                marker="*", s=220, color="#E63946", zorder=8, label="policy start")
 
-    # 统计偏差
-    min_len = min(len(expert_ee), len(policy_ee))
+    min_len = min(len(expert_ee_base), len(policy_ee_base))
     yz_dev = np.linalg.norm(
-        expert_ee[:min_len, 1:3] - policy_ee[:min_len, 1:3], axis=1
+        expert_ee_base[:min_len, 1:3] - policy_ee_base[:min_len, 1:3], axis=1
     )
     mean_dev = float(yz_dev.mean())
     max_dev  = float(yz_dev.max())
 
-    ax.set_xlabel("Y  (m)", fontsize=12)
-    ax.set_ylabel("Z  (m)", fontsize=12)
+    ax.set_xlabel("Y_base  (m)", fontsize=12)
+    ax.set_ylabel("Z_base  (m)", fontsize=12)
     ax.set_aspect("equal")
     ax.grid(True, alpha=0.35)
     ax.set_title(
-        f"Right-hand EE Trajectory (Y-Z plane)"
+        "Right-hand EE Trajectory (pelvis frame, Y-Z plane)"
         + (f"  |  {title}" if title else "")
         + f"\nmean_dev={mean_dev*100:.2f} cm   max_dev={max_dev*100:.2f} cm",
         fontsize=10,
@@ -415,7 +475,7 @@ def _save_ee_traj_plot(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_path, dpi=160, bbox_inches="tight")
     plt.close(fig)
-    print(f"EE 轨迹对比图已保存: {out_path}")
+    print(f"EE 轨迹对比图已保存（基座系 Y-Z）: {out_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -615,11 +675,13 @@ def main(
     # ── 专家末端轨迹（FK on NPZ 关节角，根固定在初始位置） ─────────────────
     # root_quat 此处已是 MuJoCo wxyz 格式（isaacsim 路径已做 [3,0,1,2] 重排）
     qpos7_root = np.concatenate([root_pos, root_quat]).astype(np.float64)
-    print("Computing expert EE trajectory via FK...")
-    expert_ee = _fk_ee_positions(fk_model, fk_data, ee_id, qpos7_root, dof_abs_np)
-    print(f"  expert_ee shape: {expert_ee.shape}  "
-          f"Y=[{expert_ee[:,1].min():.3f},{expert_ee[:,1].max():.3f}]  "
-          f"Z=[{expert_ee[:,2].min():.3f},{expert_ee[:,2].max():.3f}]")
+    print("Computing expert EE trajectory via FK (base frame)...")
+    expert_ee_base = _fk_ee_positions_base(
+        fk_model, fk_data, ee_id, qpos7_root, dof_abs_np
+    )
+    print(f"  expert_ee_base shape: {expert_ee_base.shape}  "
+          f"Y_base=[{expert_ee_base[:,1].min():.3f},{expert_ee_base[:,1].max():.3f}]  "
+          f"Z_base=[{expert_ee_base[:,2].min():.3f},{expert_ee_base[:,2].max():.3f}]")
 
     T_vis = min(N, (episode_len or N) + 1)
     expert_qpos = np.zeros((T_vis, 36), dtype=np.float32)
@@ -661,10 +723,10 @@ def main(
 
     joint_pos = [wrapped_env._env.simulator.dof_state[..., 0].clone().cpu().numpy()]
 
-    # policy EE 轨迹：从第 0 帧初始 EE 位置开始
+    # policy EE 轨迹（基座系）：从第 0 帧开始
     _rs0 = wrapped_env._env.simulator.robot_root_states[0].float().detach().cpu().numpy()
     _d0  = wrapped_env._env.simulator.dof_state.view(num_envs, -1, 2)[0, :, 0].float().detach().cpu().numpy()
-    policy_ee_list = [_fk_one_step(fk_model, fk_data, ee_id, _rs0, _d0)]
+    policy_ee_base_list = [_fk_one_step_base(fk_model, fk_data, ee_id, _rs0, _d0)]
 
     if save_mp4:
         try:
@@ -683,10 +745,10 @@ def main(
         )
         joint_pos.append(wrapped_env._env.simulator.dof_state[..., 0].clone().cpu().numpy())
 
-        # 收集 policy EE 位置
+        # 收集 policy EE 位置（基座系，每帧用当前 root 变换）
         _rs = wrapped_env._env.simulator.robot_root_states[0].float().detach().cpu().numpy()
         _d  = wrapped_env._env.simulator.dof_state.view(num_envs, -1, 2)[0, :, 0].float().detach().cpu().numpy()
-        policy_ee_list.append(_fk_one_step(fk_model, fk_data, ee_id, _rs, _d))
+        policy_ee_base_list.append(_fk_one_step_base(fk_model, fk_data, ee_id, _rs, _d))
 
         if save_mp4:
             frames.append(_render_with_ee_sphere(rgb_renderer, wrapped_env._env, ee_id))
@@ -697,11 +759,11 @@ def main(
     print(f"Rollout complete. joint_pos shape: {joint_pos_arr.shape}")
 
     # ── EE 轨迹对比图（始终保存） ─────────────────────────────────────────────
-    policy_ee = np.array(policy_ee_list)           # (n_steps+1, 3)
+    policy_ee_base = np.array(policy_ee_base_list)   # (n_steps+1, 3)
     ee_plot_path = out_dir / f"ee_traj_{stem}.png"
     _save_ee_traj_plot(
-        expert_ee[: len(policy_ee)],   # 对齐到 rollout 实际步数
-        policy_ee,
+        expert_ee_base[: len(policy_ee_base)],
+        policy_ee_base,
         ee_plot_path,
         title=stem,
     )
