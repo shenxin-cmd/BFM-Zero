@@ -1,15 +1,20 @@
 """
 Plot training curves for the BFM-Zero split-z experiment.
 
-Compared to plot_bfmzero_curves.py, this script adds dedicated panels for the
-new split-z metrics introduced by train_bfm_zero_split_z():
+Supports both metric schemas:
+  - Legacy bilinear hand: fb_hand_loss, q_hand, Q_fb_hand, fb_hand_loss_diag/offdiag
+  - Hand MSE mode:        fb_hand_mse, actor_hand_mse (body keeps bilinear Q / FB)
 
-  z-norms  : z_body_norm, z_hand_norm  (vs. original z_norm)
-  B-norms  : B_body_norm, B_hand_norm  (vs. original B_norm)
-  FB losses: fb_body_loss, fb_hand_loss, fb_total_loss (weighted sum)
-  Orth     : orth_body/hand_loss, *_diag, *_offdiag
-  Q (actor): q_body, q_hand, q_total  (from update_td3_actor)
-  Q_fb     : Q_fb_body, Q_fb_hand, Q_fb_total  (from update_actor in CPR/Aux)
+Panels:
+  01 core metrics (rewards, FPS, z/B norms)
+  02 losses (actor, critic, FB body/hand, orth, discriminator)
+  03 Q metrics (body Q, legacy hand Q if present, actor_hand_mse)
+  04 aux reward breakdown
+  05 FB diagnostics (diag/offdiag — body-only in MSE mode)
+  06 split-z hand MSE dedicated panel (when MSE metrics exist)
+  07 body vs hand overlays (auto-resolved column names)
+  08+ catch-all for any remaining numeric columns in train_log
+  single_metrics/ — one PNG per column in train_log
 
 Usage:
     python plot_bfmzero_split_z_curves.py \\
@@ -18,7 +23,8 @@ Usage:
         [--eval_log humanoidverse_tracking_eval.csv] \\
         [--out_dir plots_split_z] \\
         [--smooth_window 7] \\
-        [--burn_in_ratio 0.08]
+        [--burn_in_ratio 0.08] \\
+        [--tail_threshold 1e4]
 """
 from __future__ import annotations
 
@@ -33,7 +39,30 @@ import pandas as pd
 
 
 # ---------------------------------------------------------------------------
-# Shared data utilities (identical to the original script)
+# Metric name resolution (MSE vs legacy bilinear)
+# ---------------------------------------------------------------------------
+
+def _first_existing(df: pd.DataFrame, candidates: list[str], min_points: int = 2) -> str | None:
+    for col in candidates:
+        if col in df.columns and df[col].notna().sum() >= min_points:
+            return col
+    return None
+
+
+def _resolve_split_z_columns(df: pd.DataFrame) -> dict[str, str | None]:
+    """Pick the best column name for each split-z concept present in the log."""
+    return {
+        "hand_fb": _first_existing(df, ["fb_hand_mse", "fb_hand_loss"]),
+        "hand_actor": _first_existing(df, ["actor_hand_mse"]),
+        "hand_q_actor": _first_existing(df, ["q_hand"]),
+        "hand_q_cpr": _first_existing(df, ["Q_fb_hand"]),
+        "hand_fb_diag": _first_existing(df, ["fb_hand_loss_diag"]),
+        "hand_fb_offdiag": _first_existing(df, ["fb_hand_loss_offdiag"]),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Shared data utilities
 # ---------------------------------------------------------------------------
 
 def _as_numeric(df: pd.DataFrame) -> pd.DataFrame:
@@ -86,7 +115,7 @@ def _valid_metric_cols(
 
 
 # ---------------------------------------------------------------------------
-# Plotting helpers (identical to the original script)
+# Plotting helpers
 # ---------------------------------------------------------------------------
 
 def _plot_grid(
@@ -166,6 +195,8 @@ def _plot_single_metric(
     out_file: Path,
     smooth_window: int,
     burn_in_ratio: float,
+    tail_threshold: float | None = None,
+    tail_start_ratio: float = 0.25,
 ) -> None:
     x = df[x_col]
     y = df[metric].astype(float)
@@ -180,7 +211,18 @@ def _plot_single_metric(
     burn_idx = int(len(x) * burn_in_ratio)
     burn_idx = max(1, min(len(x) - 1, burn_idx)) if len(x) > 2 else 0
 
-    fig, axes = plt.subplots(2, 1, figsize=(9, 7), dpi=170, sharex=False)
+    n_subplots = 2
+    need_tail = (
+        tail_threshold is not None
+        and len(y) >= 2
+        and float(y.max()) >= tail_threshold
+    )
+    if need_tail:
+        n_subplots = 3
+
+    fig, axes = plt.subplots(n_subplots, 1, figsize=(9, 3.5 * n_subplots), dpi=170, sharex=False)
+    axes = np.atleast_1d(axes)
+
     axes[0].plot(x, y, alpha=0.25, linewidth=1.0, label="raw")
     axes[0].plot(x, ys, linewidth=1.8, label=f"smooth(w={smooth_window})")
     axes[0].set_title(f"{metric} (full)")
@@ -201,31 +243,40 @@ def _plot_single_metric(
 
     axes[1].grid(alpha=0.25)
     axes[1].legend(fontsize=8)
-    axes[1].set_xlabel(x_col)
+
+    if need_tail:
+        start_idx = int(len(x) * tail_start_ratio)
+        start_idx = min(start_idx, len(x) - 2)
+        x3 = x.iloc[start_idx:]
+        y3 = y.iloc[start_idx:]
+        ys3 = ys.iloc[start_idx:]
+        axes[2].plot(x3, y3, alpha=0.25, linewidth=1.0, label="raw")
+        axes[2].plot(x3, ys3, linewidth=1.8, label=f"smooth(w={smooth_window})")
+        axes[2].set_title(
+            f"{metric} (tail {int((1 - tail_start_ratio) * 100)}%, max={y.max():.2e} >= {tail_threshold:.0e})"
+        )
+        axes[2].grid(alpha=0.25)
+        axes[2].legend(fontsize=8)
+        axes[2].set_xlabel(x_col)
+    else:
+        axes[1].set_xlabel(x_col)
+
     fig.tight_layout()
     out_file.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_file)
     plt.close(fig)
 
 
-# ---------------------------------------------------------------------------
-# Overlay helper: plot body vs hand curves on the same axes
-# ---------------------------------------------------------------------------
-
 def _plot_body_hand_overlay(
     df: pd.DataFrame,
     x_col: str,
-    pairs: list[tuple[str, str]],   # [(body_col, hand_col), ...]
+    pairs: list[tuple[str, str, str]],  # (body_col, hand_col, title)
     out_file: Path,
     title: str,
     smooth_window: int,
 ) -> None:
-    """
-    For each (body_col, hand_col) pair draw both curves in the same subplot so
-    the body / hand gap is immediately visible.
-    """
     valid_pairs = [
-        (b, h) for b, h in pairs
+        (b, h, t) for b, h, t in pairs
         if b in df.columns and h in df.columns
         and df[b].notna().sum() >= 2 and df[h].notna().sum() >= 2
     ]
@@ -240,7 +291,7 @@ def _plot_body_hand_overlay(
 
     x = df[x_col]
 
-    for i, (b_col, h_col) in enumerate(valid_pairs):
+    for i, (b_col, h_col, subplot_title) in enumerate(valid_pairs):
         r, c = i // ncols, i % ncols
         ax = axes_arr[r, c]
 
@@ -255,9 +306,7 @@ def _plot_body_hand_overlay(
             ax.plot(xx, yy, alpha=0.20, linewidth=0.8, color=color)
             ax.plot(xx, ys, linewidth=1.6, color=color, label=label)
 
-        # Use the shared prefix (strip the "_body" / "_hand" suffix) as the title
-        shared = b_col.replace("_body", "").replace("body_", "")
-        ax.set_title(shared)
+        ax.set_title(subplot_title)
         ax.legend(fontsize=8)
         ax.grid(alpha=0.25)
 
@@ -269,6 +318,156 @@ def _plot_body_hand_overlay(
     out_file.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_file)
     plt.close(fig)
+
+
+def _build_metric_groups(df: pd.DataFrame, resolved: dict[str, str | None]) -> dict[str, tuple[str, list[str]]]:
+    """Return {filename: (title, ordered metric list)} for grouped panels."""
+    hand_fb = resolved["hand_fb"]
+    hand_actor = resolved["hand_actor"]
+
+    core_cols = [
+        "mean_disc_reward",
+        "mean_aux_reward",
+        "mean_next_Q",
+        "mean_next_auxQ",
+        "FPS",
+        "duration [minutes]",
+        "z_norm",
+        "B_norm",
+        "z_body_norm",
+        "z_hand_norm",
+        "B_body_norm",
+        "B_hand_norm",
+    ]
+
+    loss_cols = [
+        "actor_loss",
+        "critic_loss",
+        "aux_critic_loss",
+        "q_loss",
+        "fb_loss",
+        "fb_body_loss",
+        hand_fb,
+        "fb_total_loss",
+        "disc_loss",
+        "disc_train_loss",
+        "disc_expert_loss",
+        "disc_wgan_gp_loss",
+        "orth_loss",
+        "orth_loss_diag",
+        "orth_loss_offdiag",
+        "orth_body_loss",
+        "orth_hand_loss",
+        "orth_body_loss_diag",
+        "orth_hand_loss_diag",
+        "orth_body_loss_offdiag",
+        "orth_hand_loss_offdiag",
+    ]
+
+    q_cols = [
+        "Q1",
+        "Q_aux",
+        "Q_discriminator",
+        "target_Q",
+        "target_auxQ",
+        "target_M",
+        "Q_fb",
+        "q",
+        "Q_fb_body",
+        resolved["hand_q_cpr"],
+        "Q_fb_total",
+        "q_body",
+        resolved["hand_q_actor"],
+        "q_total",
+        hand_actor,
+    ]
+
+    diag_cols = [
+        "fb_diag",
+        "fb_offdiag",
+        "fb_loss_offdiag",
+        "fb_body_loss_diag",
+        "fb_body_loss_offdiag",
+        resolved["hand_fb_diag"],
+        resolved["hand_fb_offdiag"],
+        "unc_Q",
+        "unc_auxQ",
+        "M1",
+        "F1",
+        "B",
+    ]
+
+    hand_mse_cols = [
+        "fb_body_loss",
+        hand_fb,
+        "fb_total_loss",
+        hand_actor,
+        "q_body",
+        "Q_fb_body",
+        "q",
+        "Q_fb",
+        "actor_loss",
+        "B_hand_norm",
+        "z_hand_norm",
+    ]
+
+    groups: dict[str, tuple[str, list[str]]] = {
+        "01_core_independent_axes.png": (
+            "Core Metrics – split-z run (independent axes)", core_cols
+        ),
+        "02_losses_independent_axes.png": (
+            "Loss Metrics – split-z run (independent axes)", loss_cols
+        ),
+        "03_q_independent_axes.png": (
+            "Q / Hand-MSE Metrics – split-z run (independent axes)", q_cols
+        ),
+        "04_aux_rewards_independent_axes.png": (
+            "Aux Reward Terms (independent axes)",
+            sorted([c for c in df.columns if c.startswith("aux_rew/")]),
+        ),
+        "05_diag_independent_axes.png": (
+            "FB Diagnostics (independent axes)", diag_cols
+        ),
+    }
+
+    if hand_fb == "fb_hand_mse" or hand_actor == "actor_hand_mse":
+        groups["06_hand_mse_independent_axes.png"] = (
+            "Hand MSE Mode – dedicated panel", hand_mse_cols
+        )
+
+    return groups
+
+
+def _build_overlay_pairs(resolved: dict[str, str | None]) -> list[tuple[str, str, str]]:
+    pairs: list[tuple[str, str, str]] = []
+
+    if resolved["hand_fb"]:
+        pairs.append(("fb_body_loss", resolved["hand_fb"], "FB loss: body vs hand"))
+
+    pairs.extend([
+        ("orth_body_loss", "orth_hand_loss", "orth loss"),
+        ("orth_body_loss_diag", "orth_hand_loss_diag", "orth diag"),
+        ("orth_body_loss_offdiag", "orth_hand_loss_offdiag", "orth offdiag"),
+        ("z_body_norm", "z_hand_norm", "z norm"),
+        ("B_body_norm", "B_hand_norm", "B norm"),
+    ])
+
+    if resolved["hand_q_cpr"]:
+        pairs.append(("Q_fb_body", resolved["hand_q_cpr"], "Q_fb: body vs hand (legacy)"))
+    elif resolved["hand_actor"]:
+        pairs.append(("Q_fb_body", resolved["hand_actor"], "Q_fb_body vs actor_hand_mse"))
+
+    if resolved["hand_q_actor"]:
+        pairs.append(("q_body", resolved["hand_q_actor"], "q: body vs hand (legacy)"))
+    elif resolved["hand_actor"]:
+        pairs.append(("q_body", resolved["hand_actor"], "q_body vs actor_hand_mse"))
+
+    if resolved["hand_fb_diag"]:
+        pairs.append(("fb_body_loss_diag", resolved["hand_fb_diag"], "FB diag (legacy hand)"))
+    if resolved["hand_fb_offdiag"]:
+        pairs.append(("fb_body_loss_offdiag", resolved["hand_fb_offdiag"], "FB offdiag (legacy hand)"))
+
+    return pairs
 
 
 # ---------------------------------------------------------------------------
@@ -298,6 +497,15 @@ def main() -> None:
         default=0.08,
         help="Fraction of early timesteps removed in zoom plots.",
     )
+    parser.add_argument(
+        "--tail_threshold",
+        type=float,
+        default=1e4,
+        help=(
+            "If a metric's max exceeds this value, single-metric plots also include "
+            "a tail-75%% panel (useful when early training spikes to 1e9)."
+        ),
+    )
     args = parser.parse_args()
 
     result_dir = Path(args.result_dir)
@@ -305,140 +513,25 @@ def main() -> None:
     eval_log = result_dir / args.eval_log
     out_dir = result_dir / args.out_dir
 
+    if not train_log.exists():
+        raise FileNotFoundError(f"train log not found: {train_log}")
+
     train_df = _clean_train_df(train_log)
     train_metrics = _valid_metric_cols(train_df, "timestep")
+    resolved = _resolve_split_z_columns(train_df)
 
-    # ------------------------------------------------------------------
-    # Panel 01 – Core metrics  (original + split-z norms side-by-side)
-    # ------------------------------------------------------------------
-    core_cols = [
-        "mean_disc_reward",
-        "mean_aux_reward",
-        "mean_next_Q",
-        "mean_next_auxQ",
-        "FPS",
-        # aggregated norms (kept for reference)
-        "z_norm",
-        "B_norm",
-        # split-z norms
-        "z_body_norm",
-        "z_hand_norm",
-        "B_body_norm",
-        "B_hand_norm",
-    ]
+    schema = "hand-MSE" if resolved["hand_fb"] == "fb_hand_mse" or resolved["hand_actor"] else "legacy-bilinear"
+    print(f"Detected schema: {schema}")
+    print(f"  hand FB metric   : {resolved['hand_fb'] or '(not logged)'}")
+    print(f"  hand actor metric: {resolved['hand_actor'] or resolved['hand_q_actor'] or resolved['hand_q_cpr'] or '(not logged)'}")
+    print(f"  total train metrics in log: {len(train_metrics)}")
 
-    # ------------------------------------------------------------------
-    # Panel 02 – Loss metrics  (aggregated + split-z per-subspace)
-    # ------------------------------------------------------------------
-    loss_cols = [
-        "actor_loss",
-        "critic_loss",
-        "aux_critic_loss",
-        "q_loss",
-        # FB losses: aggregated + split
-        "fb_loss",
-        "fb_body_loss",
-        "fb_hand_loss",
-        "fb_total_loss",
-        # discriminator losses
-        "disc_loss",
-        "disc_train_loss",
-        "disc_expert_loss",
-        "disc_wgan_gp_loss",
-        # orth losses: aggregated + split
-        "orth_loss",
-        "orth_loss_diag",
-        "orth_loss_offdiag",
-        "orth_body_loss",
-        "orth_hand_loss",
-        "orth_body_loss_diag",
-        "orth_hand_loss_diag",
-        "orth_body_loss_offdiag",
-        "orth_hand_loss_offdiag",
-    ]
-
-    # ------------------------------------------------------------------
-    # Panel 03 – Q metrics  (aggregated + split-z)
-    # ------------------------------------------------------------------
-    q_cols = [
-        # critic / aux_critic (not split)
-        "Q1",
-        "Q_aux",
-        "Q_discriminator",
-        "target_Q",
-        "target_auxQ",
-        "target_M",
-        # fb Q: aggregated
-        "Q_fb",
-        "q",
-        # fb Q: split-z
-        "Q_fb_body",
-        "Q_fb_hand",
-        "Q_fb_total",
-        "q_body",
-        "q_hand",
-        "q_total",
-    ]
-
-    # ------------------------------------------------------------------
-    # Panel 04 – Aux rewards breakdown
-    # ------------------------------------------------------------------
-    aux_rew_cols = sorted([c for c in train_metrics if c.startswith("aux_rew/")])
-
-    # ------------------------------------------------------------------
-    # Panel 05 – FB diagnostics
-    # ------------------------------------------------------------------
-    diag_cols = ["fb_diag", "fb_offdiag", "unc_Q", "unc_auxQ", "M1", "F1", "B"]
-
-    # ------------------------------------------------------------------
-    # Panel 06 – Split-z FB losses comparison (body vs hand overlay)
-    # ------------------------------------------------------------------
-    fb_loss_pairs = [
-        ("fb_body_loss",        "fb_hand_loss"),
-        ("orth_body_loss",      "orth_hand_loss"),
-        ("orth_body_loss_diag", "orth_hand_loss_diag"),
-        ("orth_body_loss_offdiag", "orth_hand_loss_offdiag"),
-    ]
-
-    # ------------------------------------------------------------------
-    # Panel 07 – Split-z norms comparison (body vs hand overlay)
-    # ------------------------------------------------------------------
-    norm_pairs = [
-        ("z_body_norm", "z_hand_norm"),
-        ("B_body_norm", "B_hand_norm"),
-    ]
-
-    # ------------------------------------------------------------------
-    # Panel 08 – Split-z Q comparison (body vs hand overlay)
-    # ------------------------------------------------------------------
-    q_pairs = [
-        ("Q_fb_body", "Q_fb_hand"),
-        ("q_body",    "q_hand"),
-    ]
-
-    # ------------------------------------------------------------------
-    # Render all grid panels
-    # ------------------------------------------------------------------
-    grouped = {
-        "01_core_independent_axes.png": (
-            "Core Metrics – split-z run (independent axes)", core_cols
-        ),
-        "02_losses_independent_axes.png": (
-            "Loss Metrics – split-z run (independent axes)", loss_cols
-        ),
-        "03_q_independent_axes.png": (
-            "Q Metrics – split-z run (independent axes)", q_cols
-        ),
-        "04_aux_rewards_independent_axes.png": (
-            "Aux Reward Terms (independent axes)", aux_rew_cols
-        ),
-        "05_diag_independent_axes.png": (
-            "FB Diagnostics (independent axes)", diag_cols
-        ),
-    }
+    grouped = _build_metric_groups(train_df, resolved)
+    plotted_in_groups: set[str] = set()
 
     for file_name, (title, cols) in grouped.items():
-        valid = _valid_metric_cols(train_df, "timestep", cols)
+        valid = _valid_metric_cols(train_df, "timestep", [c for c in cols if c])
+        plotted_in_groups.update(valid)
         _plot_grid(
             train_df,
             x_col="timestep",
@@ -448,32 +541,32 @@ def main() -> None:
             smooth_window=args.smooth_window,
             burn_in_ratio=args.burn_in_ratio,
         )
+        if valid:
+            print(f"  grouped panel {file_name}: {len(valid)} metrics")
 
-    # ------------------------------------------------------------------
-    # Render body-vs-hand overlay panels
-    # ------------------------------------------------------------------
+    overlay_pairs = _build_overlay_pairs(resolved)
     _plot_body_hand_overlay(
-        train_df, "timestep", fb_loss_pairs,
-        out_file=out_dir / "06_split_z_fb_orth_losses_overlay.png",
-        title="Split-Z: FB & Orth Losses — body (blue) vs hand (orange)",
-        smooth_window=args.smooth_window,
-    )
-    _plot_body_hand_overlay(
-        train_df, "timestep", norm_pairs,
-        out_file=out_dir / "07_split_z_norms_overlay.png",
-        title="Split-Z: z & B Norms — body (blue) vs hand (orange)",
-        smooth_window=args.smooth_window,
-    )
-    _plot_body_hand_overlay(
-        train_df, "timestep", q_pairs,
-        out_file=out_dir / "08_split_z_q_overlay.png",
-        title="Split-Z: Q Values — body (blue) vs hand (orange)",
+        train_df, "timestep", overlay_pairs,
+        out_file=out_dir / "07_split_z_body_hand_overlay.png",
+        title="Split-Z: body (blue) vs hand (orange)",
         smooth_window=args.smooth_window,
     )
 
-    # ------------------------------------------------------------------
-    # One-per-metric individual plots (all columns in the CSV)
-    # ------------------------------------------------------------------
+    # Catch-all panel for any numeric column not yet in grouped panels
+    remaining = [m for m in train_metrics if m not in plotted_in_groups]
+    if remaining:
+        _plot_grid(
+            train_df,
+            x_col="timestep",
+            metrics=remaining,
+            out_file=out_dir / "08_remaining_metrics_independent_axes.png",
+            title="Remaining Logged Metrics (catch-all)",
+            smooth_window=args.smooth_window,
+            burn_in_ratio=args.burn_in_ratio,
+        )
+        print(f"  catch-all panel: {len(remaining)} metrics")
+
+    # One PNG per metric in train_log
     single_dir = out_dir / "single_metrics"
     for metric in train_metrics:
         _plot_single_metric(
@@ -483,11 +576,10 @@ def main() -> None:
             out_file=single_dir / f"{metric.replace('/', '_')}.png",
             smooth_window=args.smooth_window,
             burn_in_ratio=args.burn_in_ratio,
+            tail_threshold=args.tail_threshold,
         )
 
-    # ------------------------------------------------------------------
     # Optional: tracking eval curves
-    # ------------------------------------------------------------------
     if eval_log.exists():
         eval_df = _clean_eval_df(eval_log)
         eval_cols = _valid_metric_cols(
@@ -512,9 +604,11 @@ def main() -> None:
                 out_file=out_dir / "single_eval_metrics" / f"{metric}.png",
                 smooth_window=max(1, args.smooth_window // 2),
                 burn_in_ratio=args.burn_in_ratio,
+                tail_threshold=args.tail_threshold,
             )
 
-    print(f"Saved split-z plots to: {out_dir}")
+    print(f"\nSaved split-z plots to: {out_dir}")
+    print(f"  single_metrics/: {len(train_metrics)} files (one per logged column)")
 
 
 if __name__ == "__main__":
