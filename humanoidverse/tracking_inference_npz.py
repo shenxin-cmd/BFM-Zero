@@ -70,10 +70,12 @@ os.environ["OMP_NUM_THREADS"] = "1"
 
 from pathlib import Path
 
+import mujoco
 import joblib
 import json
 import numpy as np
 import torch
+import matplotlib.pyplot as plt
 from torch.utils._pytree import tree_map
 
 import humanoidverse
@@ -91,6 +93,11 @@ else:
 
 # NPZ 录制时 g1_player.py 使用的固定 dt（分母），与 PRIV_STATE_DT 保持一致
 _PRIV_STATE_DT = 0.001  # seconds
+
+# 右手末端执行器（与 g1_traj_gen.py 保持一致）
+_EE_BODY       = "right_wrist_yaw_link"
+_SPHERE_RADIUS = 0.028                    # 视频标注球半径 (m)
+_SPHERE_RGBA   = (1.0, 0.40, 0.05, 1.0)  # 橙色
 
 
 # ---------------------------------------------------------------------------
@@ -250,6 +257,168 @@ def _rescale_privileged_vel(
 
 
 # ---------------------------------------------------------------------------
+# 右手末端轨迹工具
+# ---------------------------------------------------------------------------
+
+def _fk_ee_positions(
+    fk_model: "mujoco.MjModel",
+    fk_data: "mujoco.MjData",
+    ee_id: int,
+    qpos7_root: np.ndarray,    # (7,) [x,y,z,qw,qx,qy,qz]  MuJoCo 格式
+    dof_abs_arr: np.ndarray,   # (N, 29)
+) -> np.ndarray:
+    """
+    批量 FK：返回 (N, 3) EE 世界坐标。
+    根固定在 qpos7_root，仅关节角按帧变化。
+    """
+    N = dof_abs_arr.shape[0]
+    out = np.zeros((N, 3), dtype=np.float64)
+    for i in range(N):
+        fk_data.qpos[:7] = qpos7_root
+        fk_data.qpos[7:] = dof_abs_arr[i]
+        fk_data.qvel[:] = 0.0
+        mujoco.mj_forward(fk_model, fk_data)
+        out[i] = fk_data.xpos[ee_id].copy()
+    return out
+
+
+def _fk_one_step(
+    fk_model: "mujoco.MjModel",
+    fk_data: "mujoco.MjData",
+    ee_id: int,
+    root_states_row: np.ndarray,  # (>=13,) Isaac 格式 [x,y,z, qx,qy,qz,qw, vx,vy,vz,wx,wy,wz]
+    dof_pos: np.ndarray,          # (29,)
+) -> np.ndarray:
+    """
+    单步 FK，返回 EE 世界坐标 (3,)。
+    Isaac root_states 索引 [0,1,2,6,3,4,5] → MuJoCo [x,y,z,qw,qx,qy,qz]。
+    """
+    fk_data.qpos[:7] = root_states_row[[0, 1, 2, 6, 3, 4, 5]]
+    fk_data.qpos[7:] = dof_pos
+    fk_data.qvel[:] = 0.0
+    mujoco.mj_forward(fk_model, fk_data)
+    return fk_data.xpos[ee_id].copy()
+
+
+def _render_with_ee_sphere(
+    rgb_renderer: "IsaacRendererWithMuJoco",
+    hv_env,
+    ee_id: int,
+) -> np.ndarray:
+    """
+    在 MuJoCo 渲染帧里注入右手末端的橙色球体标记，返回 (H, W, 3) uint8。
+
+    实现：直接调用 g1.renderer.update_scene + 注入 mjvGeom sphere + render，
+    绕过 g1.render() 以便在 update_scene 和 render 之间插入球体。
+    """
+    g1 = IsaacRendererWithMuJoco._inner_g1_env(rgb_renderer.mujoco_env)
+
+    # 1. 从 Isaac 读取当前状态，写入 MuJoCo
+    base_pos = hv_env.simulator.robot_root_states[:, [0, 1, 2, 6, 3, 4, 5]].float().cpu().numpy()
+    joint_pos = hv_env.simulator.dof_pos.float().cpu().numpy()
+    mujoco_qpos = np.concatenate([base_pos, joint_pos], axis=1)[0]  # (36,)
+
+    qvel = g1._mj_data.qvel.copy()
+    rgb_renderer.mujoco_env.reset(options={"qpos": mujoco_qpos, "qvel": qvel})
+    mujoco.mj_forward(g1.model, g1.data)
+
+    # 2. 末端世界坐标
+    ee_pos = g1.data.xpos[ee_id].copy().astype(np.float64)
+
+    # 3. 确保 renderer 已初始化
+    if g1.renderer is None:
+        g1.renderer = mujoco.Renderer(
+            g1._mj_model,
+            width=g1._config.render_width,
+            height=g1._config.render_height,
+        )
+        mujoco.mj_forward(g1._mj_model, g1._mj_data)
+
+    # 4. update_scene（与 g1.render() 内部一致）
+    cam_arg = getattr(g1._config, "camera", "track")
+    g1.renderer.update_scene(g1._mj_data, camera=cam_arg)
+
+    # 5. 注入球体 geom
+    scene = getattr(g1.renderer, "scene", None) or getattr(g1.renderer, "_scene", None)
+    if scene is not None and scene.ngeom < scene.maxgeom:
+        geom = scene.geoms[scene.ngeom]
+        scene.ngeom += 1
+        try:
+            mujoco.mjv_initGeom(
+                geom,
+                int(mujoco.mjtGeom.mjGEOM_SPHERE),
+                np.full(3, _SPHERE_RADIUS, dtype=np.float64),
+                ee_pos,
+                np.eye(3, dtype=np.float64).flatten(),
+                np.array(_SPHERE_RGBA, dtype=np.float32),
+            )
+        except Exception:
+            geom.type = int(mujoco.mjtGeom.mjGEOM_SPHERE)
+            geom.size[:] = _SPHERE_RADIUS
+            geom.pos[:] = ee_pos
+            geom.mat[:] = np.eye(3, dtype=np.float64).flatten()
+            geom.rgba[:] = np.array(_SPHERE_RGBA, dtype=np.float32)
+            geom.dataid = -1
+
+    # 6. render
+    return g1.renderer.render()
+
+
+def _save_ee_traj_plot(
+    expert_ee: np.ndarray,   # (N, 3) 世界坐标
+    policy_ee: np.ndarray,   # (M, 3) 世界坐标
+    out_path: Path,
+    title: str = "",
+) -> None:
+    """
+    将专家轨迹（蓝色虚线）和 policy 轨迹（红色实线）投影到 Y-Z 平面绘制并保存。
+    圆形轨迹在 Y-Z 平面上应呈现为圆，方便直接判断跟踪是否准确。
+    """
+    fig, ax = plt.subplots(figsize=(7, 7))
+
+    ax.plot(
+        expert_ee[:, 1], expert_ee[:, 2],
+        color="#1D7FD4", lw=1.8, linestyle="--", alpha=0.9,
+        label=f"Expert / NPZ FK  (T={len(expert_ee)})",
+    )
+    ax.scatter(expert_ee[0, 1], expert_ee[0, 2],
+               marker="*", s=220, color="#1D7FD4", zorder=8, label="expert start")
+
+    ax.plot(
+        policy_ee[:, 1], policy_ee[:, 2],
+        color="#E63946", lw=2.0, linestyle="-", alpha=0.9,
+        label=f"Policy rollout FK  (T={len(policy_ee)})",
+    )
+    ax.scatter(policy_ee[0, 1], policy_ee[0, 2],
+               marker="*", s=220, color="#E63946", zorder=8, label="policy start")
+
+    # 统计偏差
+    min_len = min(len(expert_ee), len(policy_ee))
+    yz_dev = np.linalg.norm(
+        expert_ee[:min_len, 1:3] - policy_ee[:min_len, 1:3], axis=1
+    )
+    mean_dev = float(yz_dev.mean())
+    max_dev  = float(yz_dev.max())
+
+    ax.set_xlabel("Y  (m)", fontsize=12)
+    ax.set_ylabel("Z  (m)", fontsize=12)
+    ax.set_aspect("equal")
+    ax.grid(True, alpha=0.35)
+    ax.set_title(
+        f"Right-hand EE Trajectory (Y-Z plane)"
+        + (f"  |  {title}" if title else "")
+        + f"\nmean_dev={mean_dev*100:.2f} cm   max_dev={max_dev*100:.2f} cm",
+        fontsize=10,
+    )
+    ax.legend(fontsize=9, loc="best")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    print(f"EE 轨迹对比图已保存: {out_path}")
+
+
+# ---------------------------------------------------------------------------
 # 主函数
 # ---------------------------------------------------------------------------
 
@@ -353,6 +522,15 @@ def main(
     ddp = env.default_dof_pos.detach().float()
     default_dof_np: np.ndarray = (ddp[0] if ddp.ndim >= 2 else ddp).cpu().numpy()
 
+    # ── FK 模型（轻量 MuJoCo 实例，专用于末端轨迹计算） ─────────────────────
+    from humanoidverse.utils.g1_env_config import G1EnvConfig
+    _fk_env, _ = G1EnvConfig(render_height=16, render_width=16).build(num_envs=1)
+    _fk_g1     = IsaacRendererWithMuJoco._inner_g1_env(_fk_env)
+    fk_model   = _fk_g1._mj_model
+    fk_data    = mujoco.MjData(fk_model)
+    ee_id      = int(mujoco.mj_name2id(fk_model, mujoco.mjtObj.mjOBJ_BODY, _EE_BODY))
+    print(f"  EE body '{_EE_BODY}' id = {ee_id}")
+
     # ── 加载 NPZ ─────────────────────────────────────────────────────────────
     print(f"Loading trajectory: {npz_path}")
     traj = load_npz_obs(npz_path)
@@ -434,6 +612,15 @@ def main(
         root_quat_xyzw[[3, 0, 1, 2]] if simulator == "isaacsim" else root_quat_xyzw
     )
 
+    # ── 专家末端轨迹（FK on NPZ 关节角，根固定在初始位置） ─────────────────
+    # root_quat 此处已是 MuJoCo wxyz 格式（isaacsim 路径已做 [3,0,1,2] 重排）
+    qpos7_root = np.concatenate([root_pos, root_quat]).astype(np.float64)
+    print("Computing expert EE trajectory via FK...")
+    expert_ee = _fk_ee_positions(fk_model, fk_data, ee_id, qpos7_root, dof_abs_np)
+    print(f"  expert_ee shape: {expert_ee.shape}  "
+          f"Y=[{expert_ee[:,1].min():.3f},{expert_ee[:,1].max():.3f}]  "
+          f"Z=[{expert_ee[:,2].min():.3f},{expert_ee[:,2].max():.3f}]")
+
     T_vis = min(N, (episode_len or N) + 1)
     expert_qpos = np.zeros((T_vis, 36), dtype=np.float32)
     expert_qpos[:, :3]  = root_pos
@@ -474,6 +661,11 @@ def main(
 
     joint_pos = [wrapped_env._env.simulator.dof_state[..., 0].clone().cpu().numpy()]
 
+    # policy EE 轨迹：从第 0 帧初始 EE 位置开始
+    _rs0 = wrapped_env._env.simulator.robot_root_states[0].float().detach().cpu().numpy()
+    _d0  = wrapped_env._env.simulator.dof_state.view(num_envs, -1, 2)[0, :, 0].float().detach().cpu().numpy()
+    policy_ee_list = [_fk_one_step(fk_model, fk_data, ee_id, _rs0, _d0)]
+
     if save_mp4:
         try:
             import mediapy as media
@@ -481,7 +673,8 @@ def main(
             raise ImportError("save_mp4 需要 mediapy：pip install mediapy")
         rgb_renderer = IsaacRendererWithMuJoco(render_size=256)
         expert_video = rgb_renderer.from_qpos(expert_qpos[: 1 + n_steps])
-        frames = [rgb_renderer.render(wrapped_env._env, 0)[0]]
+        # 初始帧：policy 视频带末端球体标记
+        frames = [_render_with_ee_sphere(rgb_renderer, wrapped_env._env, ee_id)]
 
     for i in range(n_steps):
         action = model.act(observation, z[i % len(z)].repeat(num_envs, 1), mean=True)
@@ -489,13 +682,29 @@ def main(
             action, to_numpy=False
         )
         joint_pos.append(wrapped_env._env.simulator.dof_state[..., 0].clone().cpu().numpy())
+
+        # 收集 policy EE 位置
+        _rs = wrapped_env._env.simulator.robot_root_states[0].float().detach().cpu().numpy()
+        _d  = wrapped_env._env.simulator.dof_state.view(num_envs, -1, 2)[0, :, 0].float().detach().cpu().numpy()
+        policy_ee_list.append(_fk_one_step(fk_model, fk_data, ee_id, _rs, _d))
+
         if save_mp4:
-            frames.append(rgb_renderer.render(wrapped_env._env, 0)[0])
+            frames.append(_render_with_ee_sphere(rgb_renderer, wrapped_env._env, ee_id))
         if (i + 1) % 50 == 0:
             print(f"  step {i + 1}/{n_steps}")
 
     joint_pos_arr = np.stack(joint_pos, axis=0).squeeze(1)
     print(f"Rollout complete. joint_pos shape: {joint_pos_arr.shape}")
+
+    # ── EE 轨迹对比图（始终保存） ─────────────────────────────────────────────
+    policy_ee = np.array(policy_ee_list)           # (n_steps+1, 3)
+    ee_plot_path = out_dir / f"ee_traj_{stem}.png"
+    _save_ee_traj_plot(
+        expert_ee[: len(policy_ee)],   # 对齐到 rollout 实际步数
+        policy_ee,
+        ee_plot_path,
+        title=stem,
+    )
 
     if save_mp4:
         new_frames = [
@@ -507,9 +716,10 @@ def main(
         print(f"Saved video: {video_path}")
 
     print(f"\n=== Done ===")
-    print(f"  z pkl  : {z_save_path}")
+    print(f"  z pkl      : {z_save_path}")
+    print(f"  EE traj    : {ee_plot_path}")
     if save_mp4:
-        print(f"  video  : {out_dir / f'tracking_{stem}.mp4'}")
+        print(f"  video      : {out_dir / f'tracking_{stem}.mp4'}")
 
 
 if __name__ == "__main__":
