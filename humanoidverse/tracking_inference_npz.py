@@ -7,51 +7,59 @@ tracking_inference_npz.py
 ------------------------------------------------
   state             (N, 64)   float32
       = [dof_pos_rel(29), dof_vel(29), proj_grav(3), ang_vel(3)]
-      dof_pos_rel = qpos[7:36] - DEFAULT_JOINT_POS   （关节角相对默认姿态偏移）
-      dof_vel     = qvel[6:35]
-      proj_grav   = R⁻¹ · [0, 0, -1]                （重力在机体系投影）
-      ang_vel     = R · ω_body                        （根角速度）
+      dof_pos_rel = qpos[7:36] - DEFAULT_JOINT_POS
+      dof_vel     = qvel[6:35]     （MuJoCo qvel，物理单位 rad/s）
+      proj_grav   = R⁻¹ · [0,0,-1]
+      ang_vel     = R · ω_body     （根角速度）
 
   last_action       (N, 29)   float32
-      = 上一步 action（通常近似为 dof_pos_rel）
 
   privileged_state  (N, D)    float32
-      = compute_humanoid_observations_max 的输出：
+      = compute_humanoid_observations_max 的输出，
         [root_h(1)?, local_body_pos, local_body_rot_6d, local_body_vel, local_body_ang_vel]
-        D 典型值：448（30 刚体，含 root_height）、447（不含）、
-                  463（31 刚体，含 root_height）、462（不含）
+        D 典型值：448（30刚体含root_h）、447（不含）、463（31刚体）、462
 
-关于第 0 帧速度问题
--------------------
-privileged_state 中的 body_vel / body_ang_vel 是有限差分：
-  frame 0: body_pos_prev = None → vel = 0（不准）
-  frame 1+: (pos_t - pos_{t-1}) / dt         （正确）
+速度尺度差异（重要）
+--------------------
+  训练时（motion library）：
+      body_vel = np.gradient(wbody_pos) / motion_dt
+               = Δpos / motion_dt   （物理 m/s）
+      其中 motion_dt = 1/motion_fps（LAFAN 通常 30~120 Hz）
 
-因此与原始 tracking_inference.py 保持一致，backward_map 的输入跳过第 0 帧：
-  z = tracking_inference(obs[1:])
-frame 0 的错误速度被天然丢弃。
+  NPZ 录制时（g1_player.py）：
+      body_vel = (body_pos_t - body_pos_{t-1}) / PRIV_STATE_DT
+               = Δpos / 0.001       （PRIV_STATE_DT 固定 1000 Hz）
+      其中 Δpos 是相邻录制帧的差，帧间隔 = 1/npz_fps
 
-环境初始化
-----------
-npz 不含根轨迹（root pos/quat/vel），Isaac 环境初始化时使用：
-  - root 状态：env.base_init_state
-  - dof 状态：state[0, :29] + env.default_dof_pos（绝对关节角）、state[0, 29:58]（关节速度）
-专家侧 MuJoCo 视频中根保持静止，只反映关节运动对比。
+  换算关系：
+      NPZ 存储值 = 物理速度 × (帧间隔 / PRIV_STATE_DT)
+                 = 物理速度 × (1/npz_fps) / 0.001
+                 = 物理速度 × (1000 / npz_fps)
 
-兼容性
-------
-若 privileged_state 维度比模型期望多一个刚体（即包含 head_link 扩展体），
-脚本会自动裁剪对齐，与 tracking_inference2.py 逻辑相同。
+  因此，要把 NPZ 速度转回物理 m/s（模型期望值），需乘以：
+      correction = 0.001 × npz_fps   （= 1/(1000/npz_fps)）
+
+  例：npz_fps=100 → correction=0.1（除以10）
+      npz_fps=50  → correction=0.05（除以20）
+      npz_fps=30  → correction=0.03（除以33）
+
+  若不指定 --npz-fps，脚本会尝试从 NPZ 内的时间戳自动推断，
+  否则使用默认值 100 Hz 并打印警告。
+
+关于第 0 帧跳过
+----------------
+NPZ 第 0 帧的 privileged_state body 速度 = 0（录制时无前帧），
+第 1 帧起有限差分才有意义。与原版一致 obs[1:] 跳过第 0 帧。
 
 用法
 ----
     python -m humanoidverse.tracking_inference_npz \\
         --model-folder  workdir/bfmzero-split-z/<run-id> \\
         --npz-path      g1_circle_7_obs.npz \\
+        [--npz-fps      50]      # 录制帧率，默认自动推断
         [--episode-len  500] \\
         [--save-mp4] \\
-        [--device cuda] \\
-        [--headless True]
+        [--no-vel-rescale]       # 禁用速度缩放（调试用）
 """
 from __future__ import annotations
 
@@ -81,13 +89,15 @@ if getattr(humanoidverse, "__file__", None) is not None:
 else:
     HUMANOIDVERSE_DIR = Path(__file__).resolve().parent
 
+# NPZ 录制时 g1_player.py 使用的固定 dt（分母），与 PRIV_STATE_DT 保持一致
+_PRIV_STATE_DT = 0.001  # seconds
+
 
 # ---------------------------------------------------------------------------
 # NPZ 加载工具
 # ---------------------------------------------------------------------------
 
 def _normalize_key(k: str) -> str:
-    """统一键名：去空格、小写、修正 priviledged 拼写。"""
     k = k.strip().lower().replace(" ", "_")
     if k == "priviledged_state":
         k = "privileged_state"
@@ -95,13 +105,12 @@ def _normalize_key(k: str) -> str:
 
 
 def load_npz_obs(path: Path) -> dict[str, np.ndarray]:
-    """加载 NPZ，返回 {key: (T, D) float32 ndarray}，必须包含三个必要键。"""
+    """加载 NPZ，返回 {key: (T, D) float32 ndarray}。"""
     raw = np.load(path, allow_pickle=True)
     out: dict[str, np.ndarray] = {}
     for k in raw.files:
         out[_normalize_key(k)] = np.asarray(raw[k], dtype=np.float32)
     raw.close()
-
     for req in ("state", "last_action", "privileged_state"):
         if req not in out:
             raise KeyError(
@@ -111,12 +120,27 @@ def load_npz_obs(path: Path) -> dict[str, np.ndarray]:
     return out
 
 
+def _infer_npz_fps(traj: dict[str, np.ndarray]) -> float | None:
+    """
+    尝试从 NPZ 内的时间戳数组推断录制帧率。
+    常见键名：simtime、sim_time、timestamps、time、times。
+    """
+    for key in ("simtime", "sim_time", "timestamps", "timestamp", "time", "times"):
+        if key in traj:
+            t = np.asarray(traj[key], dtype=np.float64).ravel()
+            if len(t) >= 2:
+                diffs = np.diff(t)
+                dt_med = float(np.median(diffs[diffs > 0]))
+                if dt_med > 0:
+                    return round(1.0 / dt_med, 1)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # privileged_state 维度对齐
 # ---------------------------------------------------------------------------
 
 def _get_model_priv_dim(model) -> int:
-    """从模型的 obs_space 读取 privileged_state 期望维度。"""
     return int(model.obs_space.spaces["privileged_state"].shape[0])
 
 
@@ -126,15 +150,8 @@ def _align_privileged_state(
     root_height_obs: bool,
 ) -> np.ndarray:
     """
-    若 privileged_state 维度与模型不符，尝试自动裁剪对齐。
-
-    支持的转换（对应 nums_extend_bodies=1 即去掉 head_link 扩展体）：
-      463 → 448  含 root_height（30+1 → 30 刚体）
-      462 → 447  不含 root_height
-
-    layout: [root_h(1)?] [local_pos(N*3-3)] [local_rot_6d(N*6)]
-            [local_vel(N*3)] [local_ang_vel(N*3)]
-    N=31: 1+90+186+93+93=463;  N=30: 1+87+180+90+90=448
+    若 privileged_state 维度比模型期望多（含 head_link 扩展体），自动裁剪对齐。
+    支持：463→448（含 root_h）、462→447（不含）。
     """
     src_dim = int(priv.shape[-1])
     if src_dim == target_dim:
@@ -148,19 +165,15 @@ def _align_privileged_state(
     if key not in trim_map:
         raise ValueError(
             f"privileged_state 维数 {src_dim} 与模型期望 {target_dim} 不符，"
-            "且不在已知的自动裁剪映射（463→448 / 462→447）中。\n"
-            "请确认训练时的 env.root_height_obs 与 NPZ 数据配置一致。"
+            "且不在已知映射（463→448 / 462→447）中。"
         )
-
     has_root = trim_map[key]
     if has_root != root_height_obs:
         print(
             f"[警告] 由维数推断 has_root_height={has_root}，"
-            f"但 config.root_height_obs={root_height_obs}，"
-            "以维数推断为准。"
+            f"但 config.root_height_obs={root_height_obs}，以维数推断为准。"
         )
 
-    # 按段去掉最后一个刚体的贡献（每段各去掉 3 或 6 维）
     seg_full_and_chop = [(90, 3), (186, 6), (93, 3), (93, 3)]
     parts: list[np.ndarray] = []
     if has_root:
@@ -171,11 +184,69 @@ def _align_privileged_state(
         cur += length
 
     result = np.concatenate(parts, axis=-1).astype(np.float32)
-    assert result.shape[-1] == target_dim, (
-        f"裁剪后维数 {result.shape[-1]} ≠ 目标 {target_dim}，请检查配置。"
-    )
-    print(f"  privileged_state 自动对齐: {src_dim} → {target_dim} (root_height={has_root})")
+    assert result.shape[-1] == target_dim
+    print(f"  privileged_state 维度对齐: {src_dim} → {target_dim}")
     return result
+
+
+# ---------------------------------------------------------------------------
+# privileged_state 速度分量缩放
+# ---------------------------------------------------------------------------
+
+def _vel_slice(target_dim: int, root_height_obs: bool) -> tuple[int, int]:
+    """
+    返回 privileged_state 中 (body_vel ++ body_ang_vel) 的切片 [start, end)。
+
+    layout（已对齐后）：
+      [root_h(1)?] [local_pos((N-1)*3)] [local_rot(N*6)] [local_vel(N*3)] [local_ang_vel(N*3)]
+
+    从 target_dim 和 root_height_obs 反解 N（刚体数）：
+      有 root_h:  1 + (N-1)*3 + N*6 + N*3 + N*3 = target_dim → 15N = target_dim + 2
+      无 root_h:  (N-1)*3 + N*6 + N*3 + N*3 = target_dim     → 15N = target_dim + 3
+    """
+    if root_height_obs:
+        N = (target_dim + 2) // 15
+        offset = 1
+    else:
+        N = (target_dim + 3) // 15
+        offset = 0
+
+    pos_len = (N - 1) * 3
+    rot_len = N * 6
+    vel_start = offset + pos_len + rot_len
+    vel_end   = vel_start + N * 3 + N * 3   # linear_vel + ang_vel
+    return vel_start, vel_end
+
+
+def _rescale_privileged_vel(
+    priv: np.ndarray,
+    npz_fps: float,
+    root_height_obs: bool,
+) -> np.ndarray:
+    """
+    将 privileged_state 中 body 线速度和角速度从 NPZ 录制尺度转换到物理 m/s。
+
+    NPZ 存储值 = 物理速度 × (1/npz_fps) / PRIV_STATE_DT
+    物理速度   = NPZ 存储值 × PRIV_STATE_DT × npz_fps
+    correction = _PRIV_STATE_DT × npz_fps
+
+    训练时 motion_lib 使用的是物理速度（np.gradient / motion_dt），
+    所以需要把 NPZ 速度缩回物理尺度才能和模型期望对齐。
+    """
+    correction = _PRIV_STATE_DT * npz_fps  # e.g., 0.001 * 100 = 0.1
+    if abs(correction - 1.0) < 1e-4:
+        return priv  # 刚好 1000 Hz 录制时无需缩放（不常见）
+
+    target_dim = priv.shape[-1]
+    vel_start, vel_end = _vel_slice(target_dim, root_height_obs)
+
+    priv = priv.copy()
+    priv[:, vel_start:vel_end] *= correction
+    print(
+        f"  privileged_state 速度缩放: dims[{vel_start}:{vel_end}] × {correction:.4f}"
+        f"  （NPZ {npz_fps:.0f} Hz → 物理 m/s，PRIV_STATE_DT={_PRIV_STATE_DT}s）"
+    )
+    return priv
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +256,7 @@ def _align_privileged_state(
 def main(
     model_folder: Path,
     npz_path: Path,
+    npz_fps: float | None = None,
     data_path: Path | None = None,
     headless: bool = True,
     device: str = "cuda",
@@ -193,15 +265,18 @@ def main(
     disable_dr: bool = False,
     disable_obs_noise: bool = False,
     episode_len: int | None = None,
+    no_vel_rescale: bool = False,
 ) -> None:
     """
     参数说明
     --------
-    model_folder : checkpoint 上一级目录（内含 checkpoint/ 和 config.json）
-    npz_path     : 轨迹 NPZ 文件路径（如 g1_circle_7_obs.npz）
-    data_path    : 覆盖 config.json 里的 lafan_tail_path（仅用于 Isaac 环境初始化，
-                   不影响 tracking inference 本身）
-    episode_len  : rollout 最大步数（None = 使用 z 的完整长度）
+    model_folder   : checkpoint 上一级目录（内含 checkpoint/ 和 config.json）
+    npz_path       : 轨迹 NPZ 文件路径（如 g1_circle_7_obs.npz）
+    npz_fps        : NPZ 录制帧率（Hz）。若不指定，自动从 NPZ 时间戳推断；
+                     推断失败则默认 100 Hz 并打印警告。常见值：30 / 50 / 100。
+    data_path      : 覆盖 config.json 里的 lafan_tail_path（仅用于 Isaac 环境初始化）
+    episode_len    : rollout 最大步数（None = 使用 z 的完整长度）
+    no_vel_rescale : 禁用 privileged_state 速度缩放（仅调试用）
     """
     model_folder = Path(model_folder)
     npz_path = Path(npz_path)
@@ -224,7 +299,7 @@ def main(
     print(f"模型期望 privileged_state 维度: {priv_expected}")
     print(f"use_root_height_obs: {use_root_height_obs}")
 
-    # 保证 Isaac 环境能正常初始化（需要一个合法的 lafan_tail_path）
+    # Isaac 环境初始化需要合法的 lafan_tail_path
     if data_path is not None:
         config["env"]["lafan_tail_path"] = str(Path(data_path).resolve())
     elif not Path(config["env"].get("lafan_tail_path", "")).exists():
@@ -240,7 +315,7 @@ def main(
     config["env"]["disable_domain_randomization"] = disable_dr
     config["env"]["disable_obs_noise"] = disable_obs_noise
 
-    # ── 导出 ONNX（与原版一致）────────────────────────────────────────────────
+    # ── 导出 ONNX ────────────────────────────────────────────────────────────
     export_dir = model_folder / "exported"
     export_dir.mkdir(parents=True, exist_ok=True)
     z_export_dim = model.cfg.archi.total_z_dim
@@ -257,9 +332,9 @@ def main(
     )
     print(f"Exported model to {export_dir}/{model_name}.onnx")
 
-    # ── backward_map → cumulative mean → project_z（与原版完全一致）───────────
+    # ── backward_map → cumulative mean → project_z ───────────────────────────
     def tracking_inference(obs: dict[str, torch.Tensor]) -> torch.Tensor:
-        """obs 已跳过第 0 帧（速度有限差分第 0 帧不准），从第 1 帧开始。"""
+        """obs 已跳过第 0 帧（privileged_state 第 0 帧 body 速度为 0 不准）。"""
         z = model.backward_map(obs)
         for step in range(z.shape[0]):
             end_idx = min(step + 1, z.shape[0])
@@ -275,33 +350,59 @@ def main(
     print(env.config.simulator)
     print("-" * 80)
 
-    # env.default_dof_pos 可能是 (29,) 或 (1, 29)
     ddp = env.default_dof_pos.detach().float()
-    default_dof_np: np.ndarray = (ddp[0] if ddp.ndim >= 2 else ddp).cpu().numpy()  # (29,)
+    default_dof_np: np.ndarray = (ddp[0] if ddp.ndim >= 2 else ddp).cpu().numpy()
 
-    # ── 加载 NPZ 轨迹 ─────────────────────────────────────────────────────────
+    # ── 加载 NPZ ─────────────────────────────────────────────────────────────
     print(f"Loading trajectory: {npz_path}")
     traj = load_npz_obs(npz_path)
     N = traj["state"].shape[0]
     print(f"  Trajectory length: {N} frames")
-    print(f"  state shape:             {traj['state'].shape}")
-    print(f"  last_action shape:       {traj['last_action'].shape}")
-    print(f"  privileged_state shape:  {traj['privileged_state'].shape}")
+    print(f"  state shape:            {traj['state'].shape}")
+    print(f"  last_action shape:      {traj['last_action'].shape}")
+    print(f"  privileged_state shape: {traj['privileged_state'].shape}")
 
-    # privileged_state 维度对齐（自动裁剪 head_link 扩展体）
+    # ── 确定 NPZ 录制帧率 ─────────────────────────────────────────────────────
+    if npz_fps is None:
+        inferred = _infer_npz_fps(traj)
+        if inferred is not None:
+            npz_fps = inferred
+            print(f"  从 NPZ 时间戳自动推断 npz_fps = {npz_fps:.1f} Hz")
+        else:
+            npz_fps = 100.0
+            print(
+                f"  [警告] 无法从 NPZ 推断帧率，使用默认 npz_fps = {npz_fps:.0f} Hz。\n"
+                f"  若实际帧率不同（如 30/50 Hz），请用 --npz-fps 显式指定，\n"
+                f"  否则 privileged_state 速度缩放会不准确！"
+            )
+    else:
+        print(f"  使用用户指定 npz_fps = {npz_fps:.1f} Hz")
+
+    # ── privileged_state 维度对齐 ─────────────────────────────────────────────
     traj["privileged_state"] = _align_privileged_state(
         traj["privileged_state"], priv_expected, use_root_height_obs
     )
 
+    # ── privileged_state 速度缩放 ─────────────────────────────────────────────
+    # 原理：
+    #   NPZ 存储值 = Δpos / PRIV_STATE_DT = 物理速度 × (帧间隔/PRIV_STATE_DT)
+    #   模型期望   = 物理速度（motion_lib 用 np.gradient/motion_dt 计算）
+    #   correction = PRIV_STATE_DT × npz_fps
+    #              = 0.001 × npz_fps   （把 NPZ 尺度还原回物理 m/s）
+    if not no_vel_rescale:
+        traj["privileged_state"] = _rescale_privileged_vel(
+            traj["privileged_state"], npz_fps, use_root_height_obs
+        )
+    else:
+        print("  [调试] 速度缩放已禁用（--no-vel-rescale）")
+
     # ── 构建 backward_map 输入（跳过第 0 帧）────────────────────────────────
-    # 理由：privileged_state 的 body_vel/body_ang_vel 由有限差分计算，
-    # 第 0 帧 body_pos_prev=None 导致速度为 0，从第 1 帧开始才正确。
     obs_full: dict[str, torch.Tensor] = {
         "state":            torch.from_numpy(traj["state"]).to(dev),
         "last_action":      torch.from_numpy(traj["last_action"]).to(dev),
         "privileged_state": torch.from_numpy(traj["privileged_state"]).to(dev),
     }
-    # x[1:] 跳过第 0 帧，与原版 tracking_inference.py 第 101 行一致
+    # x[1:] 跳过第 0 帧：privileged_state 第 0 帧 body 速度 = 0（无前帧可差分）
     obs_for_bmap = tree_map(lambda x: x[1:], obs_full)
 
     # ── backward_map → z ──────────────────────────────────────────────────────
@@ -319,31 +420,29 @@ def main(
     print(f"Saved z → {z_save_path}")
 
     # ── 初始化 Isaac 环境到轨迹第 0 帧 ──────────────────────────────────────
-    # 关节角：state[:, :29] 是相对 default_dof_pos 的偏移 → 还原绝对关节角
+    # state[:, :29]  = dof_pos_rel → 加 default_dof_pos 还原绝对关节角
+    # state[:, 29:58] = dof_vel   （MuJoCo qvel，物理 rad/s，无需缩放）
     dof_abs_np = traj["state"][:, :29] + default_dof_np   # (N, 29)
-    dof_vel_np = traj["state"][:, 29:58]                   # (N, 29)  关节速度
+    dof_vel_np = traj["state"][:, 29:58]                   # (N, 29)
 
-    # 根状态：NPZ 不含根轨迹，使用环境默认 base_init_state
+    # NPZ 不含根轨迹，使用 env.base_init_state
     bis = env.base_init_state.detach().float().cpu()
     root7 = (bis[:7] if bis.ndim == 1 else bis[0, :7]).numpy().astype(np.float32)
-    root_pos  = root7[:3]          # (3,)  xyz
-    root_quat_xyzw = root7[3:7]   # (4,)  x,y,z,w
-    # IsaacSim 内部约定 wxyz（与 tracking_inference.py 第 110–111 行一致）
+    root_pos       = root7[:3]
+    root_quat_xyzw = root7[3:7]
     root_quat = (
         root_quat_xyzw[[3, 0, 1, 2]] if simulator == "isaacsim" else root_quat_xyzw
     )
 
-    # expert_qpos 仅用于 MuJoCo 专家侧视频：根静止、只有关节运动
     T_vis = min(N, (episode_len or N) + 1)
     expert_qpos = np.zeros((T_vis, 36), dtype=np.float32)
     expert_qpos[:, :3]  = root_pos
     expert_qpos[:, 3:7] = root_quat
     expert_qpos[:, 7:]  = dof_abs_np[:T_vis]
 
-    # 重置环境
     sim_dev = env.device
     ref_root = torch.tensor(
-        np.concatenate([root_pos, root_quat, np.zeros(6)]),  # pos + quat + vel(zero)
+        np.concatenate([root_pos, root_quat, np.zeros(6)]),
         dtype=torch.float32,
     )
     dof_init = torch.zeros_like(
@@ -367,7 +466,7 @@ def main(
     observation = wrapped_env._get_g1env_observation(to_numpy=False)
 
     # ── Rollout ───────────────────────────────────────────────────────────────
-    n_steps = z.shape[0]                          # N-1（与 z 长度对齐）
+    n_steps = z.shape[0]
     if episode_len is not None:
         n_steps = min(n_steps, episode_len)
     print(f"Running rollout for {n_steps} steps "
@@ -379,7 +478,7 @@ def main(
         try:
             import mediapy as media
         except ImportError:
-            raise ImportError("save_mp4 需要 mediapy 库：pip install mediapy")
+            raise ImportError("save_mp4 需要 mediapy：pip install mediapy")
         rgb_renderer = IsaacRendererWithMuJoco(render_size=256)
         expert_video = rgb_renderer.from_qpos(expert_qpos[: 1 + n_steps])
         frames = [rgb_renderer.render(wrapped_env._env, 0)[0]]
@@ -395,7 +494,7 @@ def main(
         if (i + 1) % 50 == 0:
             print(f"  step {i + 1}/{n_steps}")
 
-    joint_pos_arr = np.stack(joint_pos, axis=0).squeeze(1)   # (n_steps+1, 29)
+    joint_pos_arr = np.stack(joint_pos, axis=0).squeeze(1)
     print(f"Rollout complete. joint_pos shape: {joint_pos_arr.shape}")
 
     if save_mp4:
