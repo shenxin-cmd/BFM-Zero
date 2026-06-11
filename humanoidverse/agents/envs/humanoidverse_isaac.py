@@ -37,9 +37,41 @@ HYDRA_CONFIG_DIR = os.path.join(HUMANOIDVERSE_DIR, "config")
 HYDRA_CONFIG_REL_PATH = os.path.join("exp", "bfm_zero", "bfm_zero")
 
 
-def load_expert_trajectories_from_motion_lib(env, agent_cfg, device="cpu", add_history_noaction: bool = False):
+def _expert_source_base_weights(file_names: list, source_weights: dict[str, float]) -> list[float]:
+    """Per-trajectory base sampling weights from per-source weights.
+
+    Each motion key is matched to the LONGEST matching prefix in source_weights
+    ("" acts as catch-all, e.g. for original lafan keys). The weight of a source is
+    its *total* sampling mass: per-trajectory weight = source_weight / n_in_source,
+    so the source-level mix is exactly proportional to source_weights regardless of
+    how many clips each source contributes.
+    """
+    prefixes = sorted(source_weights.keys(), key=len, reverse=True)
+
+    def match(name: str) -> str:
+        for p in prefixes:
+            if str(name).startswith(p):
+                return p
+        raise ValueError(f"motion key {name!r} matches no prefix in {list(source_weights)}")
+
+    sources = [match(n) for n in file_names]
+    counts = {p: sources.count(p) for p in set(sources)}
+    # rescale so weights stay O(1) (mean 1) for numerical niceness
+    raw = [source_weights[s] / counts[s] for s in sources]
+    mean_raw = sum(raw) / len(raw)
+    weights = [w / mean_raw for w in raw]
+    print("Expert source balance:", {p: f"n={counts[p]}, total_mass={source_weights[p]}" for p in counts})
+    return weights
+
+
+def load_expert_trajectories_from_motion_lib(
+    env, agent_cfg, device="cpu", add_history_noaction: bool = False, source_weights: dict[str, float] | None = None
+):
     """
     Load expert trajectories from motion library.
+
+    source_weights: optional {key_prefix: total_sampling_mass} to balance sampling
+    across data sources in the merged dataset (see _expert_source_base_weights).
     """
     env._motion_lib.load_motions_for_training()  # loading all motions from the motion lib
     episodes = []
@@ -151,10 +183,15 @@ def load_expert_trajectories_from_motion_lib(env, agent_cfg, device="cpu", add_h
             ep["observation"]["history_noaction"] = history_actor
         episodes.append(ep)
 
+    base_weights = None
+    if source_weights is not None:
+        base_weights = _expert_source_base_weights(file_names, source_weights)
+
     expert_buffer = TrajectoryDictBuffer(
         episodes=episodes,
         seq_length=agent_cfg.model.seq_length,
         device=device,
+        base_weights=base_weights,
     )
 
     assert expert_buffer.storage["observation"]["state"].shape[0] == expert_buffer.storage["truncated"].shape[0]

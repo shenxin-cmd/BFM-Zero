@@ -278,7 +278,17 @@ def main(
     disable_dr: bool = False,
     disable_obs_noise: bool = False,
     episode_len: int | None = None,
+    z_window: int = 1,
+    z_ema_alpha: float | None = None,
 ) -> None:
+    """z smoothing options (anti-jump for OOD target trajectories):
+
+    z_window    : forward-looking window mean over B projections (1 = off, the
+                  historical behaviour of this script; training-time tracking
+                  uses seq_length=8).
+    z_ema_alpha : causal low-pass z[t] <- a*z[t] + (1-a)*z[t-1]; None/1.0 = off.
+                  Start with z_window=8, z_ema_alpha=0.6 when the right hand jumps.
+    """
     model_folder = Path(model_folder)
     traj_obs_dir = Path(traj_obs_dir)
 
@@ -323,8 +333,11 @@ def main(
     def tracking_inference(obs: dict[str, torch.Tensor]) -> torch.Tensor:
         z = model.backward_map(obs)
         for step in range(z.shape[0]):
-            end_idx = min(step + 1, z.shape[0])
+            end_idx = min(step + max(1, z_window), z.shape[0])
             z[step] = z[step:end_idx].mean(dim=0)
+        if z_ema_alpha is not None and z_ema_alpha < 1.0:
+            for step in range(1, z.shape[0]):
+                z[step] = z_ema_alpha * z[step] + (1.0 - z_ema_alpha) * z[step - 1]
         return model.project_z(z)
 
     env_cfg = HumanoidVerseIsaacConfig(**config["env"])

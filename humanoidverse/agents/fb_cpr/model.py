@@ -38,8 +38,13 @@ class FBcprModel(FBModel):
         super().__init__(obs_space, action_dim, cfg)
         # For IDEs
         self.cfg: FBcprModelConfig = cfg
-        # In split mode use z_body_dim for the discriminator; critic keeps full z.
-        disc_z_dim = cfg.archi.z_body_dim if cfg.archi.is_split_mode else cfg.archi.z_dim
+        # In split mode use z_body_dim for the discriminator (unless include_hand,
+        # which feeds it the full z again); critic always keeps full z.
+        if cfg.archi.is_split_mode:
+            disc_include_hand = bool(getattr(cfg.archi.discriminator, "include_hand", False))
+            disc_z_dim = cfg.archi.total_z_dim if disc_include_hand else cfg.archi.z_body_dim
+        else:
+            disc_z_dim = cfg.archi.z_dim
         self._discriminator = cfg.archi.discriminator.build(obs_space, disc_z_dim)
         self._critic = cfg.archi.critic.build(obs_space, cfg.archi.total_z_dim, action_dim, output_dim=1)
 

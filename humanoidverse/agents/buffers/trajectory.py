@@ -45,7 +45,11 @@ class TrajectoryDictBuffer:
         output_key_tp1: List[str] = ["observation"],
         end_key: Tuple[str] | str = "done",
         motion_id_key: Tuple[str] | str = "motion_id",
+        base_weights: List[float] | None = None,
     ) -> None:
+        """base_weights: optional per-episode sampling weight (e.g. to balance data
+        sources). It scales both the initial priorities and any later priorities set
+        via update_priorities, so source balancing survives prioritized re-weighting."""
         self._is_full = True
         self.output_key_t = output_key_t
         self.output_key_tp1 = output_key_tp1
@@ -95,7 +99,14 @@ class TrajectoryDictBuffer:
             done.squeeze()[: len(self)], at_capacity=self._is_full, cursor=None
         )
         # set priorities to match the number of trajectories
-        self.priorities = torch.ones(len(self.lengths), device=self.device, dtype=torch.float32) / len(self.lengths)
+        if base_weights is not None:
+            assert len(base_weights) == len(self.lengths), (
+                f"base_weights ({len(base_weights)}) must match number of trajectories ({len(self.lengths)})"
+            )
+            self.base_weights = torch.tensor(base_weights, device=self.device, dtype=torch.float32)
+        else:
+            self.base_weights = torch.ones(len(self.lengths), device=self.device, dtype=torch.float32)
+        self.priorities = self.base_weights / self.base_weights.sum()
         self._get_idxs = torch.compile(get_idxs, mode="reduce-overhead")
 
     def sample(self, batch_size: int = 1, seq_length: int | None = None):
@@ -133,9 +144,9 @@ class TrajectoryDictBuffer:
         return output
 
     def update_priorities(self, priorities: torch.Tensor, idxs: torch.Tensor) -> None:
-        """update priorities of trajectories"""
+        """update priorities of trajectories (scaled by per-source base_weights)"""
         assert len(priorities) == len(self.priorities)
-        self.priorities[idxs] = priorities
+        self.priorities[idxs] = priorities * self.base_weights[idxs]
         self.priorities = self.priorities / torch.sum(self.priorities)
 
     @property

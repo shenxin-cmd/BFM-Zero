@@ -42,13 +42,31 @@ class FBAgentTrainConfig(BaseConfig):
     rollout_expert_trajectories: bool = False
     rollout_expert_trajectories_length: int = 250
     rollout_expert_trajectories_percentage: float = 0.25
-    # Split-z hand MSE weights.
-    # fb_hand_mse_weight  : flat coefficient applied to hand MSE in the FB update.
-    #                       Both sub-space losses are O(1) at init, so 1.0 keeps them balanced.
-    # actor_hand_mse_weight: multiplied on top of Q_body.abs().mean() (adaptive base scale),
-    #                        making the hand gradient always commensurate with the body Q gradient.
+    # ------------------------------------------------------------------
+    # Split-z hand sub-space loss configuration.
+    #
+    # fb_hand_loss_mode:
+    #   "mse": F_hand regresses target_B_hand directly (one-step latent prediction;
+    #          the gamma->0 limit of the FB loss). Actor minimizes MSE(F_hand, z_hand).
+    #   "fb":  multi-timescale ablation - the hand keeps the bilinear FB loss
+    #          M_hand = F_hand · B_hand^T, but with its OWN small discount
+    #          fb_hand_discount (<< body discount). This preserves the
+    #          occupancy-measure semantics / zero-shot property of the hand
+    #          sub-space while concentrating it on short horizons for precision.
+    #          Actor maximizes Q_hand = F_hand · z_hand weighted by actor_hand_q_weight.
+    #
+    # fb_hand_mse_weight  : flat coefficient applied to the hand loss in the FB update
+    #                       (used in BOTH modes; both losses are O(1) at init).
+    # actor_hand_mse_weight: ("mse" mode) multiplied on top of Q_body.abs().mean()
+    #                        (adaptive base scale) so the hand gradient is always
+    #                        commensurate with the body Q gradient.
+    # actor_hand_q_weight : ("fb" mode) weight of -Q_hand.mean() in the actor loss.
+    # ------------------------------------------------------------------
+    fb_hand_loss_mode: Literal["mse", "fb"] = "mse"
+    fb_hand_discount: float = 0.7
     fb_hand_mse_weight: float = 1.0
     actor_hand_mse_weight: float = 1.0
+    actor_hand_q_weight: float = 1.0
 
 
 class FBAgentConfig(BaseConfig):
@@ -277,7 +295,11 @@ class FBAgent:
                     target_B_hand = target_B[:, z_body_dim:]        # direct MSE target for hand fb_loss
                     target_Ms_body = torch.matmul(target_Fs_body, target_B_body.T)
                     _, _, target_M_body = self.get_targets_uncertainty(target_Ms_body, self.cfg.train.fb_pessimism_penalty)
-                    # combined target_M for metrics only (hand M matrix no longer used in loss)
+                    if self.cfg.train.fb_hand_loss_mode == "fb":
+                        # multi-timescale mode: hand keeps the bilinear FB target
+                        target_Ms_hand = torch.matmul(target_Fs_hand, target_B_hand.T)
+                        _, _, target_M_hand = self.get_targets_uncertainty(target_Ms_hand, self.cfg.train.fb_pessimism_penalty)
+                    # combined target_M for metrics only
                     target_Ms_all = torch.matmul(target_Fs, target_B.T)
                     _, _, target_M = self.get_targets_uncertainty(target_Ms_all, self.cfg.train.fb_pessimism_penalty)
                 else:
@@ -299,12 +321,21 @@ class FBAgent:
                     Fs_body, B_body, discount, target_M_body
                 )
 
-                # Hand: per-head MSE regression — every parallel F_hand head → target_B_hand
-                # Both losses are O(1) at init; flat weight keeps them balanced.
-                fb_loss_hand = F.mse_loss(
-                    Fs_hand,
-                    target_B_hand.unsqueeze(0).expand_as(Fs_hand),
-                )
+                if self.cfg.train.fb_hand_loss_mode == "fb":
+                    # Hand: bilinear FB loss with its own (small) discount.
+                    # discount == cfg.discount * ~terminated, so rescaling by
+                    # fb_hand_discount / cfg.discount yields fb_hand_discount * ~terminated.
+                    discount_hand = discount * (self.cfg.train.fb_hand_discount / self.cfg.train.discount)
+                    fb_loss_hand, _, _, _ = self._fb_loss_single(
+                        Fs_hand, B_hand, discount_hand, target_M_hand
+                    )
+                else:
+                    # Hand: per-head MSE regression — every parallel F_hand head → target_B_hand
+                    # Both losses are O(1) at init; flat weight keeps them balanced.
+                    fb_loss_hand = F.mse_loss(
+                        Fs_hand,
+                        target_B_hand.unsqueeze(0).expand_as(Fs_hand),
+                    )
                 fb_loss = fb_loss_body + self.cfg.train.fb_hand_mse_weight * fb_loss_hand
 
                 # orthonormality losses (independent per sub-space; B_hand still needs diversity)
@@ -391,7 +422,8 @@ class FBAgent:
                     "B_hand_norm": torch.norm(B_hand, dim=-1).mean(),
                     # FB losses per sub-space
                     "fb_body_loss": fb_loss_body,
-                    "fb_hand_mse": fb_loss_hand,    # hand uses direct MSE regression (no bilinear)
+                    # hand loss: MSE regression ("mse" mode) or small-discount bilinear FB ("fb" mode)
+                    "fb_hand_mse": fb_loss_hand,
                     "fb_total_loss": fb_loss,
                     # Body FB diag/offdiag (hand M matrix no longer computed)
                     "fb_loss_offdiag": fb_offdiag,
@@ -434,17 +466,24 @@ class FBAgent:
                 Qs_body = (Fs[..., :z_body_dim] * z_body).sum(-1)  # num_parallel x batch
                 _, _, Q_body = self.get_targets_uncertainty(Qs_body, self.cfg.train.actor_pessimism_penalty)
 
-                # Hand: per-head MSE regression — every parallel F_hand head → z_hand
-                # Adaptive weight: scale hand term with |Q_body| so hand gradient is always
-                # commensurate with body gradient regardless of Q magnitude.
-                actor_loss_hand_mse = F.mse_loss(
-                    Fs[..., z_body_dim:],
-                    z_hand.unsqueeze(0).expand_as(Fs[..., z_body_dim:]),
-                )
-                hand_weight = Q_body.abs().mean().detach() * self.cfg.train.actor_hand_mse_weight
+                if self.cfg.train.fb_hand_loss_mode == "fb":
+                    # Hand: dot product Q on the short-horizon hand sub-space
+                    Qs_hand = (Fs[..., z_body_dim:] * z_hand).sum(-1)
+                    _, _, Q_hand = self.get_targets_uncertainty(Qs_hand, self.cfg.train.actor_pessimism_penalty)
+                    actor_loss_hand_mse = torch.zeros((), device=z.device, dtype=z.dtype)
+                    actor_loss = -Q_body.mean() - self.cfg.train.actor_hand_q_weight * Q_hand.mean()
+                else:
+                    # Hand: per-head MSE regression — every parallel F_hand head → z_hand
+                    # Adaptive weight: scale hand term with |Q_body| so hand gradient is always
+                    # commensurate with body gradient regardless of Q magnitude.
+                    actor_loss_hand_mse = F.mse_loss(
+                        Fs[..., z_body_dim:],
+                        z_hand.unsqueeze(0).expand_as(Fs[..., z_body_dim:]),
+                    )
+                    hand_weight = Q_body.abs().mean().detach() * self.cfg.train.actor_hand_mse_weight
 
-                # Maximize Q_body; minimize hand MSE (scaled to same magnitude as body term)
-                actor_loss = -Q_body.mean() + hand_weight * actor_loss_hand_mse
+                    # Maximize Q_body; minimize hand MSE (scaled to same magnitude as body term)
+                    actor_loss = -Q_body.mean() + hand_weight * actor_loss_hand_mse
             else:
                 Qs = (Fs * z).sum(-1)  # num_parallel x batch
                 _, _, Q = self.get_targets_uncertainty(Qs, self.cfg.train.actor_pessimism_penalty)
@@ -464,6 +503,8 @@ class FBAgent:
                 "q_body": Q_body.mean().detach(),
                 "actor_hand_mse": actor_loss_hand_mse.detach(),
             }
+            if self.cfg.train.fb_hand_loss_mode == "fb":
+                output_metrics["q_hand"] = Q_hand.mean().detach()
         else:
             output_metrics = {"actor_loss": actor_loss.detach(), "q": Q.mean().detach()}
         return output_metrics

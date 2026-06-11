@@ -1006,7 +1006,11 @@ class SplitActor(nn.Module):
 
 
 class SplitDiscriminatorArchiConfig(BaseConfig):
-    """Config for split Discriminator: only sees body observations and z_body."""
+    """Config for split Discriminator: only sees body observations and z_body.
+
+    Set include_hand=True (ablation) to feed it the FULL observation and FULL z
+    instead — i.e. the right arm is judged by the discriminator again.
+    """
 
     name: tp.Literal["SplitDiscriminatorArchi"] = "SplitDiscriminatorArchi"
     hidden_dim: int = 1024
@@ -1015,11 +1019,21 @@ class SplitDiscriminatorArchiConfig(BaseConfig):
     # Should be DictInputFilterConfig(key=["state", "privileged_state"]).
     input_filter: NNFilter = IdentityInputFilterConfig()
     z_body_dim: int = 225
+    include_hand: bool = False
     # Leave empty to use _G1_BODY_IDX_B (408 indices).
     body_obs_indices: list[int] = []
 
     def build(self, obs_space, z_dim: int) -> "SplitDiscriminator":
-        body_obs_indices = list(self.body_obs_indices) if self.body_obs_indices else _G1_BODY_IDX_B
+        outer_filter = self.input_filter.build(obs_space)
+
+        if self.include_hand:
+            # full observation + full z (z_dim passed by the model is total_z_dim)
+            total_obs_dim = outer_filter.output_space.shape[0]
+            body_obs_indices = list(range(total_obs_dim))
+            disc_z_dim = z_dim
+        else:
+            body_obs_indices = list(self.body_obs_indices) if self.body_obs_indices else _G1_BODY_IDX_B
+            disc_z_dim = self.z_body_dim
         body_obs_dim = len(body_obs_indices)
 
         inner_obs_space = gymnasium.spaces.Box(
@@ -1027,10 +1041,9 @@ class SplitDiscriminatorArchiConfig(BaseConfig):
             high=np.full(body_obs_dim, np.inf, dtype=np.float32),
         )
         inner_cfg = DiscriminatorArchiConfig(hidden_dim=self.hidden_dim, hidden_layers=self.hidden_layers)
-        inner_disc = inner_cfg.build(inner_obs_space, self.z_body_dim)
+        inner_disc = inner_cfg.build(inner_obs_space, disc_z_dim)
 
-        outer_filter = self.input_filter.build(obs_space)
-        return SplitDiscriminator(inner_disc, outer_filter, body_obs_indices, self.z_body_dim)
+        return SplitDiscriminator(inner_disc, outer_filter, body_obs_indices, disc_z_dim)
 
 
 class SplitDiscriminator(nn.Module):

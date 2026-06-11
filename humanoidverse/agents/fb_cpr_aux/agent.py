@@ -281,24 +281,34 @@ class FBcprAuxAgent(FBcprAgent):
                 Qs_fb_body = (Fs[..., :z_body_dim] * z_body).sum(-1)
                 _, _, Q_fb_body = self.get_targets_uncertainty(Qs_fb_body, self.cfg.train.actor_pessimism_penalty)
 
-                # Hand: per-head MSE regression — every parallel F_hand head → z_hand
-                actor_loss_hand_mse = F.mse_loss(
-                    Fs[..., z_body_dim:],
-                    z_hand.unsqueeze(0).expand_as(Fs[..., z_body_dim:]),
-                )
-                # Adaptive weight: makes hand gradient commensurate with body Q gradient
-                hand_weight = Q_fb_body.abs().mean().detach() * self.cfg.train.actor_hand_mse_weight
+                if self.cfg.train.fb_hand_loss_mode == "fb":
+                    # Hand: dot product Q on the short-horizon hand sub-space
+                    Qs_fb_hand = (Fs[..., z_body_dim:] * z_hand).sum(-1)
+                    _, _, Q_fb_hand = self.get_targets_uncertainty(Qs_fb_hand, self.cfg.train.actor_pessimism_penalty)
+                    actor_loss_hand_mse = torch.zeros((), device=z.device, dtype=z.dtype)
+                else:
+                    # Hand: per-head MSE regression — every parallel F_hand head → z_hand
+                    actor_loss_hand_mse = F.mse_loss(
+                        Fs[..., z_body_dim:],
+                        z_hand.unsqueeze(0).expand_as(Fs[..., z_body_dim:]),
+                    )
+                    # Adaptive weight: makes hand gradient commensurate with body Q gradient
+                    hand_weight = Q_fb_body.abs().mean().detach() * self.cfg.train.actor_hand_mse_weight
             else:
                 Qs_fb = (Fs * z).sum(-1)  # num_parallel x batch
                 _, _, Q_fb = self.get_targets_uncertainty(Qs_fb, self.cfg.train.actor_pessimism_penalty)
 
             if is_split:
                 weight = Q_fb_body.abs().mean().detach() if self.cfg.train.scale_reg else 1.0
+                if self.cfg.train.fb_hand_loss_mode == "fb":
+                    hand_term = -self.cfg.train.actor_hand_q_weight * Q_fb_hand.mean()
+                else:
+                    hand_term = hand_weight * actor_loss_hand_mse
                 actor_loss = (
                     -Q_discriminator.mean() * self.cfg.train.reg_coeff * weight
                     - Q_aux.mean() * self.cfg.train.reg_coeff_aux * weight
                     - Q_fb_body.mean()
-                    + hand_weight * actor_loss_hand_mse
+                    + hand_term
                 )
             else:
                 weight = Q_fb.abs().mean().detach() if self.cfg.train.scale_reg else 1.0
@@ -327,4 +337,6 @@ class FBcprAuxAgent(FBcprAgent):
                     "Q_fb_body": Q_fb_body.mean().detach(),
                     "actor_hand_mse": actor_loss_hand_mse.detach(),
                 })
+                if self.cfg.train.fb_hand_loss_mode == "fb":
+                    output_metrics["Q_fb_hand"] = Q_fb_hand.mean().detach()
         return output_metrics

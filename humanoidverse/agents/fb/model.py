@@ -185,9 +185,21 @@ class FBModel(BaseModel):
         z = self.backward_map(next_obs)
         return self.project_z(z)
 
-    def tracking_inference(self, next_obs: torch.Tensor | dict[str, torch.Tensor]) -> torch.Tensor:
+    def tracking_inference(
+        self, next_obs: torch.Tensor | dict[str, torch.Tensor], ema_alpha: float | None = None
+    ) -> torch.Tensor:
+        """Per-step z from B projections, smoothed by a forward-looking window mean.
+
+        ema_alpha: optional causal low-pass on top of the window mean,
+            z[t] <- alpha * z[t] + (1 - alpha) * z[t-1]   (alpha in (0, 1]).
+        Useful against z jumps when tracking out-of-distribution target
+        trajectories; alpha=1 or None keeps the original behaviour.
+        """
         z = self.backward_map(next_obs)
         for step in range(z.shape[0]):
             end_idx = min(step + self.cfg.seq_length, z.shape[0])
             z[step] = z[step:end_idx].mean(dim=0)
+        if ema_alpha is not None and ema_alpha < 1.0:
+            for step in range(1, z.shape[0]):
+                z[step] = ema_alpha * z[step] + (1.0 - ema_alpha) * z[step - 1]
         return self.project_z(z)

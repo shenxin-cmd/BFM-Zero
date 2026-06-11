@@ -74,6 +74,10 @@ class TrainConfig(BaseConfig):
     agent: Agent = pydantic.Field(discriminator="name")
     motions: str | None = None
     motions_root: str | None = None
+    # Per-data-source sampling weights for the expert buffer, matched by motion-key
+    # prefix (e.g. {"bones_": 4.0, "shape_": 2.0, "": 4.0}; "" catches the rest, i.e.
+    # the original lafan keys). None = uniform per-trajectory sampling.
+    expert_source_weights: Dict[str, float] | None = None
 
     env: HumanoidVerseIsaacConfig = pydantic.Field(discriminator="name")
 
@@ -261,7 +265,12 @@ class Workspace:
     def train_online(self) -> None:
         if self.training_with_expert_data:
             if self.cfg.load_isaac_expert_data:
-                expert_buffer = load_expert_trajectories_from_motion_lib(self.train_env._env, self.cfg.agent, device=self.cfg.buffer_device)
+                expert_buffer = load_expert_trajectories_from_motion_lib(
+                    self.train_env._env,
+                    self.cfg.agent,
+                    device=self.cfg.buffer_device,
+                    source_weights=self.cfg.expert_source_weights,
+                )
             else:
                 print("Loading expert trajectories")
                 expert_buffer = load_expert_trajectories(
@@ -725,24 +734,47 @@ def train_bfm_zero():
     workspace.train()
 
 
-def train_bfm_zero_split_z():
+def train_bfm_zero_split_z(
+    z_body_dim: int = 256,
+    z_hand_dim: int = 48,
+    lafan_tail_path: str = 'humanoidverse/data/lafan_29dof_10s-clipped.pkl',
+    balance_expert_sources: bool = True,
+    disc_include_hand: bool = False,
+    fb_hand_loss_mode: tp.Literal['mse', 'fb'] = 'mse',
+    fb_hand_discount: float = 0.7,
+    work_dir: str | None = None,
+):
     """
     BFM-Zero training with structured latent space decoupling (split z).
 
     z is split into:
-      - z_body (225 dims): controls all body joints except right arm
-      - z_hand (36 dims):  controls right arm (7 joints, indices 22-28)
-    Total z_dim = 261.
+      - z_body (default 256 dims): controls all body joints except right arm
+      - z_hand (default 48 dims):  controls right arm (7 joints, indices 22-28)
 
     Key architecture changes vs train_bfm_zero():
       - B network  : SplitBackwardMap  (hand/body independent MLPs)
       - F network  : SplitForwardMap   (shared trunk + hand/body heads, num_parallel=2)
       - Actor      : SplitActor        (shared trunk + hand/body policy heads)
-      - Discriminator: SplitDiscriminator (body observations + z_body only)
-      - Critic / AuxCritic: unchanged  (use full z = 261 dims)
+      - Discriminator: SplitDiscriminator (body observations + z_body only; set
+        disc_include_hand=True to feed it the full observation + full z instead)
+      - Critic / AuxCritic: unchanged  (use full z = z_body + z_hand dims)
 
-    To start a fresh run, set work_dir to a new path (or leave unset for auto timestamp).
-    To resume, keep work_dir pointing to an existing checkpoint directory.
+    Args:
+      z_body_dim / z_hand_dim: latent sub-space sizes. The historical run used
+        225/36; defaults were raised to 256/48 for the enlarged dataset
+        (~2400 motions vs the original 862 lafan clips).
+      lafan_tail_path: training pkl; point this to the merged dataset produced by
+        scripts/data_preprocess/merge_datasets.py to include the new data.
+      balance_expert_sources: weight expert-buffer trajectory sampling per data
+        source (lafan:bones:shape = 4:4:2, matched by key prefix) so no single
+        source dominates z_expert / discriminator batches.
+      fb_hand_loss_mode: 'mse' (current default: F_hand regresses B_hand/z_hand
+        directly) or 'fb' (multi-timescale ablation: hand keeps the bilinear FB
+        loss but with its own small discount fb_hand_discount).
+      fb_hand_discount: hand-sub-space discount used when fb_hand_loss_mode='fb'.
+
+    To start a fresh run, leave work_dir unset for an auto timestamped path.
+    To resume, set work_dir to an existing checkpoint directory.
     """
     from humanoidverse.agents.fb_cpr_aux.model import FBcprAuxModelArchiConfig, FBcprAuxModelConfig
     from humanoidverse.agents.fb_cpr_aux.agent import FBcprAuxAgentTrainConfig
@@ -767,8 +799,10 @@ def train_bfm_zero_split_z():
                 archi=FBcprAuxModelArchiConfig(
                     name='FBcprAuxModelArchiConfig',
                     # --- Split z configuration ---
-                    z_body_dim=225,
-                    z_hand_dim=36,
+                    # NOTE: z_body_dim / z_hand_dim must be mirrored into every Split*
+                    # sub-config below (they keep their own copies of the dims).
+                    z_body_dim=z_body_dim,
+                    z_hand_dim=z_hand_dim,
                     norm_z=True,
                     # B network: decoupled hand / body branches
                     b=SplitBackwardArchiConfig(
@@ -780,7 +814,9 @@ def train_bfm_zero_split_z():
                             name='DictInputFilterConfig',
                             key=['state', 'privileged_state'],
                         ),
-                        # z_body_dim / z_hand_dim / hand_obs_indices default to G1 29-DOF values
+                        z_body_dim=z_body_dim,
+                        z_hand_dim=z_hand_dim,
+                        # hand_obs_indices defaults to the G1 29-DOF values
                     ),
                     # F network: shared trunk (928-dim input) + hand / body heads
                     f=SplitForwardArchiConfig(
@@ -792,6 +828,8 @@ def train_bfm_zero_split_z():
                             name='DictInputFilterConfig',
                             key=['state', 'privileged_state', 'last_action', 'history_actor'],
                         ),
+                        z_body_dim=z_body_dim,
+                        z_hand_dim=z_hand_dim,
                     ),
                     # Actor: shared trunk (465-dim input) + hand / body policy heads
                     actor=SplitActorArchiConfig(
@@ -802,6 +840,8 @@ def train_bfm_zero_split_z():
                             name='DictInputFilterConfig',
                             key=['state', 'last_action', 'history_actor'],
                         ),
+                        z_body_dim=z_body_dim,
+                        z_hand_dim=z_hand_dim,
                     ),
                     # Critic: NOT split – uses full z (261 dims) for value estimation
                     critic=ForwardArchiConfig(
@@ -817,7 +857,8 @@ def train_bfm_zero_split_z():
                             key=['state', 'privileged_state', 'last_action', 'history_actor'],
                         ),
                     ),
-                    # Discriminator: body-only observations + z_body
+                    # Discriminator: body-only observations + z_body by default;
+                    # include_hand=True feeds it the full observation + full z (ablation)
                     discriminator=SplitDiscriminatorArchiConfig(
                         name='SplitDiscriminatorArchi',
                         hidden_dim=1024,
@@ -826,6 +867,8 @@ def train_bfm_zero_split_z():
                             name='DictInputFilterConfig',
                             key=['state', 'privileged_state'],
                         ),
+                        z_body_dim=z_body_dim,
+                        include_hand=disc_include_hand,
                     ),
                     # Aux critic: NOT split – uses full z (261 dims)
                     aux_critic=ForwardArchiConfig(
@@ -880,6 +923,8 @@ def train_bfm_zero_split_z():
                 rollout_expert_trajectories=True,
                 rollout_expert_trajectories_length=250,
                 rollout_expert_trajectories_percentage=0.5,
+                fb_hand_loss_mode=fb_hand_loss_mode,
+                fb_hand_discount=fb_hand_discount,
                 lr_discriminator=1e-05,
                 lr_critic=0.0003,
                 critic_target_tau=0.005,
@@ -901,10 +946,13 @@ def train_bfm_zero_split_z():
         ),
         motions='',
         motions_root='',
+        # Expert-buffer per-source sampling weights, matched by motion-key prefix.
+        # "" matches everything not caught by a longer prefix (i.e. lafan keys).
+        expert_source_weights={'': 4.0, 'bones_': 4.0, 'shape_': 2.0} if balance_expert_sources else None,
         env=HumanoidVerseIsaacConfig(
             name='humanoidverse_isaac',
             device='cuda:0',
-            lafan_tail_path='humanoidverse/data/lafan_29dof_10s-clipped.pkl',
+            lafan_tail_path=lafan_tail_path,
             enable_cameras=False,
             camera_render_save_dir='isaac_videos',
             max_episode_length_s=None,
@@ -922,10 +970,9 @@ def train_bfm_zero_split_z():
             root_height_obs=True,
         ),
         # Each new run should use a unique work_dir to avoid overwriting previous checkpoints.
-        # Option A (recommended): remove work_dir to auto-generate a timestamped path, e.g.:
-        #   workdir/g1mujoco_train/20260506-153042-AbcXyz/
-        # Option B: set an explicit unique path, e.g. 'results/bfmzero-split-z-run1'
-        work_dir=get_local_workdir('bfmzero-split-z'),
+        # Default (work_dir=None): auto-generate a timestamped path.
+        # To resume: pass an explicit existing path, e.g. 'results/bfmzero-split-z-run1'
+        work_dir=work_dir if work_dir is not None else get_local_workdir('bfmzero-split-z'),
         seed=4728,
         online_parallel_envs=1024,
         log_every_updates=384000,
@@ -971,7 +1018,13 @@ if __name__ == "__main__":
     # launch your experiments from Python code (e.g., see under "scripts")
     #
     # train_bfm_zero()          ← original baseline (z_dim=256, no split)
-    # train_bfm_zero_split_z()  ← split-z experiment (z_body=225, z_hand=36)
-    train_bfm_zero_split_z()
+    # train_bfm_zero_split_z()  ← split-z experiment (defaults: z_body=256, z_hand=48)
+    #
+    # Examples:
+    #   uv run -m humanoidverse.train  # defaults
+    #   uv run -m humanoidverse.train --lafan-tail-path humanoidverse/data/combined_29dof_mixed.pkl
+    #   uv run -m humanoidverse.train --fb-hand-loss-mode fb --fb-hand-discount 0.7  # γ-separation ablation
+    #   uv run -m humanoidverse.train --disc-include-hand  # discriminator sees right arm again
+    tyro.cli(train_bfm_zero_split_z)
 
 # uv run --no-cache -m humanoidverse.meta_online_entry_point
