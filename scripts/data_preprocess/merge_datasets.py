@@ -31,7 +31,7 @@ from pathlib import Path
 import joblib
 import numpy as np
 
-from g1_kinematics import load_g1_skeleton
+from g1_kinematics import load_g1_skeleton, resolve_g1_mjcf_path
 
 LIMIT_TOL = 0.05  # rad
 
@@ -96,11 +96,14 @@ def main() -> None:
     parser.add_argument(
         "--mjcf",
         type=Path,
-        default=Path(__file__).resolve().parents[2] / "humanoidverse/data/robot/g1/g1_29dof.xml",
+        default=None,
+        help="G1 MJCF (default: auto-detect data/robot/g1 or data/robots/g1 under repo root)",
     )
     args = parser.parse_args()
 
-    skel = load_g1_skeleton(args.mjcf)
+    mjcf = args.mjcf or resolve_g1_mjcf_path()
+    print(f"Using MJCF: {mjcf}")
+    skel = load_g1_skeleton(mjcf)
 
     sources = {
         "lafan": args.lafan_pkl,

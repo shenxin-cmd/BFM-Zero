@@ -41,6 +41,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation as sRot
 
 from g1_kinematics import (
+    resolve_g1_mjcf_path,
     G1_DEFAULT_JOINT_POS,
     build_pose_aa,
     fk_body_positions,
@@ -151,12 +152,15 @@ def main() -> None:
     parser.add_argument(
         "--mjcf",
         type=Path,
-        default=Path(__file__).resolve().parents[2] / "humanoidverse/data/robot/g1/g1_29dof.xml",
+        default=None,
+        help="G1 MJCF (default: auto-detect data/robot/g1 or data/robots/g1 under repo root)",
     )
     parser.add_argument("--report-json", type=Path, default=None)
     args = parser.parse_args()
 
-    skel = load_g1_skeleton(args.mjcf)
+    mjcf = args.mjcf or resolve_g1_mjcf_path()
+    print(f"Using MJCF: {mjcf}")
+    skel = load_g1_skeleton(mjcf)
     rng = random.Random(args.seed)
 
     selected: list[tuple[str, Path]] = []

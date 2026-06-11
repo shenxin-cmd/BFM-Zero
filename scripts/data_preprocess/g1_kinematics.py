@@ -54,6 +54,29 @@ RIGHT_ARM_DOF_IDX = list(range(22, 29))
 LEFT_FOOT_BODY = "left_ankle_roll_link"
 RIGHT_FOOT_BODY = "right_ankle_roll_link"
 
+# Repo layouts differ: some checkouts use data/robot/, others data/robots/.
+_G1_MJCF_CANDIDATES = (
+    "humanoidverse/data/robot/g1/g1_29dof.xml",
+    "humanoidverse/data/robots/g1/g1_29dof.xml",
+    "humanoidverse/data/robots/g1/g1_29dof_mujoco.xml",
+)
+
+
+def resolve_g1_mjcf_path(repo_root: str | Path | None = None) -> Path:
+    """Return the first existing G1 MJCF under *repo_root* (BFM-Zero root)."""
+    root = Path(repo_root) if repo_root is not None else Path(__file__).resolve().parents[2]
+    tried: list[Path] = []
+    for rel in _G1_MJCF_CANDIDATES:
+        p = root / rel
+        tried.append(p)
+        if p.is_file():
+            return p
+    raise FileNotFoundError(
+        "G1 MJCF not found. Tried:\n  "
+        + "\n  ".join(str(p) for p in tried)
+        + "\nPass --mjcf /path/to/g1_29dof.xml explicitly."
+    )
+
 
 @dataclass
 class G1Skeleton:

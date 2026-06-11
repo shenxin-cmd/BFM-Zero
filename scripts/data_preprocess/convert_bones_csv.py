@@ -33,6 +33,7 @@ import numpy as np
 import pandas as pd
 
 from g1_kinematics import (
+    resolve_g1_mjcf_path,
     G1_DOF_NAMES,
     build_pose_aa,
     euler_xyz_extrinsic_deg_to_rotvec,
@@ -109,13 +110,16 @@ def main() -> None:
     parser.add_argument(
         "--mjcf",
         type=Path,
-        default=Path(__file__).resolve().parents[2] / "humanoidverse/data/robot/g1/g1_29dof.xml",
+        default=None,
+        help="G1 MJCF (default: auto-detect data/robot/g1 or data/robots/g1 under repo root)",
     )
     parser.add_argument("--report-json", type=Path, default=None,
                         help="default: <output-pkl>.report.json")
     args = parser.parse_args()
 
-    skel = load_g1_skeleton(args.mjcf)
+    mjcf = args.mjcf or resolve_g1_mjcf_path()
+    print(f"Using MJCF: {mjcf}")
+    skel = load_g1_skeleton(mjcf)
     csv_files = sorted(args.input_dir.glob("*.csv"))
     if not csv_files:
         raise FileNotFoundError(f"no .csv found in {args.input_dir}")

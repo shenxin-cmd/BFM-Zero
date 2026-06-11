@@ -14,7 +14,7 @@
 
 速度、body 位姿等全部由 motion_lib 运行时 FK + `np.gradient` 重算，**不需要**预存。
 
-`scripts/data_preprocess/g1_kinematics.py` 按 `torch_humanoid_batch.py` 的逻辑解析 `g1_29dof.xml`（深度优先 body 树、29 个 hinge 轴），并提供 numpy FK 用于离线验证/地面对齐。脚本启动时会断言 MJCF 关节顺序与 `G1_DOF_NAMES`（即训练 yaml 的 `dof_names`）一致，顺序错位会直接报错而不是产出错误数据。
+`scripts/data_preprocess/g1_kinematics.py` 按 `torch_humanoid_batch.py` 的逻辑解析 `g1_29dof.xml`（深度优先 body 树、29 个 hinge 轴），并提供 numpy FK 用于离线验证/地面对齐。MJCF 默认自动在 `humanoidverse/data/robot/g1/` 与 `humanoidverse/data/robots/g1/` 下查找（不同 checkout 目录名可能不同）；找不到时用 `--mjcf` 显式指定。
 
 ---
 
