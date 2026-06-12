@@ -107,9 +107,15 @@ python scripts/data_preprocess/merge_datasets.py \
     --shape-pkl humanoidverse/data/shape_v2_29dof_clips.pkl \
     --output-pkl humanoidverse/data/combined_29dof_mixed.pkl
 
-# 4) 训练环境内终验（需要 torch + 仓库依赖）
+# 4) 训练环境内终验（需要 torch + 仓库依赖；大 pkl 默认分批 FK，避免 OOM）
 python scripts/data_preprocess/verify_with_motion_lib.py \
-    --pkl humanoidverse/data/combined_29dof_mixed.pkl
+    --pkl humanoidverse/data/combined_29dof_mixed.pkl \
+    --device cpu \
+    --load-batch-size 200
+
+# 快速冒烟（只验前 100 条）：
+# python scripts/data_preprocess/verify_with_motion_lib.py \
+#     --pkl humanoidverse/data/combined_29dof_mixed.pkl --max-motions 100
 ```
 
 每步都会输出 `.report.json` / `.manifest.json`，请重点核对：
