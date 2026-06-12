@@ -41,20 +41,28 @@
 
 输出 key 命名：`bones_{csv文件名}_seg{i}`。
 
-## 2. data1 画形状 NPZ（`convert_shape_npz.py`）
+## 2. data2 画形状 NPZ — V2 连续 IK（`convert_shape_npz_v2.py`，**推荐**）
 
-输入：`data1/{batch_data, batch_data_xy, batch_data_xz}/clips_obs/**/*_obs.npz`，已是 30 fps × 300 帧。
+**请用 data2 替代 data1。** data1（`convert_shape_npz.py`）因旧版 IK 存在大量右臂解支跳变，已弃用于训练。
 
-1. **分层抽样**：每个 batch 目录抽 `--per-batch`（默认 250）条，在 shape 子目录间均匀分配，`--seed 0` 固定可复现，共约 750 条（避免手画轨迹在合并数据集中占比过大）。
-2. **转换**（直接用原始 MuJoCo 量，**不用** npz 里的 obs）：
+输入：`data2/{batch_data_xy_v2, batch_data_xz_v2, batch_data_yz_v2}/clips_obs/{shape}/{plane}/*_obs.npz`  
+详见 `new_data/data2/BATCH_DATA_V2_README.md`（30 fps × 300 帧，固定/连续 swivel IK + 质量筛选）。
+
+1. **抽样**（默认与 data1 相同，控制三源比例）：
+   - 每个平面 batch 目录分层抽 `--per-batch`（默认 250）条，在 10 种 shape 间均匀分配 → 约 **750** 条；
+   - 或 `--use-all` 转换全部 `clips_obs`（约 **3000** 条，V2 已通过生成端筛选）。
+2. **转换**（与 data1 相同，直接用 `qpos`，不用 `privileged_state`）：
    - `root_trans_offset = qpos[:, 0:3]`；
-   - `pose_aa[:,0] = rotvec(qpos[:, 3:7])`（wxyz 四元数）；
+   - `pose_aa[:,0] = rotvec(qpos[:, 3:7])`；
    - `pose_aa[:,1:30] = qpos[:, 7:36] × axis`。
-   - 不使用 `privileged_state`：其有限差分速度被错误缩放约 33 倍（BATCH_DATA_README §5.4）；motion_lib 会从 FK 重新差分出正确速度。
-3. **背靠背验证**（每条都做）：从 `qpos/qvel` 重建 `state` 的 `dof_pos / dof_vel / proj_grav` 与 npz 内置 `state` 对比，容差 1e-3。该检查能捕获数据生成模型（`scene_g1_draggable.xml`）与训练模型（`g1_29dof.xml`）之间任何关节顺序 / 坐标约定不一致。`ang_vel` 的参考系在源文档中描述有歧义（`rot.apply` vs `rot.inv().apply`），脚本对三种候选变换分别计算误差并报告最优者，不作为失败条件（转换本身不依赖 ang_vel）。
-4. 不做地面对齐（qpos 来自合法 MuJoCo 位形），但 report 中记录 FK 最低脚高供人工核查。
+3. **背靠背验证**：重建 `state` 的 `dof_pos / dof_vel / proj_grav`，容差 1e-3，`n_state_check_failed` 必须为 0。
+4. **右臂连续性报告**（V2 新增）：统计相邻帧右臂 7 关节最大 `|Δq|`，超过 `--jump-threshold`（默认 0.12 rad/帧，与生成端 `FilterThresholds` 一致）的 clip 写入 `jump_flagged`。V2 数据应接近 0 条 flagged。
 
-输出 key 命名：`shape_{bd|bd_xy|bd_xz}_{原文件名}`。
+输出 key 命名：`shape_{bd_xy|bd_xz|bd_yz}_{原文件名}`（仍匹配训练里 `shape_` 前缀的源权重）。
+
+## 2b. data1 画形状 NPZ（`convert_shape_npz.py`，**已弃用**）
+
+旧版 `data1/{batch_data, batch_data_xy, batch_data_xz}/clips_obs/**/*_obs.npz`。因 IK 解支跳变问题，**请勿再用于合并训练集**；脚本保留仅供对照或复现旧实验。
 
 ## 3. 合并（`merge_datasets.py`）
 
@@ -81,16 +89,22 @@ python scripts/data_preprocess/convert_bones_csv.py \
     --input-dir /path/to/new_data/selected_one_per_type \
     --output-pkl humanoidverse/data/bones_29dof_clips.pkl
 
-# 2) data1 NPZ -> pkl
-python scripts/data_preprocess/convert_shape_npz.py \
-    --data1-dir /path/to/new_data/data1 \
-    --output-pkl humanoidverse/data/shape_29dof_clips.pkl
+# 2) data2 NPZ -> pkl  （替代 data1）
+python scripts/data_preprocess/convert_shape_npz_v2.py \
+    --data2-dir /path/to/new_data/data2 \
+    --output-pkl humanoidverse/data/shape_v2_29dof_clips.pkl
+
+# 可选：使用全部 ~3000 条 V2 clip（不再分层抽样）
+# python scripts/data_preprocess/convert_shape_npz_v2.py \
+#     --data2-dir /path/to/new_data/data2 \
+#     --output-pkl humanoidverse/data/shape_v2_29dof_clips.pkl \
+#     --use-all
 
 # 3) 合并
 python scripts/data_preprocess/merge_datasets.py \
     --lafan-pkl humanoidverse/data/lafan_29dof_10s-clipped.pkl \
     --bones-pkl humanoidverse/data/bones_29dof_clips.pkl \
-    --shape-pkl humanoidverse/data/shape_29dof_clips.pkl \
+    --shape-pkl humanoidverse/data/shape_v2_29dof_clips.pkl \
     --output-pkl humanoidverse/data/combined_29dof_mixed.pkl
 
 # 4) 训练环境内终验（需要 torch + 仓库依赖）
@@ -101,7 +115,7 @@ python scripts/data_preprocess/verify_with_motion_lib.py \
 每步都会输出 `.report.json` / `.manifest.json`，请重点核对：
 
 - `convert_bones_csv` report：`mean_ground_z_shift_m`（典型应在 ±0.1 m 内；普遍很大说明 root 坐标约定理解有误）、`over_limit_ratio`（普遍偏高说明重定向质量差或单位错误）；
-- `convert_shape_npz` report：`n_state_check_failed` 必须为 0；`min_foot_z_m` 应接近 0；
+- `convert_shape_npz_v2` report：`n_state_check_failed` 必须为 0；`n_jump_flagged` 应接近 0（V2 连续 IK）；`continuity_max_arm_delta.p99` 应 ≤ 0.12 rad；
 - `verify_with_motion_lib`：必须 PASS。
 
 ## 已知影响与配套调整（详见训练代码改动）

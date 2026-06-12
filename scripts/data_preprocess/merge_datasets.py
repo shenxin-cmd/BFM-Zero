@@ -2,7 +2,7 @@
 
 Input  : - humanoidverse/data/lafan_29dof_10s-clipped.pkl   (original, keys unchanged)
          - bones pkl from convert_bones_csv.py              (keys prefixed 'bones_')
-         - shape pkl from convert_shape_npz.py              (keys prefixed 'shape_')
+         - shape pkl from convert_shape_npz_v2.py (or legacy convert_shape_npz.py)
 Output : a single joblib dict pkl with all motions + a manifest json.
 
 Validation performed on every motion:
@@ -16,7 +16,7 @@ Run (server):
     python scripts/data_preprocess/merge_datasets.py \
         --lafan-pkl humanoidverse/data/lafan_29dof_10s-clipped.pkl \
         --bones-pkl humanoidverse/data/bones_29dof_clips.pkl \
-        --shape-pkl humanoidverse/data/shape_29dof_clips.pkl \
+        --shape-pkl humanoidverse/data/shape_v2_29dof_clips.pkl \
         --output-pkl humanoidverse/data/combined_29dof_mixed.pkl
 
 Requires: numpy, joblib (no torch).
