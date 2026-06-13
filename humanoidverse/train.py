@@ -742,6 +742,7 @@ def train_bfm_zero_split_z(
     disc_include_hand: bool = False,
     fb_hand_loss_mode: tp.Literal['mse', 'fb'] = 'mse',
     fb_hand_discount: float = 0.7,
+    split_network_variant: tp.Literal['simple', 'residual'] = 'simple',
     work_dir: str | None = None,
 ):
     """
@@ -754,8 +755,8 @@ def train_bfm_zero_split_z(
 
     Key architecture changes vs train_bfm_zero():
       - B network  : SplitBackwardMap  (hand/body independent MLPs)
-      - F network  : SplitForwardMap   (shared trunk + hand/body heads, num_parallel=2)
-      - Actor      : SplitActor        (shared trunk + hand/body policy heads)
+      - F network  : SplitForwardMap   (simple split heads or residual split branches, num_parallel=2)
+      - Actor      : SplitActor        (simple split heads or residual split branches)
       - Discriminator: SplitDiscriminator (body observations + z_body only; set
         disc_include_hand=True to feed it the full observation + full z instead)
       - Critic / AuxCritic: unchanged  (use full z = z_body + z_hand dims)
@@ -781,6 +782,10 @@ def train_bfm_zero_split_z(
         directly) or 'fb' (multi-timescale ablation: hand keeps the bilinear FB
         loss but with its own small discount fb_hand_discount).
       fb_hand_discount: hand-sub-space discount used when fb_hand_loss_mode='fb'.
+      split_network_variant: 'simple' keeps the lightweight split F/Actor used by
+        the main experiment; 'residual' swaps only split F/Actor to residual
+        sub-space branches mirroring the original BFM0 ResidualForwardMap /
+        ResidualActor while keeping B, Disc, critic, data, and losses fixed.
 
     To start a fresh run, leave work_dir unset for an auto timestamped path.
     To resume, set work_dir to an existing checkpoint directory.
@@ -827,11 +832,15 @@ def train_bfm_zero_split_z(
                         z_hand_dim=z_hand_dim,
                         # hand_obs_indices defaults to the G1 29-DOF values
                     ),
-                    # F network: shared trunk (928-dim input) + hand / body heads
+                    # F network: simple split heads by default; residual variant mirrors
+                    # ResidualForwardMap separately for body/hand sub-spaces.
                     f=SplitForwardArchiConfig(
                         name='SplitForwardArchi',
+                        model=split_network_variant,
                         hidden_dim=2048,
                         trunk_hidden_dim=256,
+                        hidden_layers=6,
+                        embedding_layers=2,
                         num_parallel=2,
                         input_filter=DictInputFilterConfig(
                             name='DictInputFilterConfig',
@@ -840,11 +849,15 @@ def train_bfm_zero_split_z(
                         z_body_dim=z_body_dim,
                         z_hand_dim=z_hand_dim,
                     ),
-                    # Actor: shared trunk (465-dim input) + hand / body policy heads
+                    # Actor: simple split heads by default; residual variant mirrors
+                    # ResidualActor separately for body/hand sub-spaces.
                     actor=SplitActorArchiConfig(
                         name='SplitActorArchi',
+                        model=split_network_variant,
                         hidden_dim=2048,
                         trunk_hidden_dim=256,
+                        hidden_layers=6,
+                        embedding_layers=2,
                         input_filter=DictInputFilterConfig(
                             name='DictInputFilterConfig',
                             key=['state', 'last_action', 'history_actor'],
@@ -852,7 +865,7 @@ def train_bfm_zero_split_z(
                         z_body_dim=z_body_dim,
                         z_hand_dim=z_hand_dim,
                     ),
-                    # Critic: NOT split – uses full z (261 dims) for value estimation
+                    # Critic: NOT split – uses full z (z_body + z_hand) for value estimation
                     critic=ForwardArchiConfig(
                         name='ForwardArchi',
                         hidden_dim=2048,
@@ -879,7 +892,7 @@ def train_bfm_zero_split_z(
                         z_body_dim=z_body_dim,
                         include_hand=disc_include_hand,
                     ),
-                    # Aux critic: NOT split – uses full z (261 dims)
+                    # Aux critic: NOT split – uses full z (z_body + z_hand)
                     aux_critic=ForwardArchiConfig(
                         name='ForwardArchi',
                         hidden_dim=2048,

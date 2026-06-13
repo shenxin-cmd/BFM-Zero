@@ -836,11 +836,20 @@ class SplitBackwardMap(nn.Module):
 
 
 class SplitForwardArchiConfig(BaseConfig):
-    """Config for the split F-network: shared trunk + hand head + body head."""
+    """Config for the split F-network.
+
+    model="simple" keeps the original lightweight split implementation.
+    model="residual" mirrors ResidualForwardMap per sub-space:
+      embed(full_obs + z_sub), embed(full_obs + action_sub), concatenate,
+      then residual blocks -> F_sub.
+    """
 
     name: tp.Literal["SplitForwardArchi"] = "SplitForwardArchi"
+    model: tp.Literal["simple", "residual"] = "simple"
     hidden_dim: int = 1024
     trunk_hidden_dim: int = 256
+    hidden_layers: int = 6
+    embedding_layers: int = 2
     num_parallel: int = 2
     input_filter: NNFilter = IdentityInputFilterConfig()
     z_body_dim: int = 324  # 18² — historical: 225 (original), 256 (interim)
@@ -872,22 +881,39 @@ class _SingleSplitForwardMap(nn.Module):
         self.z_hand_dim = cfg.z_hand_dim
         self.hand_action_dim = cfg.hand_action_dim
         self.body_action_dim = action_dim - cfg.hand_action_dim
+        self.model = cfg.model
 
-        trunk_dim = cfg.trunk_hidden_dim
         h = cfg.hidden_dim
 
-        self.trunk = nn.Sequential(
-            nn.Linear(obs_dim, h), nn.LayerNorm(h), nn.Tanh(),
-            nn.Linear(h, trunk_dim), nn.ReLU(),
-        )
-        self.hand_head = nn.Sequential(
-            nn.Linear(trunk_dim + cfg.hand_action_dim + cfg.z_hand_dim, h), nn.ReLU(),
-            nn.Linear(h, cfg.z_hand_dim),
-        )
-        self.body_head = nn.Sequential(
-            nn.Linear(trunk_dim + self.body_action_dim + cfg.z_body_dim, h), nn.ReLU(),
-            nn.Linear(h, cfg.z_body_dim),
-        )
+        if cfg.model == "simple":
+            trunk_dim = cfg.trunk_hidden_dim
+            self.trunk = nn.Sequential(
+                nn.Linear(obs_dim, h), nn.LayerNorm(h), nn.Tanh(),
+                nn.Linear(h, trunk_dim), nn.ReLU(),
+            )
+            self.hand_head = nn.Sequential(
+                nn.Linear(trunk_dim + cfg.hand_action_dim + cfg.z_hand_dim, h), nn.ReLU(),
+                nn.Linear(h, cfg.z_hand_dim),
+            )
+            self.body_head = nn.Sequential(
+                nn.Linear(trunk_dim + self.body_action_dim + cfg.z_body_dim, h), nn.ReLU(),
+                nn.Linear(h, cfg.z_body_dim),
+            )
+        elif cfg.model == "residual":
+            self.hand_embed_z = residual_embedding(obs_dim + cfg.z_hand_dim, h, cfg.hidden_layers)
+            self.hand_embed_sa = residual_embedding(obs_dim + cfg.hand_action_dim, h, cfg.hidden_layers)
+            self.body_embed_z = residual_embedding(obs_dim + cfg.z_body_dim, h, cfg.hidden_layers)
+            self.body_embed_sa = residual_embedding(obs_dim + self.body_action_dim, h, cfg.hidden_layers)
+            self.hand_head = nn.Sequential(
+                *[ResidualBlock(h) for _ in range(cfg.hidden_layers)],
+                Block(h, cfg.z_hand_dim, False),
+            )
+            self.body_head = nn.Sequential(
+                *[ResidualBlock(h) for _ in range(cfg.hidden_layers)],
+                Block(h, cfg.z_body_dim, False),
+            )
+        else:
+            raise ValueError(f"Unsupported split forward model {cfg.model}")
 
     def forward(
         self,
@@ -896,15 +922,23 @@ class _SingleSplitForwardMap(nn.Module):
         action: torch.Tensor,
     ) -> torch.Tensor:
         x = self.input_filter(obs)
-        e_ctx = self.trunk(x)
 
         z_body = z[:, : self.z_body_dim]
         z_hand = z[:, self.z_body_dim :]
         a_body = action[:, : self.body_action_dim]
         a_hand = action[:, -self.hand_action_dim :]
 
-        f_body = self.body_head(torch.cat([e_ctx, a_body, z_body], dim=-1))
-        f_hand = self.hand_head(torch.cat([e_ctx, a_hand, z_hand], dim=-1))
+        if self.model == "simple":
+            e_ctx = self.trunk(x)
+            f_body = self.body_head(torch.cat([e_ctx, a_body, z_body], dim=-1))
+            f_hand = self.hand_head(torch.cat([e_ctx, a_hand, z_hand], dim=-1))
+        else:
+            body_z_embedding = self.body_embed_z(torch.cat([x, z_body], dim=-1))
+            body_sa_embedding = self.body_embed_sa(torch.cat([x, a_body], dim=-1))
+            hand_z_embedding = self.hand_embed_z(torch.cat([x, z_hand], dim=-1))
+            hand_sa_embedding = self.hand_embed_sa(torch.cat([x, a_hand], dim=-1))
+            f_body = self.body_head(torch.cat([body_sa_embedding, body_z_embedding], dim=-1))
+            f_hand = self.hand_head(torch.cat([hand_sa_embedding, hand_z_embedding], dim=-1))
         return torch.cat([f_body, f_hand], dim=-1)
 
 
@@ -933,11 +967,20 @@ class SplitForwardMap(nn.Module):
 
 
 class SplitActorArchiConfig(BaseConfig):
-    """Config for the split Actor: shared trunk + hand policy + body policy."""
+    """Config for the split Actor.
+
+    model="simple" keeps the original lightweight split implementation.
+    model="residual" mirrors ResidualActor per sub-space:
+      embed(full_obs + z_sub), embed(full_obs), concatenate,
+      then residual blocks -> action_sub.
+    """
 
     name: tp.Literal["SplitActorArchi"] = "SplitActorArchi"
+    model: tp.Literal["simple", "residual"] = "simple"
     hidden_dim: int = 1024
     trunk_hidden_dim: int = 256
+    hidden_layers: int = 6
+    embedding_layers: int = 2
     input_filter: NNFilter = IdentityInputFilterConfig()
     z_body_dim: int = 324  # 18² — historical: 225 (original), 256 (interim)
     z_hand_dim: int = 64   # 8²  — historical: 36  (original), 48  (interim)
@@ -948,7 +991,7 @@ class SplitActorArchiConfig(BaseConfig):
 
 
 class SplitActor(nn.Module):
-    """Split Actor: shared trunk extracts context, then separate policies for hand / body.
+    """Split Actor: separate body/hand policies conditioned on split z.
 
     Output action layout: [mu_body (body_action_dim), mu_hand (hand_action_dim)]
     — matches dof_names order where right arm is last.
@@ -968,22 +1011,39 @@ class SplitActor(nn.Module):
         self.z_hand_dim = cfg.z_hand_dim
         self.hand_action_dim = cfg.hand_action_dim
         self.body_action_dim = action_dim - cfg.hand_action_dim
+        self.model = cfg.model
 
-        trunk_dim = cfg.trunk_hidden_dim
         h = cfg.hidden_dim
 
-        self.trunk = nn.Sequential(
-            nn.Linear(obs_dim, h), nn.LayerNorm(h), nn.Tanh(),
-            nn.Linear(h, trunk_dim), nn.ReLU(),
-        )
-        self.hand_policy = nn.Sequential(
-            nn.Linear(trunk_dim + cfg.z_hand_dim, h), nn.ReLU(),
-            nn.Linear(h, cfg.hand_action_dim),
-        )
-        self.body_policy = nn.Sequential(
-            nn.Linear(trunk_dim + cfg.z_body_dim, h), nn.ReLU(),
-            nn.Linear(h, self.body_action_dim),
-        )
+        if cfg.model == "simple":
+            trunk_dim = cfg.trunk_hidden_dim
+            self.trunk = nn.Sequential(
+                nn.Linear(obs_dim, h), nn.LayerNorm(h), nn.Tanh(),
+                nn.Linear(h, trunk_dim), nn.ReLU(),
+            )
+            self.hand_policy = nn.Sequential(
+                nn.Linear(trunk_dim + cfg.z_hand_dim, h), nn.ReLU(),
+                nn.Linear(h, cfg.hand_action_dim),
+            )
+            self.body_policy = nn.Sequential(
+                nn.Linear(trunk_dim + cfg.z_body_dim, h), nn.ReLU(),
+                nn.Linear(h, self.body_action_dim),
+            )
+        elif cfg.model == "residual":
+            self.hand_embed_z = residual_embedding(obs_dim + cfg.z_hand_dim, h, cfg.embedding_layers)
+            self.hand_embed_s = residual_embedding(obs_dim, h, cfg.embedding_layers)
+            self.body_embed_z = residual_embedding(obs_dim + cfg.z_body_dim, h, cfg.embedding_layers)
+            self.body_embed_s = residual_embedding(obs_dim, h, cfg.embedding_layers)
+            self.hand_policy = nn.Sequential(
+                *[ResidualBlock(h) for _ in range(cfg.hidden_layers)],
+                Block(h, cfg.hand_action_dim, False),
+            )
+            self.body_policy = nn.Sequential(
+                *[ResidualBlock(h) for _ in range(cfg.hidden_layers)],
+                Block(h, self.body_action_dim, False),
+            )
+        else:
+            raise ValueError(f"Unsupported split actor model {cfg.model}")
 
     def forward(
         self,
@@ -992,13 +1052,21 @@ class SplitActor(nn.Module):
         std: float,
     ) -> "TruncatedNormal":
         x = self.input_filter(obs)
-        e_ctx = self.trunk(x)
 
         z_body = z[:, : self.z_body_dim]
         z_hand = z[:, self.z_body_dim :]
 
-        mu_body = self.body_policy(torch.cat([e_ctx, z_body], dim=-1))
-        mu_hand = self.hand_policy(torch.cat([e_ctx, z_hand], dim=-1))
+        if self.model == "simple":
+            e_ctx = self.trunk(x)
+            mu_body = self.body_policy(torch.cat([e_ctx, z_body], dim=-1))
+            mu_hand = self.hand_policy(torch.cat([e_ctx, z_hand], dim=-1))
+        else:
+            body_z_embedding = self.body_embed_z(torch.cat([x, z_body], dim=-1))
+            body_s_embedding = self.body_embed_s(x)
+            hand_z_embedding = self.hand_embed_z(torch.cat([x, z_hand], dim=-1))
+            hand_s_embedding = self.hand_embed_s(x)
+            mu_body = self.body_policy(torch.cat([body_s_embedding, body_z_embedding], dim=-1))
+            mu_hand = self.hand_policy(torch.cat([hand_s_embedding, hand_z_embedding], dim=-1))
         mu = torch.tanh(torch.cat([mu_body, mu_hand], dim=-1))  # 29 dims: body first, hand last
 
         std_tensor = torch.ones_like(mu) * std
