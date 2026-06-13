@@ -139,7 +139,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--data-dir", type=Path, default=None, help="data1 root (scans *_obs.npz / raw npz)")
     parser.add_argument("--z-dir", type=Path, default=None, help="dir containing zs_*.pkl from tracking inference")
-    parser.add_argument("--z-body-dim", type=int, default=256, help="z_body dim of the checkpoint (225 for old runs)")
+    parser.add_argument("--z-body-dim", type=int, default=324, help="z_body dim of the checkpoint (225 original, 256 interim, 324 main-exp)")
     parser.add_argument("--report-json", type=Path, default=None)
     args = parser.parse_args()
 

@@ -735,10 +735,10 @@ def train_bfm_zero():
 
 
 def train_bfm_zero_split_z(
-    z_body_dim: int = 256,
-    z_hand_dim: int = 48,
+    z_body_dim: int = 324,
+    z_hand_dim: int = 64,
     lafan_tail_path: str = 'humanoidverse/data/lafan_29dof_10s-clipped.pkl',
-    balance_expert_sources: bool = True,
+    balance_expert_sources: bool = False,
     disc_include_hand: bool = False,
     fb_hand_loss_mode: tp.Literal['mse', 'fb'] = 'mse',
     fb_hand_discount: float = 0.7,
@@ -748,8 +748,9 @@ def train_bfm_zero_split_z(
     BFM-Zero training with structured latent space decoupling (split z).
 
     z is split into:
-      - z_body (default 256 dims): controls all body joints except right arm
-      - z_hand (default 48 dims):  controls right arm (7 joints, indices 22-28)
+      - z_body (default 324 = 18² dims): controls all body joints except right arm
+      - z_hand (default 64 = 8² dims):   controls right arm (7 joints, indices 22-28)
+      - total_z_dim = 388
 
     Key architecture changes vs train_bfm_zero():
       - B network  : SplitBackwardMap  (hand/body independent MLPs)
@@ -760,14 +761,22 @@ def train_bfm_zero_split_z(
       - Critic / AuxCritic: unchanged  (use full z = z_body + z_hand dims)
 
     Args:
-      z_body_dim / z_hand_dim: latent sub-space sizes. The historical run used
-        225/36; defaults were raised to 256/48 for the enlarged dataset
-        (~2400 motions vs the original 862 lafan clips).
+      z_body_dim / z_hand_dim: latent sub-space sizes. Historical values: 225/36
+        (original split-z run); interim values: 256/48. Current default 324/64
+        (18²/8²) selected for the main experiment with ~1879-motion merged dataset
+        (lafan 862 + bones 987 + shape 30). Square values are convenient for
+        sqrt-based normalisation analysis.
       lafan_tail_path: training pkl; point this to the merged dataset produced by
         scripts/data_preprocess/merge_datasets.py to include the new data.
-      balance_expert_sources: weight expert-buffer trajectory sampling per data
-        source (lafan:bones:shape = 4:4:2, matched by key prefix) so no single
-        source dominates z_expert / discriminator batches.
+        Main experiment default: humanoidverse/data/combined_29dof_1879.pkl
+        (lafan 862 + bones 987 + shape 30 clips, three planes × 10 each).
+      balance_expert_sources: when True, apply per-source sampling weights
+        (lafan:bones:shape = 4:4:2 by key prefix) to the expert buffer. Default
+        is now False because the merged dataset uses only 30 shape clips (~1.6%
+        of total), so uniform per-trajectory sampling is appropriate and avoids
+        inflating the small shape source. Set True (or pass custom
+        expert_source_weights) only when shape clips are numerous enough to
+        require down-weighting.
       fb_hand_loss_mode: 'mse' (current default: F_hand regresses B_hand/z_hand
         directly) or 'fb' (multi-timescale ablation: hand keeps the bilinear FB
         loss but with its own small discount fb_hand_discount).

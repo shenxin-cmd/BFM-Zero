@@ -776,8 +776,8 @@ class SplitBackwardArchiConfig(BaseConfig):
     hidden_layers: int = 2
     norm: bool = True
     input_filter: NNFilter = IdentityInputFilterConfig()
-    z_body_dim: int = 225
-    z_hand_dim: int = 36
+    z_body_dim: int = 324  # 18² — historical: 225 (original), 256 (interim)
+    z_hand_dim: int = 64   # 8²  — historical: 36  (original), 48  (interim)
     # Observation indices in the concatenated [state, privstate] vector.
     # Leave empty to use the G1 29-DOF defaults (_G1_HAND_IDX_B / _G1_BODY_IDX_B).
     hand_obs_indices: list[int] = []
@@ -843,8 +843,8 @@ class SplitForwardArchiConfig(BaseConfig):
     trunk_hidden_dim: int = 256
     num_parallel: int = 2
     input_filter: NNFilter = IdentityInputFilterConfig()
-    z_body_dim: int = 225
-    z_hand_dim: int = 36
+    z_body_dim: int = 324  # 18² — historical: 225 (original), 256 (interim)
+    z_hand_dim: int = 64   # 8²  — historical: 36  (original), 48  (interim)
     hand_action_dim: int = 7  # right arm: last 7 action dims
 
     def build(self, obs_space, z_dim: int, action_dim: int, output_dim=None) -> "SplitForwardMap":
@@ -939,8 +939,8 @@ class SplitActorArchiConfig(BaseConfig):
     hidden_dim: int = 1024
     trunk_hidden_dim: int = 256
     input_filter: NNFilter = IdentityInputFilterConfig()
-    z_body_dim: int = 225
-    z_hand_dim: int = 36
+    z_body_dim: int = 324  # 18² — historical: 225 (original), 256 (interim)
+    z_hand_dim: int = 64   # 8²  — historical: 36  (original), 48  (interim)
     hand_action_dim: int = 7  # right arm: last 7 action dims
 
     def build(self, obs_space, z_dim: int, action_dim: int) -> "SplitActor":
@@ -1018,7 +1018,7 @@ class SplitDiscriminatorArchiConfig(BaseConfig):
     # Outer filter: converts obs dict → flat tensor (e.g. 527-dim [state, privstate]).
     # Should be DictInputFilterConfig(key=["state", "privileged_state"]).
     input_filter: NNFilter = IdentityInputFilterConfig()
-    z_body_dim: int = 225
+    z_body_dim: int = 324  # 18² — historical: 225 (original), 256 (interim)
     include_hand: bool = False
     # Leave empty to use _G1_BODY_IDX_B (408 indices).
     body_obs_indices: list[int] = []
