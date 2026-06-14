@@ -127,9 +127,9 @@ def run_split_z_smoke_test(device="cpu"):
     # Dimensions matching the split-z design
     obs_dim = 64
     action_dim = 29
-    z_body_dim = 225
-    z_hand_dim = 36
-    z_dim = z_body_dim + z_hand_dim       # 261
+    z_body_dim = 324  # 18² — matches main experiment default
+    z_hand_dim = 64   # 8²  — matches main experiment default
+    z_dim = z_body_dim + z_hand_dim       # 388
     batch = 64
     num_parallel = 2
 

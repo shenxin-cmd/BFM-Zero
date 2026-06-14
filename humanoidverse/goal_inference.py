@@ -117,6 +117,11 @@ def main(model_folder: Path, data_path: Path | None = None, headless: bool = Tru
     with open(os.path.join(path, "goal_reaching.pkl"), "wb") as f:
         joblib.dump(z_dict, f)
 
+    try:
+        _z_body_dim: int = model.cfg.archi.z_body_dim
+    except AttributeError:
+        _z_body_dim = model.cfg.archi.total_z_dim
+
     if save_mp4:
         rgb_renderer = IsaacRendererWithMuJoco(render_size=256)
 
@@ -132,20 +137,103 @@ def main(model_folder: Path, data_path: Path | None = None, headless: bool = Tru
     goal_idx = -1
     goal_names = list(z_dict.keys())
 
+    _action_dim = wrapped_env.action_space.shape[-1]
+    sim_dev = wrapped_env._env.device
+    _last_act_buf = torch.zeros((num_envs, _action_dim), dtype=torch.float32, device=sim_dev)
+    # per-goal z_actual segments: goal_name → list of [segment_len, z_dim] arrays
+    _goal_z_actual: dict[str, list[np.ndarray]] = {}
+    _cur_goal_name: str | None = None
+    _cur_goal_seg: list[np.ndarray] = []
+
     while counter < episode_len:
         if counter % 100 == 0:
+            # flush previous goal's segment
+            if _cur_goal_name is not None and _cur_goal_seg:
+                _goal_z_actual.setdefault(_cur_goal_name, []).append(np.stack(_cur_goal_seg))
+                _cur_goal_seg = []
             goal_idx = (goal_idx + 1) % len(goal_names)
-            print(f"Switching to goal {goal_names[goal_idx]} at step {counter}")
-            z = z_dict[goal_names[goal_idx]].copy()
+            _cur_goal_name = goal_names[goal_idx]
+            print(f"Switching to goal {_cur_goal_name} at step {counter}")
+            z = z_dict[_cur_goal_name].copy()
             z = torch.tensor(z, device=model.device, dtype=torch.float32)
 
+        # --- collect z_actual at current robot state (before acting) ---
+        _bmap_obs = {
+            "state": observation["state"],
+            "privileged_state": observation["privileged_state"],
+            "last_action": observation.get("last_action", _last_act_buf),
+        }
+        with torch.no_grad():
+            _z_now = model.project_z(model.backward_map(_bmap_obs))[0].detach().cpu().numpy()
+        _cur_goal_seg.append(_z_now)
+        # ---
+
         action = model.act(observation, z.repeat(num_envs, 1), mean=True)
+        _last_act_buf = action.detach()
         observation, reward, terminated, truncated, info = wrapped_env.step(action, to_numpy=False)
         if save_mp4:
             frames.append(rgb_renderer.render(wrapped_env._env, 0)[0])
         counter += 1
         _pbar.update(1)
     _pbar.close()
+
+    # flush the last segment
+    if _cur_goal_name is not None and _cur_goal_seg:
+        _goal_z_actual.setdefault(_cur_goal_name, []).append(np.stack(_cur_goal_seg))
+
+    # --- compute per-goal z metrics and save ---
+    _goal_metrics: dict[str, dict] = {}
+    _goal_z_actual_flat: dict[str, np.ndarray] = {}
+    for _gname, _segs in _goal_z_actual.items():
+        _z_act_all = np.concatenate(_segs, axis=0)             # [total_steps, z_dim]
+        _goal_z_actual_flat[_gname] = _z_act_all
+        _z_goal = z_dict[_gname]                                # [z_dim]
+
+        # z_hand jump rate in actual sequence
+        _z_hand_act = _z_act_all[:, _z_body_dim:]
+        if _z_hand_act.shape[1] > 0 and len(_z_hand_act) > 1:
+            _dz = np.diff(_z_hand_act, axis=0)
+            _scale = np.sqrt(max(1, _z_hand_act.shape[1]))
+            _spike_rate = float(np.mean(np.linalg.norm(_dz, axis=1) / _scale > 0.5))
+        else:
+            _spike_rate = 0.0
+
+        # z_hand drift from goal z
+        _z_hand_goal = _z_goal[_z_body_dim:]
+        _hand_drift = (
+            float(np.mean(np.linalg.norm(_z_hand_act - _z_hand_goal[None], axis=-1)))
+            if _z_hand_act.shape[1] > 0 else 0.0
+        )
+        # full z drift from goal z
+        _full_drift = float(np.mean(np.linalg.norm(_z_act_all - _z_goal[None], axis=-1)))
+
+        _goal_metrics[_gname] = {
+            "n_steps":               int(len(_z_act_all)),
+            "z_hand_spike_rate":     _spike_rate,
+            "z_hand_drift_from_goal": _hand_drift,
+            "z_full_drift_from_goal": _full_drift,
+            "z_body_dim":            int(_z_body_dim),
+            "z_hand_dim":            int(_z_act_all.shape[1] - _z_body_dim),
+        }
+
+    print("\n=== Goal Inference Z Metrics ===")
+    for _gname, _m in _goal_metrics.items():
+        print(f"  [{_gname}]  spike_rate={_m['z_hand_spike_rate']:.4f}  "
+              f"hand_drift={_m['z_hand_drift_from_goal']:.4f}  "
+              f"full_drift={_m['z_full_drift_from_goal']:.4f}")
+
+    _analysis = {
+        "z_goal":     {k: v for k, v in z_dict.items()},   # goal z per goal name
+        "z_actual":   _goal_z_actual_flat,                  # actual z sequence per goal
+        "metrics":    _goal_metrics,
+    }
+    joblib.dump(_analysis, path / "goal_z_analysis.pkl")
+    print(f"Saved goal z analysis → {path}/goal_z_analysis.pkl")
+    with open(path / "goal_z_metrics.json", "w", encoding="utf-8") as _f:
+        json.dump(_goal_metrics, _f, indent=2)
+    print(f"Saved goal z metrics  → {path}/goal_z_metrics.json")
+    # ---
+
     if save_mp4:
         media.write_video(video_folder / "goal.mp4", frames, fps=50)
         print("Saved video for goal")

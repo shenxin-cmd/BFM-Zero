@@ -54,6 +54,114 @@ else:
 
 _BACKWARD_KEYS = ("state", "last_action", "privileged_state")
 
+# ---------- inference metric helpers ----------
+
+# DOF slices (G1 29-DOF)
+_BODY_DOF_SLICE = slice(0, 22)   # 22 non-right-arm joints
+_HAND_DOF_SLICE = slice(22, 29)  # 7 right-arm joints
+
+
+def _wrist_local_pos_slice(config: dict) -> slice:
+    """Right wrist (right_wrist_yaw_link) local position slice in privileged_state.
+
+    G1 29-DOF body ordering: body index 29 = right_wrist_yaw_link.
+    After removing root from local_body_pos, body 29 is at offset (29-1)*3 = 84.
+    If root_height_obs=True, privstate starts with root_height (1 dim), shifting by +1.
+    """
+    rho = bool(config["env"].get("root_height_obs", False))
+    start = 85 if rho else 84
+    return slice(start, start + 3)
+
+
+def _compute_z_actual(model, observation: dict, last_action_buf: "torch.Tensor") -> np.ndarray:
+    """Re-encode current robot observation through backward_map → project_z."""
+    bmap_obs = {
+        "state": observation["state"],
+        "privileged_state": observation["privileged_state"],
+        "last_action": observation.get("last_action", last_action_buf),
+    }
+    z_raw = model.backward_map(bmap_obs)
+    return model.project_z(z_raw)[0].detach().cpu().numpy()
+
+
+def _save_inference_metrics(
+    output_dir: Path,
+    stem: str,
+    n_steps: int,
+    joint_pos_arr: np.ndarray,
+    z_actual_arr: np.ndarray,
+    ee_pred_arr: np.ndarray,
+    ref_dof_arr: np.ndarray,
+    ref_ee_arr: np.ndarray,
+    z_expert_arr: np.ndarray,
+    z_body_dim: int,
+) -> None:
+    """Compute all inference metrics, print them, and save to pkl + json."""
+    n_cmp = min(n_steps, ref_dof_arr.shape[0] - 1, len(z_actual_arr))
+
+    # joint_pos: [n_steps+1, 29]; compare after-step states [1:n_cmp+1] vs ref [1:n_cmp+1]
+    jp_pred = joint_pos_arr[1 : n_cmp + 1]
+    jp_ref   = ref_dof_arr[1 : n_cmp + 1]
+    # z and EE: both collected before-acting [0:n_cmp]
+    z_act  = z_actual_arr[:n_cmp]
+    z_exp  = z_expert_arr[:n_cmp]
+    ee_pred = ee_pred_arr[:n_cmp]
+    ee_ref  = ref_ee_arr[:n_cmp]
+
+    # ---- DOF errors ----
+    all_dof_err  = np.linalg.norm(jp_pred - jp_ref,                                axis=-1)
+    body_dof_err = np.linalg.norm(jp_pred[:, _BODY_DOF_SLICE] - jp_ref[:, _BODY_DOF_SLICE], axis=-1)
+    hand_dof_err = np.linalg.norm(jp_pred[:, _HAND_DOF_SLICE] - jp_ref[:, _HAND_DOF_SLICE], axis=-1)
+
+    # ---- EE local (heading-frame) error ----
+    hand_ee_err = np.linalg.norm(ee_pred - ee_ref, axis=-1)   # metres
+
+    # ---- z_hand jump rate (in z_actual) ----
+    z_hand_act = z_act[:, z_body_dim:]
+    if z_hand_act.shape[1] > 0 and len(z_hand_act) > 1:
+        dz_h       = np.diff(z_hand_act, axis=0)
+        hand_scale = np.sqrt(max(1, z_hand_act.shape[1]))
+        spike_rate = float(np.mean(np.linalg.norm(dz_h, axis=1) / hand_scale > 0.5))
+    else:
+        spike_rate = 0.0
+
+    metrics = {
+        "n_frames":               int(n_cmp),
+        "all_dof_error_norm":     float(np.mean(all_dof_err)),
+        "body_dof_error_norm":    float(np.mean(body_dof_err)),
+        "hand_dof_error_norm":    float(np.mean(hand_dof_err)),
+        "hand_ee_local_err_m":    float(np.mean(hand_ee_err)),
+        "hand_ee_local_err_mm":   float(np.mean(hand_ee_err) * 1000),
+        "z_hand_spike_rate":      spike_rate,
+        "z_body_dim":             int(z_body_dim),
+        "z_hand_dim":             int(z_act.shape[1] - z_body_dim),
+    }
+
+    print(f"\n=== Inference Metrics ({stem}) ===")
+    for k, v in metrics.items():
+        print(f"  {k}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
+
+    analysis = {
+        "metrics":        metrics,
+        "z_expert":       z_exp,       # [n_cmp, z_dim]  smoothed expert z
+        "z_actual":       z_act,       # [n_cmp, z_dim]  robot's online z encoding
+        "joint_pos_pred": jp_pred,     # [n_cmp, 29]
+        "joint_pos_ref":  jp_ref,      # [n_cmp, 29]
+        "ee_local_pred":  ee_pred,     # [n_cmp, 3]  heading-frame right wrist pos (actual)
+        "ee_local_ref":   ee_ref,      # [n_cmp, 3]  heading-frame right wrist pos (ref)
+    }
+    analysis_path = output_dir / f"analysis_{stem}.pkl"
+    joblib.dump(analysis, analysis_path)
+    print(f"Saved analysis data → {analysis_path}")
+
+    metrics_path = output_dir / f"metrics_{stem}.json"
+    with open(metrics_path, "w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2)
+    print(f"Saved metrics      → {metrics_path}")
+
+
+# ---------- end metric helpers ----------
+
 
 def _normalize_traj_key(name: str) -> str:
     k = name.strip().lower().replace(" ", "_")
@@ -301,6 +409,12 @@ def main(
     with open(model_folder / "config.json", "r", encoding="utf-8") as f:
         config = json.load(f)
 
+    _wrist_slice = _wrist_local_pos_slice(config)
+    try:
+        _z_body_dim: int = model.cfg.archi.z_body_dim
+    except AttributeError:
+        _z_body_dim = model.cfg.archi.total_z_dim  # no hand split
+
     if data_path is not None:
         config["env"]["lafan_tail_path"] = str(Path(data_path).resolve())
     elif not Path(config["env"].get("lafan_tail_path", "")).exists():
@@ -412,6 +526,10 @@ def main(
     print(f"Rollout steps: {n_steps} (z={Tz}, traj_T={traj_T})")
 
     joint_pos = [wrapped_env._env.simulator.dof_state[..., 0].clone().cpu().numpy()]
+    _z_actual_list:    list[np.ndarray] = []
+    _ee_local_pred_list: list[np.ndarray] = []
+    _action_dim = wrapped_env.action_space.shape[-1]
+    _last_act_buf = torch.zeros((num_envs, _action_dim), dtype=torch.float32, device=sim_dev)
 
     if save_mp4:
         rgb_renderer = IsaacRendererWithMuJoco(render_size=256)
@@ -420,13 +538,37 @@ def main(
 
     for i in range(n_steps):
         print(f"Step {i + 1}/{n_steps}")
+        # --- collect metrics at current robot state (before acting) ---
+        with torch.no_grad():
+            _z_actual_list.append(_compute_z_actual(model, observation, _last_act_buf))
+        _ee_local_pred_list.append(
+            observation["privileged_state"][0, _wrist_slice].detach().cpu().numpy()
+        )
+        # ---
         action = model.act(observation, z[i % len(z)].unsqueeze(0).expand(num_envs, -1), mean=True)
+        _last_act_buf = action.detach()
         observation, _r, _t, _trunc, _info = wrapped_env.step(action, to_numpy=False)
         joint_pos.append(wrapped_env._env.simulator.dof_state[..., 0].clone().cpu().numpy())
         if save_mp4:
             frames.append(rgb_renderer.render(wrapped_env._env, 0)[0])
 
-    np.stack(joint_pos, axis=0).squeeze(1)
+    # --- compute and save all inference metrics ---
+    _default_dof = wrapped_env._env.default_dof_pos[0].cpu().numpy()          # [29]
+    _ref_dof_arr = traj_np["state"][:, :29] + _default_dof                    # [T, 29]
+    _ref_ee_arr  = traj_np["privileged_state"][:, _wrist_slice].astype(np.float32)  # [T, 3]
+    _save_inference_metrics(
+        output_dir       = output_dir,
+        stem             = last_stem,
+        n_steps          = n_steps,
+        joint_pos_arr    = np.stack(joint_pos, axis=0).squeeze(1),
+        z_actual_arr     = np.stack(_z_actual_list),
+        ee_pred_arr      = np.stack(_ee_local_pred_list),
+        ref_dof_arr      = _ref_dof_arr,
+        ref_ee_arr       = _ref_ee_arr,
+        z_expert_arr     = z.detach().cpu().numpy(),
+        z_body_dim       = _z_body_dim,
+    )
+    # ---
 
     if save_mp4:
         new_frames = [np.concatenate([a, b], axis=1) for a, b in zip(expert_video, frames)]

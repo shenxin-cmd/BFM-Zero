@@ -21,6 +21,21 @@ if getattr(humanoidverse, "__file__", None) is not None:
 else:
     HUMANOIDVERSE_DIR = Path(__file__).resolve().parent
 
+# ---------- inference metric helpers ----------
+_BODY_DOF_SLICE = slice(0, 22)
+_HAND_DOF_SLICE = slice(22, 29)
+
+
+def _wrist_local_pos_slice(use_root_height_obs: bool) -> slice:
+    """Right wrist (right_wrist_yaw_link) local pos in privileged_state.
+
+    G1 29-DOF: body index 29 → local_body_pos[(29-1)*3] = 84.
+    +1 offset when root_height_obs=True (root_height occupies privstate[0]).
+    """
+    start = 85 if use_root_height_obs else 84
+    return slice(start, start + 3)
+# ---------- end metric helpers ----------
+
 
 def main(model_folder: Path, data_path: Path | None = None, headless: bool = True, device="cuda", simulator: str = "isaacsim", save_mp4: bool=False, disable_dr: bool = False, disable_obs_noise: bool = False, motion_list: list[int] = [25]):
     # motion_list: motion ids to evaluate (default [25])
@@ -135,6 +150,16 @@ def main(model_folder: Path, data_path: Path | None = None, headless: bool = Tru
     qpos, qvel = wrapped_env._get_qpos_qvel(to_numpy=True)
     assert np.allclose(wrapped_env._env.simulator.dof_pos.clone().cpu(), expert_qpos[0,7:])
     joint_pos = [wrapped_env._env.simulator.dof_state[..., 0].clone().cpu().numpy()]
+    _wrist_slice = _wrist_local_pos_slice(use_root_height_obs)
+    try:
+        _z_body_dim: int = model.cfg.archi.z_body_dim
+    except AttributeError:
+        _z_body_dim = model.cfg.archi.total_z_dim
+    _action_dim = wrapped_env.action_space.shape[-1]
+    sim_dev = wrapped_env._env.device
+    _last_act_buf = torch.zeros((num_envs, _action_dim), dtype=torch.float32, device=sim_dev)
+    _z_actual_list:    list[np.ndarray] = []
+    _ee_local_pred_list: list[np.ndarray] = []
 
     # Visualization length: match inference length so expert and policy videos align
     episode_len = z.shape[0]
@@ -149,15 +174,91 @@ def main(model_folder: Path, data_path: Path | None = None, headless: bool = Tru
     print(f"Running tracking inference for {episode_len} steps")
     for i in range(episode_len):
         print(f"Step {i} of {episode_len}")
+        # --- collect metrics at current robot state (before acting) ---
+        _bmap_obs = {
+            "state": observation["state"],
+            "privileged_state": observation["privileged_state"],
+            "last_action": observation.get("last_action", _last_act_buf),
+        }
+        with torch.no_grad():
+            _z_raw = model.backward_map(_bmap_obs)
+            _z_now = model.project_z(_z_raw)
+        _z_actual_list.append(_z_now[0].detach().cpu().numpy())
+        _ee_local_pred_list.append(
+            observation["privileged_state"][0, _wrist_slice].detach().cpu().numpy()
+        )
+        # ---
         action = model.act(observation, z[i % len(z)].repeat(num_envs, 1), mean=True)
+        _last_act_buf = action.detach()
         observation, reward, terminated, truncated, info = wrapped_env.step(action, to_numpy=False)
         joint_pos.append(wrapped_env._env.simulator.dof_state[..., 0].clone().cpu().numpy())
         if save_mp4:
             frames.append(rgb_renderer.render(wrapped_env._env, 0)[0])
 
-    joint_pos = np.stack(joint_pos, axis=0).squeeze(1)
-    stats = {}
-    
+    # --- compute and save all inference metrics ---
+    _joint_pos_arr = np.stack(joint_pos, axis=0).squeeze(1)     # [episode_len+1, 29]
+    _z_actual_arr  = np.stack(_z_actual_list)                    # [episode_len, z_dim]
+    _ee_pred_arr   = np.stack(_ee_local_pred_list)               # [episode_len, 3]
+
+    _ref_dof_arr = obs_dict["dof_pos"].cpu().numpy()             # [T, 29]  absolute DOF from motion lib
+    _ref_ee_arr  = obs["privileged_state"][:, _wrist_slice].cpu().numpy() if isinstance(
+        obs["privileged_state"], torch.Tensor
+    ) else obs["privileged_state"][:, _wrist_slice].astype(np.float32)  # [T, 3]
+
+    _n_cmp = min(episode_len, _ref_dof_arr.shape[0] - 1, len(_z_actual_arr))
+    _jp_pred = _joint_pos_arr[1 : _n_cmp + 1]
+    _jp_ref   = _ref_dof_arr[1 : _n_cmp + 1]
+    _z_act   = _z_actual_arr[:_n_cmp]
+    _z_exp   = z.detach().cpu().numpy()[:_n_cmp]
+    _ee_pred = _ee_pred_arr[:_n_cmp]
+    _ee_ref  = _ref_ee_arr[:_n_cmp]
+
+    _all_dof_err  = np.linalg.norm(_jp_pred - _jp_ref,                                   axis=-1)
+    _body_dof_err = np.linalg.norm(_jp_pred[:, _BODY_DOF_SLICE] - _jp_ref[:, _BODY_DOF_SLICE], axis=-1)
+    _hand_dof_err = np.linalg.norm(_jp_pred[:, _HAND_DOF_SLICE] - _jp_ref[:, _HAND_DOF_SLICE], axis=-1)
+    _hand_ee_err  = np.linalg.norm(_ee_pred - _ee_ref, axis=-1)
+
+    _z_hand_act = _z_act[:, _z_body_dim:]
+    if _z_hand_act.shape[1] > 0 and len(_z_hand_act) > 1:
+        _dz_h       = np.diff(_z_hand_act, axis=0)
+        _hand_scale = np.sqrt(max(1, _z_hand_act.shape[1]))
+        _spike_rate = float(np.mean(np.linalg.norm(_dz_h, axis=1) / _hand_scale > 0.5))
+    else:
+        _spike_rate = 0.0
+
+    _metrics = {
+        "motion_id":              int(MOTION_ID),
+        "n_frames":               int(_n_cmp),
+        "all_dof_error_norm":     float(np.mean(_all_dof_err)),
+        "body_dof_error_norm":    float(np.mean(_body_dof_err)),
+        "hand_dof_error_norm":    float(np.mean(_hand_dof_err)),
+        "hand_ee_local_err_m":    float(np.mean(_hand_ee_err)),
+        "hand_ee_local_err_mm":   float(np.mean(_hand_ee_err) * 1000),
+        "z_hand_spike_rate":      _spike_rate,
+        "z_body_dim":             int(_z_body_dim),
+        "z_hand_dim":             int(_z_act.shape[1] - _z_body_dim),
+    }
+    print(f"\n=== Inference Metrics (motion {MOTION_ID}) ===")
+    for _k, _v in _metrics.items():
+        print(f"  {_k}: {_v:.4f}" if isinstance(_v, float) else f"  {_k}: {_v}")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _analysis = {
+        "metrics":        _metrics,
+        "z_expert":       _z_exp,
+        "z_actual":       _z_act,
+        "joint_pos_pred": _jp_pred,
+        "joint_pos_ref":  _jp_ref,
+        "ee_local_pred":  _ee_pred,
+        "ee_local_ref":   _ee_ref,
+    }
+    joblib.dump(_analysis, output_dir / f"analysis_{MOTION_ID}.pkl")
+    print(f"Saved analysis → {output_dir}/analysis_{MOTION_ID}.pkl")
+    with open(output_dir / f"metrics_{MOTION_ID}.json", "w", encoding="utf-8") as _f:
+        json.dump(_metrics, _f, indent=2)
+    print(f"Saved metrics  → {output_dir}/metrics_{MOTION_ID}.json")
+    # ---
+
     # breakpoint()  # use PYTHONBREAKPOINT=0 to disable, or install ipdb for a nicer debugger
 
     if save_mp4:

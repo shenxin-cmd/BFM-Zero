@@ -119,6 +119,14 @@ xpos_bodies = [
     # "right_wrist_yaw_link",
 ]
 
+# Index of right_wrist_yaw_link in _rigid_body_pos / ref_body_pos (G1 29-DOF, 30 bodies total).
+# Body ordering: pelvis(0), left-leg(1-6), right-leg(7-12), waist(13-15),
+#   left-arm(16-19), left-wrist(20-22), right-arm(23-26), right-wrist(27-29).
+# right_wrist_yaw_link is the terminal EE body at index 29.
+# Pelvis (root body) is always at index 0.
+_RIGHT_WRIST_BODY_IDX: int = 29
+_PELVIS_BODY_IDX: int = 0
+
 def get_backward_observation(env, motion_id, include_last_action, velocity_multiplier: float = 1.0) -> torch.Tensor:
     import numpy as np
     from humanoidverse.envs.legged_robot_motions.legged_robot_motions import (
@@ -413,6 +421,8 @@ def _async_tracking_worker(
     tracking_targets = {}
     # target_xpos_dict = {}
     tracking_joint_pos = {}
+    tracking_ee_pos = {}        # right_wrist_yaw_link world positions from motion lib, shape [T, 3]
+    tracking_ref_root_rot = {}  # pelvis xyzw quaternion from motion lib, shape [T, 4]
     dof_states_list = [None] * num_envs
     root_states_list = [None] * num_envs
 
@@ -428,6 +438,11 @@ def _async_tracking_worker(
         ctx_dict[m_id] = ctx
         tracking_targets[m_id] = tree_map(lambda x: x.cpu(), tracking_target)
         tracking_joint_pos[m_id] = tracking_target_dict["dof_pos"].clone()
+        if "ref_body_pos" in tracking_target_dict:
+            tracking_ee_pos[m_id] = tracking_target_dict["ref_body_pos"][:, _RIGHT_WRIST_BODY_IDX].clone().cpu()
+        if "ref_body_rots" in tracking_target_dict:
+            # xyzw quaternion of pelvis — used for heading-frame EE error
+            tracking_ref_root_rot[m_id] = tracking_target_dict["ref_body_rots"][:, _PELVIS_BODY_IDX].clone().cpu()
         # import ipdb; ipdb.set_trace()
 
         ref_body_rots = tracking_target_dict["ref_body_rots"][0, 0]
@@ -481,6 +496,8 @@ def _async_tracking_worker(
         _episode.initialise(ooo, info_cpu)
 
         xpos_log = [isaac_env.simulator._rigid_body_pos.reshape(num_envs, -1, 3)]
+        # root_rot_log stores pelvis xyzw quaternion; used for heading-frame EE error
+        xrot_root_log = [isaac_env.simulator._rigid_body_rot.reshape(num_envs, -1, 4)[:, _PELVIS_BODY_IDX, :].cpu()]
         joint_pos = [isaac_env.simulator.dof_state[..., 0]]
         joint_vel = [isaac_env.simulator.dof_state[..., 1]]
 
@@ -498,6 +515,7 @@ def _async_tracking_worker(
             joint_pos.append(isaac_env.simulator.dof_state[..., 0])
             joint_vel.append(isaac_env.simulator.dof_state[..., 1])
             xpos_log.append(isaac_env.simulator._rigid_body_pos.reshape(num_envs, -1, 3))
+            xrot_root_log.append(isaac_env.simulator._rigid_body_rot.reshape(num_envs, -1, 4)[:, _PELVIS_BODY_IDX, :].cpu())
 
             ooo = {k: v for k, v in observation.items() if k != "history"}
             _episode.add(
@@ -510,7 +528,8 @@ def _async_tracking_worker(
             )
 
         episode_data = _episode.get()
-        episode_data["xpos"] = torch.stack(xpos_log)[:-1]
+        episode_data["xpos"] = torch.stack(xpos_log)[:-1]           # [T, num_envs, num_bodies, 3]
+        episode_data["root_rot"] = torch.stack(xrot_root_log)[:-1]  # [T, num_envs, 4] xyzw
         joint_pos = torch.stack(joint_pos)
         joint_vel = torch.stack(joint_vel)
 
@@ -520,16 +539,40 @@ def _async_tracking_worker(
                 # we average the results
                 _joint_pos = joint_pos[: ctx_dict[m_id].shape[0] + 1, env_id]
                 _target_joint_pos = tracking_joint_pos[m_id]
+                ctx_len = ctx_dict[m_id].shape[0]
+                _xpos_ee = (
+                    episode_data["xpos"][0:ctx_len, env_id, _RIGHT_WRIST_BODY_IDX]
+                    if m_id in tracking_ee_pos else None
+                )
+                _target_ee_pos = tracking_ee_pos.get(m_id, None)
+                if _target_ee_pos is not None:
+                    _target_ee_pos = _target_ee_pos[:ctx_len]
+                # pelvis world position and xyzw quaternion for heading-frame transform
+                _root_pos = episode_data["xpos"][0:ctx_len, env_id, _PELVIS_BODY_IDX]      # [T, 3]
+                _root_rot = episode_data["root_rot"][0:ctx_len, env_id]                      # [T, 4] xyzw
+                _target_root_pos = (
+                    tracking_target_dict["ref_body_pos"][:ctx_len, _PELVIS_BODY_IDX].cpu()
+                    if "ref_body_pos" in tracking_target_dict else None
+                )
+                _target_root_rot = tracking_ref_root_rot.get(m_id, None)
+                if _target_root_rot is not None:
+                    _target_root_rot = _target_root_rot[:ctx_len]
                 local_metrics = _calc_metrics(
                     {
-                        # "xpos": episode_data["xpos"][0 : ctx_dict[m_id].shape[0], env_id],
+                        # "xpos": episode_data["xpos"][0 : ctx_len, env_id],
                         # "target_xpos": target_xpos_dict[env_id],
                         "tracking_target": tracking_targets[m_id],
                         "motion_id": m_id,
                         "motion_file": isaac_env._motion_lib.curr_motion_keys[m_id],
-                        "observation": tree_map(lambda x: x[0 : ctx_dict[m_id].shape[0] + 1, env_id], episode_data["observation"]),
+                        "observation": tree_map(lambda x: x[0 : ctx_len + 1, env_id], episode_data["observation"]),
                         "joint_pos": _joint_pos,
                         "target_joint_pos": _target_joint_pos,
+                        "xpos_ee": _xpos_ee,
+                        "target_ee_pos": _target_ee_pos,
+                        "root_pos": _root_pos,
+                        "root_rot": _root_rot,
+                        "target_root_pos": _target_root_pos,
+                        "target_root_rot": _target_root_rot,
                     },
                 )
 
@@ -609,6 +652,46 @@ def _calc_metrics(ep):
     # phc metrics
     phc_metrics = compute_joint_pos_metrics(joint_pos=ep["joint_pos"], target_joint_pos=ep["target_joint_pos"])
     metr.update(phc_metrics)
+
+    # Right wrist EE position error (mm) — heading-relative Cartesian frame.
+    # Heading frame = root-centred + yaw-only rotation removed (pitch/roll preserved).
+    # This isolates right-arm tracking quality from base translation/yaw drift.
+    if (
+        ep.get("xpos_ee") is not None
+        and ep.get("target_ee_pos") is not None
+        and ep.get("root_pos") is not None
+        and ep.get("root_rot") is not None
+        and ep.get("target_root_pos") is not None
+        and ep.get("target_root_rot") is not None
+    ):
+        from humanoidverse.utils.torch_utils import calc_heading_quat_inv
+        from humanoidverse.envs.legged_robot_motions.legged_robot_motions import my_quat_rotate
+
+        def _to_tensor(x):
+            return x if isinstance(x, torch.Tensor) else torch.tensor(x, dtype=torch.float32)
+
+        xpos_ee      = _to_tensor(ep["xpos_ee"]).float()
+        target_ee    = _to_tensor(ep["target_ee_pos"]).float()
+        root_pos     = _to_tensor(ep["root_pos"]).float()
+        root_rot     = _to_tensor(ep["root_rot"]).float()         # xyzw
+        tgt_root_pos = _to_tensor(ep["target_root_pos"]).float()
+        tgt_root_rot = _to_tensor(ep["target_root_rot"]).float()  # xyzw
+
+        min_t = min(xpos_ee.shape[0], target_ee.shape[0], root_pos.shape[0], tgt_root_pos.shape[0])
+        xpos_ee      = xpos_ee[:min_t]
+        target_ee    = target_ee[:min_t]
+        root_pos     = root_pos[:min_t]
+        root_rot     = root_rot[:min_t]
+        tgt_root_pos = tgt_root_pos[:min_t]
+        tgt_root_rot = tgt_root_rot[:min_t]
+
+        h_inv_pred   = calc_heading_quat_inv(root_rot,     w_last=True)  # [T, 4]
+        h_inv_target = calc_heading_quat_inv(tgt_root_rot, w_last=True)
+
+        local_ee_pred   = my_quat_rotate(h_inv_pred,   xpos_ee   - root_pos)
+        local_ee_target = my_quat_rotate(h_inv_target, target_ee - tgt_root_pos)
+
+        metr["hand_ee_local_err"] = torch.norm(local_ee_pred - local_ee_target, dim=-1).mean().item() * 1000
     for k, v in metr.items():
         if isinstance(v, torch.Tensor):
             metr[k] = v.tolist()
@@ -632,6 +715,17 @@ def compute_joint_pos_metrics(joint_pos, target_joint_pos):
     accel_gt = target_joint_pos[:, :-2] - 2 * target_joint_pos[:, 1:-1] + target_joint_pos[:, 2:]
     accel_pred = joint_pos[:, :-2] - 2 * joint_pos[:, 1:-1] + joint_pos[:, 2:]
     stats["accel_dist"] = torch.norm(accel_pred - accel_gt, dim=-1).mean(-1) * 100
+
+    # Right-arm specialised metrics (G1 29-DOF: right arm = dof_names indices 22-28)
+    _RA = slice(22, 29)
+    stats["hand_mpjpe_l"] = torch.norm(
+        joint_pos[..., _RA] - target_joint_pos[..., _RA], dim=-1
+    ).mean(-1) * 1000
+    stats["hand_vel_dist"] = torch.norm(
+        (joint_pos[:, 1:, _RA] - joint_pos[:, :-1, _RA])
+        - (target_joint_pos[:, 1:, _RA] - target_joint_pos[:, :-1, _RA]),
+        dim=-1,
+    ).mean(-1) * 1000
 
     stats.update(
         distance_proximity(next_obs=joint_pos, tracking_target=target_joint_pos, prefix="")
