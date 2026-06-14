@@ -23,8 +23,12 @@
 可选键（若提供则用于更准确的 MuJoCo 专家侧）：
   - ``mujoco_qpos`` 形状 ``(T, 36)``：7 自由根 + 29 关节，与 ``IsaacRendererWithMuJoco`` 一致。
 
-若无 ``mujoco_qpos``：用每帧 ``state[:, :29] + default_dof_pos`` 作为关节绝对角，
+若无 ``mujoco_qpos`` / ``qpos``：用每帧 ``state[:, :29] + default_dof_pos`` 作为关节绝对角，
 根姿态使用环境 ``reset`` 后的默认根（仅用于专家侧渲染，可能与真实采集略有偏差）。
+
+录制轨迹（``data/recordings/*_obs.npz``）的 ``privileged_state`` 常含错误 body 速度
+（有限差分 ~30× 偏大）。默认 ``--repair-privileged`` 会从 ``state`` 重建 qpos/qvel 并用
+MuJoCo FK 重算 ``privileged_state``，同时对每条轨迹分别 rollout 并保存指标。
 """
 from __future__ import annotations
 
@@ -46,6 +50,7 @@ import humanoidverse
 from humanoidverse.agents.envs.humanoidverse_isaac import HumanoidVerseIsaacConfig, IsaacRendererWithMuJoco
 from humanoidverse.agents.load_utils import load_model_from_checkpoint_dir
 from humanoidverse.utils.helpers import export_meta_policy_as_onnx
+from humanoidverse.utils.recording_obs_repair import repair_recording_traj
 
 if getattr(humanoidverse, "__file__", None) is not None:
     HUMANOIDVERSE_DIR = Path(humanoidverse.__file__).parent
@@ -335,10 +340,11 @@ def _build_expert_qpos(
     else:
         default_dof = ddp[0].cpu().numpy()
 
-    if "mujoco_qpos" in traj:
-        q = np.asarray(traj["mujoco_qpos"], dtype=np.float64)
+    qpos_key = "mujoco_qpos" if "mujoco_qpos" in traj else ("qpos" if "qpos" in traj else None)
+    if qpos_key is not None:
+        q = np.asarray(traj[qpos_key], dtype=np.float64)
         if q.shape != (T, 36):
-            raise ValueError(f"mujoco_qpos 期望 (T,36) T={T}, got {q.shape}")
+            raise ValueError(f"{qpos_key} 期望 (T,36) T={T}, got {q.shape}")
         expert_qpos = q.astype(np.float32)
         root_pos = torch.from_numpy(expert_qpos[0, :3]).float().to(device)
         quat_wxyz = torch.from_numpy(expert_qpos[0, 3:7]).float().to(device)
@@ -374,6 +380,100 @@ def _build_expert_qpos(
     return expert_qpos, ref_root, dof_init
 
 
+def _run_single_traj_rollout(
+    *,
+    traj_np: dict[str, np.ndarray],
+    z: torch.Tensor,
+    stem: str,
+    model,
+    wrapped_env,
+    env,
+    dev: torch.device,
+    num_envs: int,
+    output_dir: Path,
+    _wrist_slice: slice,
+    _z_body_dim: int,
+    episode_len: int | None,
+    save_mp4: bool,
+) -> None:
+    """Reset env to traj init, rollout tracking, save metrics for one trajectory."""
+    expert_qpos, ref_root, dof_init_state = _build_expert_qpos(
+        traj_np, env=env, wrapped_env=wrapped_env, device=dev, num_envs=num_envs
+    )
+
+    sim_dev = wrapped_env._env.device
+    env.set_is_evaluating(0)
+    wrapped_env.reset(to_numpy=False)
+
+    env_ids = torch.arange(num_envs, dtype=torch.long, device=sim_dev)
+    target_states = {
+        "dof_states": dof_init_state,
+        "root_states": torch.stack([ref_root.clone().to(sim_dev) for _ in range(num_envs)]),
+    }
+    wrapped_env._env.reset_envs_idx(env_ids, target_states=target_states)
+    wrapped_env.step(
+        torch.zeros((num_envs, wrapped_env.action_space.shape[-1]), dtype=torch.float32, device=sim_dev),
+        to_numpy=False,
+    )
+    observation = wrapped_env._get_g1env_observation(to_numpy=False)
+
+    Tz = z.shape[0]
+    traj_T = traj_np["state"].shape[0]
+    n_steps = min(Tz, traj_T - 1, expert_qpos.shape[0] - 1)
+    if episode_len is not None:
+        n_steps = min(n_steps, episode_len)
+    print(f"Rollout [{stem}]: {n_steps} steps (z={Tz}, traj_T={traj_T})")
+
+    joint_pos = [wrapped_env._env.simulator.dof_state[..., 0].clone().cpu().numpy()]
+    _z_actual_list: list[np.ndarray] = []
+    _ee_local_pred_list: list[np.ndarray] = []
+    _action_dim = wrapped_env.action_space.shape[-1]
+    _last_act_buf = torch.zeros((num_envs, _action_dim), dtype=torch.float32, device=sim_dev)
+
+    expert_video = None
+    frames: list[np.ndarray] = []
+    if save_mp4:
+        rgb_renderer = IsaacRendererWithMuJoco(render_size=256)
+        expert_video = rgb_renderer.from_qpos(expert_qpos[: 1 + n_steps])
+        frames = [rgb_renderer.render(wrapped_env._env, 0)[0]]
+
+    for i in range(n_steps):
+        print(f"  [{stem}] step {i + 1}/{n_steps}")
+        with torch.no_grad():
+            _z_actual_list.append(_compute_z_actual(model, observation, _last_act_buf))
+        _ee_local_pred_list.append(
+            observation["privileged_state"][0, _wrist_slice].detach().cpu().numpy()
+        )
+        action = model.act(observation, z[i % len(z)].unsqueeze(0).expand(num_envs, -1), mean=True)
+        _last_act_buf = action.detach()
+        observation, _r, _t, _trunc, _info = wrapped_env.step(action, to_numpy=False)
+        joint_pos.append(wrapped_env._env.simulator.dof_state[..., 0].clone().cpu().numpy())
+        if save_mp4:
+            frames.append(rgb_renderer.render(wrapped_env._env, 0)[0])
+
+    _default_dof = wrapped_env._env.default_dof_pos[0].cpu().numpy()
+    _ref_dof_arr = traj_np["state"][:, :29] + _default_dof
+    _ref_ee_arr = traj_np["privileged_state"][:, _wrist_slice].astype(np.float32)
+    _save_inference_metrics(
+        output_dir=output_dir,
+        stem=stem,
+        n_steps=n_steps,
+        joint_pos_arr=np.stack(joint_pos, axis=0).squeeze(1),
+        z_actual_arr=np.stack(_z_actual_list),
+        ee_pred_arr=np.stack(_ee_local_pred_list),
+        ref_dof_arr=_ref_dof_arr,
+        ref_ee_arr=_ref_ee_arr,
+        z_expert_arr=z.detach().cpu().numpy(),
+        z_body_dim=_z_body_dim,
+    )
+
+    if save_mp4 and expert_video is not None:
+        new_frames = [np.concatenate([a, b], axis=1) for a, b in zip(expert_video, frames)]
+        video_path = output_dir / f"tracking_{stem}.mp4"
+        media.write_video(str(video_path), new_frames, fps=50)
+        print(f"Saved video: {video_path}")
+
+
 def main(
     model_folder: Path,
     traj_obs_dir: Path,
@@ -388,6 +488,8 @@ def main(
     episode_len: int | None = None,
     z_window: int = 1,
     z_ema_alpha: float | None = None,
+    repair_privileged: bool = True,
+    recording_dt: float = 1.0 / 30.0,
 ) -> None:
     """z smoothing options (anti-jump for OOD target trajectories):
 
@@ -396,6 +498,9 @@ def main(
                   uses seq_length=8).
     z_ema_alpha : causal low-pass z[t] <- a*z[t] + (1-a)*z[t-1]; None/1.0 = off.
                   Start with z_window=8, z_ema_alpha=0.6 when the right hand jumps.
+    repair_privileged : recompute privileged_state from state via MuJoCo FK (fixes
+                  ~30× velocity bug in recording pipeline). Default True.
+    recording_dt: frame interval used when reconstructing root linear velocity from state.
     """
     model_folder = Path(model_folder)
     traj_obs_dir = Path(traj_obs_dir)
@@ -477,104 +582,41 @@ def main(
             f"（若轨迹为另一种格式，请显式设置 --traj-glob，例如 '*.npz' 或 '*.pkl'）"
         )
 
-    last_z: torch.Tensor | None = None
-    last_traj_np: dict[str, np.ndarray] | None = None
-    last_stem: str | None = None
+    traj_items: list[tuple[str, dict[str, np.ndarray], torch.Tensor]] = []
 
     for traj_path in paths:
-        print(f"Load trajectory: {traj_path}")
-        traj_np = align_traj_privileged_for_model(load_traj_obs_file(traj_path), model)
+        print(f"\nLoad trajectory: {traj_path}")
+        traj_np = load_traj_obs_file(traj_path)
+        if repair_privileged:
+            print("  Repairing privileged_state from state (MuJoCo FK) …")
+            traj_np = repair_recording_traj(traj_np, dt=recording_dt, verbose=True)
+        traj_np = align_traj_privileged_for_model(traj_np, model)
         obs_full = traj_to_backward_batch(traj_np, dev)
         z = tracking_inference(tree_map(lambda x: x[1:], obs_full))
         stem = re.sub(r"[^\w\-.]+", "_", traj_path.stem)
         joblib.dump(z.detach().cpu().numpy(), output_dir / f"zs_{stem}.pkl")
         print(f"Saved {output_dir / f'zs_{stem}.pkl'}  (z steps={z.shape[0]})")
-        last_z = z
-        last_traj_np = traj_np
-        last_stem = stem
+        traj_items.append((stem, traj_np, z))
 
-    assert last_z is not None and last_stem is not None and last_traj_np is not None
+    if not traj_items:
+        raise RuntimeError("No trajectories processed")
 
-    # 环境与 rollout：默认使用排序后「最后一个」轨迹（与原版多 motion 只录一段视频类似）
-    traj_np = last_traj_np
-    z = last_z
-    expert_qpos, ref_root, dof_init_state = _build_expert_qpos(
-        traj_np, env=env, wrapped_env=wrapped_env, device=dev, num_envs=num_envs
-    )
-
-    sim_dev = wrapped_env._env.device
-    env.set_is_evaluating(0)
-    wrapped_env.reset(to_numpy=False)
-
-    env_ids = torch.arange(num_envs, dtype=torch.long, device=sim_dev)
-    target_states = {
-        "dof_states": dof_init_state,
-        "root_states": torch.stack([ref_root.clone().to(sim_dev) for _ in range(num_envs)]),
-    }
-    wrapped_env._env.reset_envs_idx(env_ids, target_states=target_states)
-    wrapped_env.step(
-        torch.zeros((num_envs, wrapped_env.action_space.shape[-1]), dtype=torch.float32, device=sim_dev),
-        to_numpy=False,
-    )
-    observation = wrapped_env._get_g1env_observation(to_numpy=False)
-
-    Tz = z.shape[0]
-    traj_T = traj_np["state"].shape[0]
-    n_steps = min(Tz, traj_T - 1, expert_qpos.shape[0] - 1)
-    if episode_len is not None:
-        n_steps = min(n_steps, episode_len)
-    print(f"Rollout steps: {n_steps} (z={Tz}, traj_T={traj_T})")
-
-    joint_pos = [wrapped_env._env.simulator.dof_state[..., 0].clone().cpu().numpy()]
-    _z_actual_list:    list[np.ndarray] = []
-    _ee_local_pred_list: list[np.ndarray] = []
-    _action_dim = wrapped_env.action_space.shape[-1]
-    _last_act_buf = torch.zeros((num_envs, _action_dim), dtype=torch.float32, device=sim_dev)
-
-    if save_mp4:
-        rgb_renderer = IsaacRendererWithMuJoco(render_size=256)
-        expert_video = rgb_renderer.from_qpos(expert_qpos[: 1 + n_steps])
-        frames = [rgb_renderer.render(wrapped_env._env, 0)[0]]
-
-    for i in range(n_steps):
-        print(f"Step {i + 1}/{n_steps}")
-        # --- collect metrics at current robot state (before acting) ---
-        with torch.no_grad():
-            _z_actual_list.append(_compute_z_actual(model, observation, _last_act_buf))
-        _ee_local_pred_list.append(
-            observation["privileged_state"][0, _wrist_slice].detach().cpu().numpy()
+    for stem, traj_np, z in traj_items:
+        _run_single_traj_rollout(
+            traj_np=traj_np,
+            z=z,
+            stem=stem,
+            model=model,
+            wrapped_env=wrapped_env,
+            env=env,
+            dev=dev,
+            num_envs=num_envs,
+            output_dir=output_dir,
+            _wrist_slice=_wrist_slice,
+            _z_body_dim=_z_body_dim,
+            episode_len=episode_len,
+            save_mp4=save_mp4,
         )
-        # ---
-        action = model.act(observation, z[i % len(z)].unsqueeze(0).expand(num_envs, -1), mean=True)
-        _last_act_buf = action.detach()
-        observation, _r, _t, _trunc, _info = wrapped_env.step(action, to_numpy=False)
-        joint_pos.append(wrapped_env._env.simulator.dof_state[..., 0].clone().cpu().numpy())
-        if save_mp4:
-            frames.append(rgb_renderer.render(wrapped_env._env, 0)[0])
-
-    # --- compute and save all inference metrics ---
-    _default_dof = wrapped_env._env.default_dof_pos[0].cpu().numpy()          # [29]
-    _ref_dof_arr = traj_np["state"][:, :29] + _default_dof                    # [T, 29]
-    _ref_ee_arr  = traj_np["privileged_state"][:, _wrist_slice].astype(np.float32)  # [T, 3]
-    _save_inference_metrics(
-        output_dir       = output_dir,
-        stem             = last_stem,
-        n_steps          = n_steps,
-        joint_pos_arr    = np.stack(joint_pos, axis=0).squeeze(1),
-        z_actual_arr     = np.stack(_z_actual_list),
-        ee_pred_arr      = np.stack(_ee_local_pred_list),
-        ref_dof_arr      = _ref_dof_arr,
-        ref_ee_arr       = _ref_ee_arr,
-        z_expert_arr     = z.detach().cpu().numpy(),
-        z_body_dim       = _z_body_dim,
-    )
-    # ---
-
-    if save_mp4:
-        new_frames = [np.concatenate([a, b], axis=1) for a, b in zip(expert_video, frames)]
-        video_path = output_dir / f"tracking_{last_stem}.mp4"
-        media.write_video(str(video_path), new_frames, fps=50)
-        print(f"Saved video: {video_path}")
 
 
 if __name__ == "__main__":
