@@ -199,9 +199,17 @@ def _stack_traj_obs(raw: object) -> dict[str, np.ndarray]:
     fixed: dict[str, np.ndarray] = {}
     for k, v in raw.items():
         nk = _normalize_traj_key(k)
-        fixed[nk] = np.asarray(v, dtype=np.float32)
-        if fixed[nk].ndim != 2:
-            raise ValueError(f"键 {k!r} 展开后应为 2维 (T,D)，got shape {fixed[nk].shape}")
+        arr = np.asarray(v)
+        if arr.dtype == object:
+            continue
+        arr = arr.astype(np.float32, copy=False)
+        if arr.ndim == 0:
+            continue
+        if arr.ndim == 1:
+            continue
+        if arr.ndim != 2:
+            raise ValueError(f"键 {k!r} 展开后应为 2维 (T,D)，got shape {arr.shape}")
+        fixed[nk] = arr
     return fixed
 
 
