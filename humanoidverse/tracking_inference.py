@@ -37,7 +37,7 @@ def _wrist_local_pos_slice(use_root_height_obs: bool) -> slice:
 # ---------- end metric helpers ----------
 
 
-def main(model_folder: Path, data_path: Path | None = None, headless: bool = True, device="cuda", simulator: str = "isaacsim", save_mp4: bool=False, disable_dr: bool = False, disable_obs_noise: bool = False, motion_list: list[int] = [25], episode_len: int | None = 100):
+def main(model_folder: Path, data_path: Path | None = None, headless: bool = True, device="cuda", simulator: str = "isaacsim", save_mp4: bool=False, disable_dr: bool = False, disable_obs_noise: bool = False, motion_list: list[int] = [25], episode_len: int | None = 100, video_name: str | None = None):
     # motion_list: motion ids to evaluate (default [25])
     
     model_folder = Path(model_folder)
@@ -267,7 +267,10 @@ def main(model_folder: Path, data_path: Path | None = None, headless: bool = Tru
         new_frames = []
         for a, b in zip(expert_video, frames):
             new_frames.append(np.concatenate([a, b], axis=1))
-        video_path = output_dir / "tracking.mp4"
+        _video_stem = video_name or "tracking.mp4"
+        if not _video_stem.endswith(".mp4"):
+            _video_stem = f"{_video_stem}.mp4"
+        video_path = output_dir / _video_stem
         media.write_video(str(video_path), new_frames, fps=50)
         print(f"Saved video for tracking: {video_path}")
 
