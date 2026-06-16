@@ -80,6 +80,37 @@ uv run -m humanoidverse.tracking_inference_split \
 
 `--raw-npz` 可选；若 `*_obs.npz` 内已有 `qpos/qvel`（V2 标准格式），会自动用 obs 内字段做校验。
 
+### 2d. V3 批量 clip → tracking inference（`prepare_tracking_clips_batch.py`）
+
+与 data2 相同校验逻辑，但**批量扫描** `custom_circles_src` 下三个 V3 batch 目录，输出扁平 inference 目录（不转 pkl）。
+
+**输入目录结构**（与 data2 一致，版本后缀 `_v3`）：
+
+```
+custom_circles_src/
+  batch_data_xy_v3/clips_obs/{shape}/{plane}/*_obs.npz
+  batch_data_xz_v3/clips_obs/{shape}/{plane}/*_obs.npz
+  batch_data_yz_v3/clips_obs/{shape}/{plane}/*_obs.npz
+  batch_data_*_v3/raw/{shape}/{plane}/seed*.npz   # 可选，用于背靠背校验
+```
+
+10 种 shape × 3 平面 ≈ **3000** 条；预处理为纯 CPU，较快。
+
+```bash
+python scripts/data_preprocess/prepare_tracking_clips_batch.py \
+    --src-dir humanoidverse/data/inference_clips/custom_circles_src \
+    --output-dir humanoidverse/data/inference_clips/shapes_v3
+
+uv run -m humanoidverse.tracking_inference_split \
+    --model-folder results/<your_checkpoint> \
+    --traj-obs-dir humanoidverse/data/inference_clips/shapes_v3 \
+    --traj-glob "*_obs.npz" \
+    --one-per-shape-plane \
+    --z-window 8 --z-ema-alpha 0.6
+```
+
+`--one-per-shape-plane` 每平面×每形状选 1 条（约 30 条）做 Isaac rollout；汇总误差、EE 对比图、z 序列见 `tracking_inference_split/` 输出。
+
 ## 2b. data1 画形状 NPZ（`convert_shape_npz.py`，**已弃用**）
 
 旧版 `data1/{batch_data, batch_data_xy, batch_data_xz}/clips_obs/**/*_obs.npz`。因 IK 解支跳变问题，**请勿再用于合并训练集**；脚本保留仅供对照或复现旧实验。

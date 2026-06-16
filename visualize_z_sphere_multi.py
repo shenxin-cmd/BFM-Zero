@@ -14,11 +14,11 @@ visualize_z_sphere_multi.py
 
 用法
 ----
-  # 批量加载目录下所有 pkl
+  # 批量加载目录下所有 pkl / z_*.npz
   python visualize_z_sphere_multi.py  --pkl-dir  /path/to/pkls/
 
-  # 指定具体文件（最多支持任意多条）
-  python visualize_z_sphere_multi.py  --pkl-files a.pkl b.pkl c.pkl d.pkl
+  # 指定 pkl 或 npz（tracking_inference_split 输出的 z_expert_*.npz 等）
+  python visualize_z_sphere_multi.py  --pkl-files a.pkl b.npz c.npz
 
   # 保存动图
   python visualize_z_sphere_multi.py  --pkl-dir /path/pkls --save-gif --save-mp4
@@ -56,17 +56,37 @@ _PALETTE = [
 
 # ─── 工具 ─────────────────────────────────────────────────────────────────────
 
-def _load_pkls(paths: list[Path]) -> list[np.ndarray]:
-    zs = []
-    for p in paths:
+def _load_z_file(p: Path) -> np.ndarray:
+    """Load z trajectory from joblib pkl or NPZ (``z`` / ``z_expert`` key)."""
+    p = Path(p)
+    if p.suffix.lower() == ".npz":
+        with np.load(p, allow_pickle=True) as d:
+            if "z" in d.files:
+                z = np.asarray(d["z"], dtype=np.float32)
+            elif "z_expert" in d.files:
+                z = np.asarray(d["z_expert"], dtype=np.float32)
+            elif "z_actual" in d.files:
+                z = np.asarray(d["z_actual"], dtype=np.float32)
+            else:
+                raise KeyError(
+                    f"{p.name}: NPZ must contain 'z', 'z_expert', or 'z_actual'; "
+                    f"found {list(d.files)}"
+                )
+            if "z_body_dim" in d.files and d["z_body_dim"].size == 1:
+                # optional; caller may override via CLI
+                pass
+    else:
         z = joblib.load(p)
         z = np.asarray(z, dtype=np.float32)
-        if z.ndim == 3:
-            z = z.squeeze(1)
-        if z.ndim != 2:
-            raise ValueError(f"{p.name}: 形状应为 (T, D)，当前为 {z.shape}")
-        zs.append(z)
-    return zs
+    if z.ndim == 3:
+        z = z.squeeze(1)
+    if z.ndim != 2:
+        raise ValueError(f"{p.name}: expected shape (T, D), got {z.shape}")
+    return z
+
+
+def _load_pkls(paths: list[Path]) -> list[np.ndarray]:
+    return [_load_z_file(p) for p in paths]
 
 
 def _split_and_check(zs: list[np.ndarray], z_body_dim: int):
@@ -373,9 +393,10 @@ def main(
     if pkl_files:
         paths = [Path(p) for p in pkl_files]
     elif pkl_dir is not None:
-        paths = sorted(Path(pkl_dir).glob("*.pkl"))
+        pdir = Path(pkl_dir)
+        paths = sorted(set(pdir.glob("*.pkl")) | set(pdir.glob("z_*.npz")))
     if not paths:
-        print("错误：未找到任何 pkl 文件。请通过 --pkl-dir 或 --pkl-files 指定。",
+        print("错误：未找到任何 pkl/npz 文件。请通过 --pkl-dir 或 --pkl-files 指定。",
               file=sys.stderr)
         sys.exit(1)
     print(f"共找到 {len(paths)} 条轨迹:")
@@ -473,8 +494,8 @@ if __name__ == "__main__":
         description="多条 z 轨迹在同一球面上的 PCA 可视化"
     )
     grp = ap.add_mutually_exclusive_group(required=True)
-    grp.add_argument("--pkl-dir",   type=Path, help="包含 *.pkl 的目录")
-    grp.add_argument("--pkl-files", type=Path, nargs="+", help="显式指定 pkl 文件列表")
+    grp.add_argument("--pkl-dir",   type=Path, help="directory with *.pkl and/or z_*.npz")
+    grp.add_argument("--pkl-files", type=Path, nargs="+", help="pkl or npz files (z_expert_*.npz, etc.)")
 
     ap.add_argument("--z-body-dim", type=int,   default=225,
                     help="z_body 维度（默认 225）")

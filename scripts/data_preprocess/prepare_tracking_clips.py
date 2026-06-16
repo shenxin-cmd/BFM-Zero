@@ -58,6 +58,7 @@ def prepare_one_obs(
     raw_path: Path | None,
     output_dir: Path,
     jump_threshold: float,
+    output_name: str | None = None,
 ) -> dict:
     obs_path = Path(obs_path)
     raw = _load_npz_dict(raw_path) if raw_path is not None else {}
@@ -109,7 +110,9 @@ def prepare_one_obs(
         print(f"WARNING: {obs_path.name} has no qpos/qvel; inference still OK, no FK validation")
 
     # Standard inference filename: keep *_obs.npz suffix
-    out_name = obs_path.name if obs_path.name.endswith("_obs.npz") else f"{obs_path.stem}_obs.npz"
+    out_name = output_name or (
+        obs_path.name if obs_path.name.endswith("_obs.npz") else f"{obs_path.stem}_obs.npz"
+    )
     out_path = output_dir / out_name
 
     # Save float32 arrays for inference
