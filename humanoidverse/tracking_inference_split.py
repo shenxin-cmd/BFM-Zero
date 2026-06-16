@@ -175,8 +175,22 @@ def _normalize_traj_key(name: str) -> str:
     return k
 
 
+def _as_traj_array(v: object) -> np.ndarray | None:
+    """Convert to (T, D) float32 trajectory array; skip metadata / non-numeric."""
+    arr = np.asarray(v)
+    if arr.dtype.kind in ("U", "S", "O", "M", "m") or not np.issubdtype(arr.dtype, np.number):
+        return None
+    try:
+        arr = np.asarray(arr, dtype=np.float32)
+    except (ValueError, TypeError):
+        return None
+    if arr.ndim != 2:
+        return None
+    return arr
+
+
 def _stack_traj_obs(raw: object) -> dict[str, np.ndarray]:
-    """统一为 {key: (T, D) float32 numpy}。"""
+    """统一为 {key: (T, D) float32 numpy}；NPZ 内 timestamps/fps/字符串元数据会被忽略。"""
     if isinstance(raw, list):
         if len(raw) == 0:
             raise ValueError("轨迹 list 为空")
@@ -199,16 +213,9 @@ def _stack_traj_obs(raw: object) -> dict[str, np.ndarray]:
     fixed: dict[str, np.ndarray] = {}
     for k, v in raw.items():
         nk = _normalize_traj_key(k)
-        arr = np.asarray(v)
-        if arr.dtype == object:
+        arr = _as_traj_array(v)
+        if arr is None:
             continue
-        arr = arr.astype(np.float32, copy=False)
-        if arr.ndim == 0:
-            continue
-        if arr.ndim == 1:
-            continue
-        if arr.ndim != 2:
-            raise ValueError(f"键 {k!r} 展开后应为 2维 (T,D)，got shape {arr.shape}")
         fixed[nk] = arr
     return fixed
 
