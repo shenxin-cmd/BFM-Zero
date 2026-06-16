@@ -60,6 +60,26 @@
 
 输出 key 命名：`shape_{bd_xy|bd_xz|bd_yz}_{原文件名}`（仍匹配训练里 `shape_` 前缀的源权重）。
 
+### 2c. 少量 ad-hoc clip → tracking inference（`prepare_tracking_clips.py`）
+
+**不写入训练 pkl**，只做与 data2 相同的 **state↔qpos 背靠背校验** + 右臂连续性报告，输出 `*_obs.npz` 供 `tracking_inference_split.py` 直接读取。
+
+```bash
+python scripts/data_preprocess/prepare_tracking_clips.py \
+    --obs-npz /path/to/circle_Pyz_..._seed003_F300_obs.npz \
+              /path/to/circle_Pyz_..._seed007_F300_obs.npz \
+    --raw-npz /path/to/seed003_L1_F300.npz \
+              /path/to/seed007_L1_F300.npz \
+    --output-dir humanoidverse/data/inference_clips/custom_circles
+
+uv run -m humanoidverse.tracking_inference_split \
+    --model-folder results/<your_checkpoint> \
+    --traj-obs-dir humanoidverse/data/inference_clips/custom_circles \
+    --traj-glob "*_obs.npz"
+```
+
+`--raw-npz` 可选；若 `*_obs.npz` 内已有 `qpos/qvel`（V2 标准格式），会自动用 obs 内字段做校验。
+
 ## 2b. data1 画形状 NPZ（`convert_shape_npz.py`，**已弃用**）
 
 旧版 `data1/{batch_data, batch_data_xy, batch_data_xz}/clips_obs/**/*_obs.npz`。因 IK 解支跳变问题，**请勿再用于合并训练集**；脚本保留仅供对照或复现旧实验。
