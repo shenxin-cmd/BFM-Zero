@@ -37,7 +37,7 @@ def _wrist_local_pos_slice(use_root_height_obs: bool) -> slice:
 # ---------- end metric helpers ----------
 
 
-def main(model_folder: Path, data_path: Path | None = None, headless: bool = True, device="cuda", simulator: str = "isaacsim", save_mp4: bool=False, disable_dr: bool = False, disable_obs_noise: bool = False, motion_list: list[int] = [25]):
+def main(model_folder: Path, data_path: Path | None = None, headless: bool = True, device="cuda", simulator: str = "isaacsim", save_mp4: bool=False, disable_dr: bool = False, disable_obs_noise: bool = False, motion_list: list[int] = [25], episode_len: int | None = 100):
     # motion_list: motion ids to evaluate (default [25])
     
     model_folder = Path(model_folder)
@@ -161,9 +161,11 @@ def main(model_folder: Path, data_path: Path | None = None, headless: bool = Tru
     _z_actual_list:    list[np.ndarray] = []
     _ee_local_pred_list: list[np.ndarray] = []
 
-    # Visualization length: match inference length so expert and policy videos align
-    episode_len = z.shape[0]
-    episode_len = 100
+    # Rollout / video length (None = full motion from z)
+    if episode_len is None:
+        episode_len = z.shape[0]
+    else:
+        episode_len = min(episode_len, z.shape[0])
     print(f"Saving video for tracking ({episode_len} steps)")
     if save_mp4:
         rgb_renderer = IsaacRendererWithMuJoco(render_size=256)
