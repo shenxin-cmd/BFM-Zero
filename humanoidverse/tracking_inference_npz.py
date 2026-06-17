@@ -282,17 +282,25 @@ def _fk_ee_positions_base(
     fk_model: "mujoco.MjModel",
     fk_data: "mujoco.MjData",
     ee_id: int,
-    qpos7_root: np.ndarray,    # (7,) [x,y,z,qw,qx,qy,qz]  MuJoCo 格式
+    qpos7_root: np.ndarray,    # (7,) or (N, 7) MuJoCo [x,y,z,qw,qx,qy,qz]
     dof_abs_arr: np.ndarray,   # (N, 29)
 ) -> np.ndarray:
     """
-    批量 FK：返回 (N, 3) EE 在基座（pelvis）局部坐标系下的位置。
-    每帧用该帧 root 位姿做 world→base 变换（专家根固定时等价于固定基座系）。
+    Batch FK: return (N, 3) EE positions in pelvis-local frame.
+    ``qpos7_root`` may be a single root reused for all frames, or per-frame (N, 7).
     """
     N = dof_abs_arr.shape[0]
+    qpos7_root = np.asarray(qpos7_root, dtype=np.float64)
+    per_frame_root = qpos7_root.ndim == 2
+    if per_frame_root:
+        if qpos7_root.shape != (N, 7):
+            raise ValueError(f"qpos7_root expected ({N}, 7), got {qpos7_root.shape}")
+    elif qpos7_root.shape != (7,):
+        raise ValueError(f"qpos7_root expected (7,), got {qpos7_root.shape}")
+
     out = np.zeros((N, 3), dtype=np.float64)
     for i in range(N):
-        fk_data.qpos[:7] = qpos7_root
+        fk_data.qpos[:7] = qpos7_root[i] if per_frame_root else qpos7_root
         fk_data.qpos[7:] = dof_abs_arr[i]
         fk_data.qvel[:] = 0.0
         mujoco.mj_forward(fk_model, fk_data)
