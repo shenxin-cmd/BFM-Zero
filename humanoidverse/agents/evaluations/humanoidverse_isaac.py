@@ -701,30 +701,66 @@ def _calc_metrics(ep):
 
 
 def compute_joint_pos_metrics(joint_pos, target_joint_pos):
+    """Compute joint-position tracking metrics.
+
+    Accepts either:
+      - [T, D] tensors from single-env tracking eval (most common), or
+      - [B, T, D] batched tensors.
+    """
     stats = {}
+    joint_pos = torch.as_tensor(joint_pos, dtype=torch.float32)
+    target_joint_pos = torch.as_tensor(target_joint_pos, dtype=torch.float32)
+
+    if joint_pos.ndim == 2:
+        t_len = min(joint_pos.shape[0], target_joint_pos.shape[0])
+        joint_pos = joint_pos[:t_len]
+        target_joint_pos = target_joint_pos[:t_len]
+
+        def _vel(x):
+            return x[1:] - x[:-1]
+
+        def _accel(x):
+            return x[:-2] - 2 * x[1:-1] + x[2:]
+
+        _RA = slice(22, 29)
+        hand_joint = lambda x: x[:, _RA]
+        hand_vel = lambda x: _vel(x)[:, _RA]
+    elif joint_pos.ndim == 3:
+        t_len = min(joint_pos.shape[1], target_joint_pos.shape[1])
+        joint_pos = joint_pos[:, :t_len]
+        target_joint_pos = target_joint_pos[:, :t_len]
+
+        def _vel(x):
+            return x[:, 1:] - x[:, :-1]
+
+        def _accel(x):
+            return x[:, :-2] - 2 * x[:, 1:-1] + x[:, 2:]
+
+        _RA = slice(22, 29)
+        hand_joint = lambda x: x[..., _RA]
+        hand_vel = lambda x: _vel(x)[..., _RA]
+    else:
+        raise ValueError(
+            f"joint_pos must be [T, D] or [B, T, D], got shape {tuple(joint_pos.shape)}"
+        )
+
     # Next observation should match the desired target (if possible in 1 step)
     stats["mpjpe_l"] = torch.norm(joint_pos - target_joint_pos, dim=-1).mean(-1) * 1000
 
-    # we compute the velocity as finite difference
-    vel_gt = target_joint_pos[:, 1:] - target_joint_pos[:, :-1]  # num_env x T x D
-    vel_pred = joint_pos[:, 1:] - joint_pos[:, :-1]  # num_env x T x D
-    stats["vel_dist"] = torch.norm(vel_pred - vel_gt, dim=-1).mean(-1) * 1000  # num_env
+    vel_gt = _vel(target_joint_pos)
+    vel_pred = _vel(joint_pos)
+    stats["vel_dist"] = torch.norm(vel_pred - vel_gt, dim=-1).mean(-1) * 1000
 
-    # Computes acceleration error:
-    #     1/(n-2) \sum_{i=1}^{n-1} X_{i-1} - 2X_i + X_{i+1}
-    accel_gt = target_joint_pos[:, :-2] - 2 * target_joint_pos[:, 1:-1] + target_joint_pos[:, 2:]
-    accel_pred = joint_pos[:, :-2] - 2 * joint_pos[:, 1:-1] + joint_pos[:, 2:]
+    accel_gt = _accel(target_joint_pos)
+    accel_pred = _accel(joint_pos)
     stats["accel_dist"] = torch.norm(accel_pred - accel_gt, dim=-1).mean(-1) * 100
 
     # Right-arm specialised metrics (G1 29-DOF: right arm = dof_names indices 22-28)
-    _RA = slice(22, 29)
     stats["hand_mpjpe_l"] = torch.norm(
-        joint_pos[..., _RA] - target_joint_pos[..., _RA], dim=-1
+        hand_joint(joint_pos) - hand_joint(target_joint_pos), dim=-1
     ).mean(-1) * 1000
     stats["hand_vel_dist"] = torch.norm(
-        (joint_pos[:, 1:, _RA] - joint_pos[:, :-1, _RA])
-        - (target_joint_pos[:, 1:, _RA] - target_joint_pos[:, :-1, _RA]),
-        dim=-1,
+        hand_vel(joint_pos) - hand_vel(target_joint_pos), dim=-1
     ).mean(-1) * 1000
 
     stats.update(
