@@ -900,10 +900,12 @@ class _SingleSplitForwardMap(nn.Module):
                 nn.Linear(h, cfg.z_body_dim),
             )
         elif cfg.model == "residual":
-            self.hand_embed_z = residual_embedding(obs_dim + cfg.z_hand_dim, h, cfg.hidden_layers)
-            self.hand_embed_sa = residual_embedding(obs_dim + cfg.hand_action_dim, h, cfg.hidden_layers)
-            self.body_embed_z = residual_embedding(obs_dim + cfg.z_body_dim, h, cfg.hidden_layers)
-            self.body_embed_sa = residual_embedding(obs_dim + self.body_action_dim, h, cfg.hidden_layers)
+            # Embeddings use embedding_layers (shallow, mirrors ResidualActor design).
+            # The main processing heads use hidden_layers (deep, mirrors ResidualForwardMap).
+            self.hand_embed_z = residual_embedding(obs_dim + cfg.z_hand_dim, h, cfg.embedding_layers)
+            self.hand_embed_sa = residual_embedding(obs_dim + cfg.hand_action_dim, h, cfg.embedding_layers)
+            self.body_embed_z = residual_embedding(obs_dim + cfg.z_body_dim, h, cfg.embedding_layers)
+            self.body_embed_sa = residual_embedding(obs_dim + self.body_action_dim, h, cfg.embedding_layers)
             self.hand_head = nn.Sequential(
                 *[ResidualBlock(h) for _ in range(cfg.hidden_layers)],
                 Block(h, cfg.z_hand_dim, False),

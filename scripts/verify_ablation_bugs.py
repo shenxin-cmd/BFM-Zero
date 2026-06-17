@@ -134,14 +134,11 @@ try:
     print(f"  {FAIL if dead_code else PASS}  "
           f"{'BUG CONFIRMED: embedding_layers ignored in residual F network' if dead_code else 'ok'}")
 
-    # Show what fixed version would look like (using embedding_layers for embed)
-    # We can't easily patch the class, so just estimate:
-    # residual_embedding with 2 layers vs 6 layers: ~ (2*h^2)/(6*h^2) reduction ratio
-    ratio_fix = (2 * 2048**2) / (6 * 2048**2)
-    embed_contribution = p_residual - p_simple   # rough
-    p_fixed_est = p_simple + embed_contribution * ratio_fix
-    print(f"  Estimated fixed residual F params: ~{p_fixed_est/1e6:.1f}M "
-          f"(vs current {p_residual/1e6:.1f}M)")
+    # Build the FIXED version directly (embedding_layers=2 is now actually used)
+    m_residual_fixed = build_split_f("residual", hidden_layers=6, embedding_layers=2)
+    p_fixed = count_params(m_residual_fixed)
+    print(f"  Residual SplitForwardMap (FIXED):  {p_fixed/1e6:.1f}M params")
+    print(f"  Fixed / Simple = {p_fixed/p_simple:.1f}x  (was {p_residual/p_simple:.1f}x before fix)")
 
 except Exception as e:
     print(f"  Could not instantiate SplitForwardMap: {e}")

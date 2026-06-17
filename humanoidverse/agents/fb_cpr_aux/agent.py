@@ -301,7 +301,13 @@ class FBcprAuxAgent(FBcprAgent):
             if is_split:
                 weight = Q_fb_body.abs().mean().detach() if self.cfg.train.scale_reg else 1.0
                 if self.cfg.train.fb_hand_loss_mode == "fb":
-                    hand_term = -self.cfg.train.actor_hand_q_weight * Q_fb_hand.mean()
+                    # Adaptive scaling: normalise Q_hand to Q_body magnitude so the hand
+                    # gradient is commensurate with the body gradient regardless of gamma.
+                    # Without this, Q_hand (gamma=0.7) is ~75x smaller than Q_body (gamma=0.98),
+                    # making the hand term negligible and causing the hand policy to drift.
+                    q_body_scale = Q_fb_body.abs().mean().detach()
+                    q_hand_scale = Q_fb_hand.abs().mean().detach().clamp(min=1e-6)
+                    hand_term = -self.cfg.train.actor_hand_q_weight * (q_body_scale / q_hand_scale) * Q_fb_hand.mean()
                 else:
                     hand_term = hand_weight * actor_loss_hand_mse
                 actor_loss = (
