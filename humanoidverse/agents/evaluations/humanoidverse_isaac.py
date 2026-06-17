@@ -495,7 +495,7 @@ def _async_tracking_worker(
         ooo = {k: v for k, v in obs_cpu.items() if k != "history"}
         _episode.initialise(ooo, info_cpu)
 
-        xpos_log = [isaac_env.simulator._rigid_body_pos.reshape(num_envs, -1, 3)]
+        xpos_log = [isaac_env.simulator._rigid_body_pos.reshape(num_envs, -1, 3).cpu()]
         # root_rot_log stores pelvis xyzw quaternion; used for heading-frame EE error
         xrot_root_log = [isaac_env.simulator._rigid_body_rot.reshape(num_envs, -1, 4)[:, _PELVIS_BODY_IDX, :].cpu()]
         joint_pos = [isaac_env.simulator.dof_state[..., 0]]
@@ -514,7 +514,7 @@ def _async_tracking_worker(
             observation, reward, terminated, truncated, info = env.step(action, to_numpy=False)
             joint_pos.append(isaac_env.simulator.dof_state[..., 0])
             joint_vel.append(isaac_env.simulator.dof_state[..., 1])
-            xpos_log.append(isaac_env.simulator._rigid_body_pos.reshape(num_envs, -1, 3))
+            xpos_log.append(isaac_env.simulator._rigid_body_pos.reshape(num_envs, -1, 3).cpu())
             xrot_root_log.append(isaac_env.simulator._rigid_body_rot.reshape(num_envs, -1, 4)[:, _PELVIS_BODY_IDX, :].cpu())
 
             ooo = {k: v for k, v in observation.items() if k != "history"}
