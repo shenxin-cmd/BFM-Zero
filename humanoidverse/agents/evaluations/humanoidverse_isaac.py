@@ -628,8 +628,8 @@ def distance_proximity(next_obs: torch.Tensor, tracking_target: torch.Tensor, bo
 
 def _calc_metrics(ep):
     metr = {}
-    next_obs = torch.tensor(ep["observation"]["state"][:, :QVEL_IDX], dtype=torch.float32)
-    tracking_target = torch.tensor(ep["tracking_target"]["state"][:, :QVEL_IDX], dtype=torch.float32)
+    next_obs = torch.as_tensor(ep["observation"]["state"][:, :QVEL_IDX], dtype=torch.float32)
+    tracking_target = torch.as_tensor(ep["tracking_target"]["state"][:, :QVEL_IDX], dtype=torch.float32)
     dist_prox_res = distance_proximity(next_obs=next_obs, tracking_target=tracking_target, prefix="obs_state_")
     metr.update(dist_prox_res)
     emd_res = emd_numpy(next_obs=next_obs, tracking_target=tracking_target, prefix="obs_state_")
@@ -668,14 +668,15 @@ def _calc_metrics(ep):
         from humanoidverse.envs.legged_robot_motions.legged_robot_motions import my_quat_rotate
 
         def _to_tensor(x):
-            return x if isinstance(x, torch.Tensor) else torch.tensor(x, dtype=torch.float32)
+            t = x if isinstance(x, torch.Tensor) else torch.tensor(x, dtype=torch.float32)
+            return t.float().cpu()
 
-        xpos_ee      = _to_tensor(ep["xpos_ee"]).float()
-        target_ee    = _to_tensor(ep["target_ee_pos"]).float()
-        root_pos     = _to_tensor(ep["root_pos"]).float()
-        root_rot     = _to_tensor(ep["root_rot"]).float()         # xyzw
-        tgt_root_pos = _to_tensor(ep["target_root_pos"]).float()
-        tgt_root_rot = _to_tensor(ep["target_root_rot"]).float()  # xyzw
+        xpos_ee      = _to_tensor(ep["xpos_ee"])
+        target_ee    = _to_tensor(ep["target_ee_pos"])
+        root_pos     = _to_tensor(ep["root_pos"])
+        root_rot     = _to_tensor(ep["root_rot"])         # xyzw
+        tgt_root_pos = _to_tensor(ep["target_root_pos"])
+        tgt_root_rot = _to_tensor(ep["target_root_rot"])  # xyzw
 
         min_t = min(xpos_ee.shape[0], target_ee.shape[0], root_pos.shape[0], tgt_root_pos.shape[0])
         xpos_ee      = xpos_ee[:min_t]
