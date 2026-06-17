@@ -2,7 +2,7 @@
 
 Scans ``batch_data_{xy,xz,yz}_v3/clips_obs/{shape}/{plane}/*_obs.npz`` under
 ``--src-dir``, validates each clip like data2 (state back-to-back + arm continuity),
-and writes inference-ready NPZ to a flat ``--output-dir``.
+and writes inference-ready NPZ under ``--output-dir/clips/{plane}/{shape}/``.
 
 Run (repo root):
 
@@ -102,6 +102,8 @@ def main() -> None:
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    (args.output_dir / "clips").mkdir(parents=True, exist_ok=True)
+    (args.output_dir / "reports").mkdir(parents=True, exist_ok=True)
     pairs = collect_obs_files(args.src_dir)
     if args.max_clips is not None:
         pairs = pairs[: args.max_clips]
@@ -111,7 +113,7 @@ def main() -> None:
         )
 
     all_stats: list[dict] = []
-    seen_names: set[str] = set()
+    seen_names: dict[str, set[str]] = defaultdict(set)
     by_group: dict[str, dict] = defaultdict(lambda: {"n": 0, "n_jump": 0, "n_fail": 0})
 
     for i, (batch_name, obs_path) in enumerate(pairs):
@@ -120,22 +122,27 @@ def main() -> None:
         rel = obs_path.relative_to(batch_dir / "clips_obs")
         shape = rel.parts[0] if rel.parts else "unknown"
         group_key = f"{plane}/{shape}"
+        clip_out_dir = args.output_dir / "clips" / plane / shape
+        clip_out_dir.mkdir(parents=True, exist_ok=True)
 
         raw_cands = _raw_candidates(batch_dir, obs_path)
         raw_path = _match_raw_for_obs(obs_path, raw_cands) if raw_cands else None
         if raw_cands and raw_path is None:
             print(f"WARNING: no raw match for {obs_path.name} in {batch_name}")
 
-        out_name = _unique_out_name(args.output_dir, batch_name, obs_path.name, seen_names)
+        out_name = _unique_out_name(
+            clip_out_dir, batch_name, obs_path.name, seen_names[group_key]
+        )
         stats = prepare_one_obs(
             obs_path,
             raw_path,
-            args.output_dir,
+            clip_out_dir,
             args.jump_threshold,
             output_name=out_name,
         )
-        target = args.output_dir / out_name
+        target = clip_out_dir / out_name
         stats["output_npz"] = str(target)
+        stats["output_relpath"] = str(target.relative_to(args.output_dir))
 
         stats["batch"] = batch_name
         stats["plane"] = plane
@@ -153,11 +160,15 @@ def main() -> None:
         jump = stats.get("jump_flagged")
         jump_s = f" jump={jump}" if jump is not None else ""
         if (i + 1) % 100 == 0 or i == 0 or i + 1 == len(pairs):
-            print(f"[{i + 1}/{len(pairs)}] {flag}{jump_s} {plane}/{shape} -> {target.name}")
+            print(f"[{i + 1}/{len(pairs)}] {flag}{jump_s} {plane}/{shape} -> {stats['output_relpath']}")
 
     summary = {
         "src_dir": str(args.src_dir.resolve()),
         "output_dir": str(args.output_dir.resolve()),
+        "layout": {
+            "clips": "clips/{plane}/{shape}/*_obs.npz",
+            "reports": "reports/prepare_report.json",
+        },
         "version": "v3_inference_batch",
         "n_clips": len(all_stats),
         "n_state_failed": sum(1 for s in all_stats if s.get("state_check_ok") is False),
@@ -168,13 +179,14 @@ def main() -> None:
             "uv run -m humanoidverse.tracking_inference_split "
             f"--model-folder <checkpoint_dir> "
             f"--traj-obs-dir {args.output_dir} "
-            "--traj-glob '*_obs.npz' --one-per-shape-plane"
+            "--traj-glob '**/*_obs.npz' --one-per-shape-plane"
         ),
     }
-    report = args.report_json or (args.output_dir / "prepare_report.json")
+    report = args.report_json or (args.output_dir / "reports" / "prepare_report.json")
+    report.parent.mkdir(parents=True, exist_ok=True)
     with open(report, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
-    print(f"\nSaved {len(all_stats)} clips -> {args.output_dir}")
+    print(f"\nSaved {len(all_stats)} clips -> {args.output_dir}/clips/{{plane}}/{{shape}}/")
     print(f"state failed={summary['n_state_failed']} jump_flagged={summary['n_jump_flagged']}")
     print(f"Report -> {report}")
     if summary["n_state_failed"]:

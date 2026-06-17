@@ -30,13 +30,15 @@
 （有限差分 ~30× 偏大）。默认 ``--repair-privileged`` 会从 ``state`` 重建 qpos/qvel 并用
 MuJoCo FK 重算 ``privileged_state``，同时对每条轨迹分别 rollout 并保存指标。
 
-Rollout 输出（``<model>/tracking_inference_split/``）：
-  - ``z_expert_{stem}.npz`` / ``z_actual_{stem}.npz``：专家目标 z vs 机器人单帧重编码 z
-  - ``z_actual_smoothed_{stem}.npz``：对 Isaac B 投影施加与 expert 相同的 window+EMA 后再 project_z
-  - ``z_compare_{stem}.npz``：合并上述三条 z 序列
-  - ``body_input_{stem}.json``：B_body 408 维输入（expert NPZ vs Isaac）的分组 L2 差
-  - ``metrics_{stem}.json``：含 ``z_body_cos_expert_vs_actual(_smoothed)`` 等余弦相似度
-  - ``ee_traj_3d_{stem}.png`` + ``ee_traj_plane_{stem}_{xy,xz,yz}.png``：英文 EE 对比图
+Rollout 输出（``<model>/tracking_inference_split/``）按**来源**与**类型**分目录：
+
+  ``summary/``
+    汇总 ``summary_by_plane_shape.json`` / ``.csv``、``summary_overall.json``
+
+  ``clips/{plane}/{shape}/{clip_id}/``
+    ``metrics.json``、``body_input.json``、``analysis.pkl``、``zs_expert.pkl``
+    ``z_expert.npz``、``z_actual.npz``、``z_actual_smoothed.npz``、``z_compare.npz``
+    ``ee_traj_3d.png``、``ee_traj_plane_{xy,xz,yz}.png``、``tracking.mp4``（可选）
 """
 from __future__ import annotations
 
@@ -44,6 +46,7 @@ import csv
 import os
 import re
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 
 os.environ.setdefault("MUJOCO_GL", "egl")
@@ -227,9 +230,54 @@ def _compute_z_actual(model, observation: dict, last_action_buf: "torch.Tensor")
     return _compute_z_from_B(model, _compute_B_raw(model, _backward_obs_from_env(observation, last_action_buf)))
 
 
+@dataclass
+class InferenceOutputLayout:
+    """Rollout artifacts grouped by source (plane/shape) and clip id."""
+
+    root: Path
+
+    @classmethod
+    def create(cls, model_folder: Path) -> "InferenceOutputLayout":
+        root = model_folder / "tracking_inference_split"
+        root.mkdir(parents=True, exist_ok=True)
+        summary = root / "summary"
+        summary.mkdir(parents=True, exist_ok=True)
+        return cls(root=root)
+
+    @property
+    def summary_dir(self) -> Path:
+        return self.root / "summary"
+
+    def clip_dir(self, clip_meta: dict | None, clip_id: str) -> Path:
+        meta = clip_meta or {}
+        plane = str(meta.get("plane") or "unknown")
+        shape = str(meta.get("shape") or "unknown")
+        d = self.root / "clips" / plane / shape / clip_id
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+
+def _clip_id_from_path(traj_path: Path) -> str:
+    clip_id = traj_path.stem.removesuffix("_obs")
+    return re.sub(r"[^\w\-.]+", "_", clip_id)
+
+
+def _discover_traj_paths(traj_obs_dir: Path, traj_glob: str) -> list[Path]:
+    paths = sorted(traj_obs_dir.glob(traj_glob))
+    if not paths and traj_glob in ("*.npz", "*.pkl", "**/*_obs.npz"):
+        for alt in ("**/*_obs.npz", "clips/**/*_obs.npz", "*.npz", "*.pkl"):
+            if alt == traj_glob:
+                continue
+            paths = sorted(traj_obs_dir.glob(alt))
+            if paths:
+                print(f"提示: {traj_glob!r} 无匹配，已改用 {alt!r}，共 {len(paths)} 个文件。")
+                break
+    return paths
+
+
 def _save_inference_metrics(
-    output_dir: Path,
-    stem: str,
+    clip_dir: Path,
+    clip_id: str,
     n_steps: int,
     joint_pos_arr: np.ndarray,
     z_actual_arr: np.ndarray,
@@ -292,14 +340,14 @@ def _save_inference_metrics(
     if body_input_diag:
         metrics.update({k: v for k, v in body_input_diag.items() if v is not None and k not in metrics})
 
-    print(f"\n=== Inference Metrics ({stem}) ===")
+    print(f"\n=== Inference Metrics ({clip_id}) ===")
     for k, v in metrics.items():
         print(f"  {k}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
 
     z_hand_dim = int(z_act.shape[1] - z_body_dim)
+    metrics["output_relpath"] = str(clip_dir.relative_to(clip_dir.parents[3]))
     _save_z_sequences(
-        output_dir=output_dir,
-        stem=stem,
+        clip_dir=clip_dir,
         z_expert=z_exp,
         z_actual=z_act,
         z_body_dim=z_body_dim,
@@ -309,12 +357,13 @@ def _save_inference_metrics(
     )
 
     if body_input_diag:
-        body_path = output_dir / f"body_input_{stem}.json"
+        body_path = clip_dir / "body_input.json"
         with open(body_path, "w", encoding="utf-8") as f:
             json.dump(body_input_diag, f, indent=2)
         print(f"Saved body input diag → {body_path}")
 
     analysis = {
+        "clip_id":        clip_id,
         "metrics":        metrics,
         "z_expert":       z_exp,
         "z_actual":       z_act,
@@ -322,16 +371,16 @@ def _save_inference_metrics(
             z_actual_smoothed_arr[:n_cmp] if z_actual_smoothed_arr is not None else None
         ),
         "body_input_diag": body_input_diag,
-        "joint_pos_pred": jp_pred,     # [n_cmp, 29]
-        "joint_pos_ref":  jp_ref,      # [n_cmp, 29]
-        "ee_local_pred":  ee_pred,     # [n_cmp, 3]  heading-frame right wrist pos (actual)
-        "ee_local_ref":   ee_ref,      # [n_cmp, 3]  heading-frame right wrist pos (ref)
+        "joint_pos_pred": jp_pred,
+        "joint_pos_ref":  jp_ref,
+        "ee_local_pred":  ee_pred,
+        "ee_local_ref":   ee_ref,
     }
-    analysis_path = output_dir / f"analysis_{stem}.pkl"
+    analysis_path = clip_dir / "analysis.pkl"
     joblib.dump(analysis, analysis_path)
     print(f"Saved analysis data → {analysis_path}")
 
-    metrics_path = output_dir / f"metrics_{stem}.json"
+    metrics_path = clip_dir / "metrics.json"
     with open(metrics_path, "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
     print(f"Saved metrics      → {metrics_path}")
@@ -340,8 +389,7 @@ def _save_inference_metrics(
 
 def _save_z_sequences(
     *,
-    output_dir: Path,
-    stem: str,
+    clip_dir: Path,
     z_expert: np.ndarray,
     z_actual: np.ndarray,
     z_body_dim: int,
@@ -356,37 +404,36 @@ def _save_z_sequences(
         "z_hand_dim": np.int32(z_hand_dim),
     }
     np.savez(
-        output_dir / f"z_expert_{stem}.npz",
+        clip_dir / "z_expert.npz",
         z=z_expert.astype(np.float32),
         **common,
     )
     np.savez(
-        output_dir / f"z_actual_{stem}.npz",
+        clip_dir / "z_actual.npz",
         z=z_actual.astype(np.float32),
         **common,
     )
     if z_actual_smoothed is not None:
         np.savez(
-            output_dir / f"z_actual_smoothed_{stem}.npz",
+            clip_dir / "z_actual_smoothed.npz",
             z=z_actual_smoothed.astype(np.float32),
             **common,
         )
     compare_kw = {
         "z_expert": z_expert.astype(np.float32),
         "z_actual": z_actual.astype(np.float32),
-        "stem": np.array(stem),
         "plane": np.array(str(meta.get("plane", ""))),
         "shape": np.array(str(meta.get("shape", ""))),
         **common,
     }
     if z_actual_smoothed is not None:
         compare_kw["z_actual_smoothed"] = z_actual_smoothed.astype(np.float32)
-    np.savez(output_dir / f"z_compare_{stem}.npz", **compare_kw)
-    saved = f"z_expert_{stem}.npz, z_actual_{stem}.npz"
+    np.savez(clip_dir / "z_compare.npz", **compare_kw)
+    saved = "z_expert.npz, z_actual.npz"
     if z_actual_smoothed is not None:
-        saved += f", z_actual_smoothed_{stem}.npz"
-    saved += f", z_compare_{stem}.npz"
-    print(f"Saved z sequences  → {saved}")
+        saved += ", z_actual_smoothed.npz"
+    saved += ", z_compare.npz"
+    print(f"Saved z sequences  → {clip_dir.name}/{saved}")
 
 
 def _npz_scalar_str(path: Path, key: str) -> str | None:
@@ -426,8 +473,14 @@ def parse_clip_meta(path: Path) -> dict[str, str]:
 
 
 def _load_prepare_quality_map(traj_obs_dir: Path) -> dict[str, dict]:
-    report_path = traj_obs_dir / "prepare_report.json"
-    if not report_path.is_file():
+    for candidate in (
+        traj_obs_dir / "reports" / "prepare_report.json",
+        traj_obs_dir / "prepare_report.json",
+    ):
+        if candidate.is_file():
+            report_path = candidate
+            break
+    else:
         return {}
     with open(report_path, encoding="utf-8") as f:
         report = json.load(f)
@@ -473,14 +526,13 @@ def select_one_per_shape_plane(
 def _save_ee_traj_plots(
     expert_ee_base: np.ndarray,
     policy_ee_base: np.ndarray,
-    output_dir: Path,
-    stem: str,
+    clip_dir: Path,
     title_suffix: str = "",
 ) -> None:
     """Save 3D and XY/XZ/YZ pelvis-frame EE comparison plots (English labels only)."""
     n_cmp = min(len(expert_ee_base), len(policy_ee_base))
     if n_cmp < 2:
-        print(f"WARNING: skip EE plots for {stem}: too few frames ({n_cmp})")
+        print(f"WARNING: skip EE plots for {clip_dir.name}: too few frames ({n_cmp})")
         return
     exp = expert_ee_base[:n_cmp]
     pol = policy_ee_base[:n_cmp]
@@ -509,7 +561,7 @@ def _save_ee_traj_plots(
     ax.set_zlabel("Z (m)")
     ax.set_title(f"Right-hand EE trajectory (pelvis frame){suffix}\n{subtitle}", fontsize=10)
     ax.legend(fontsize=8, loc="best")
-    fig.savefig(output_dir / f"ee_traj_3d_{stem}.png", dpi=160, bbox_inches="tight")
+    fig.savefig(clip_dir / "ee_traj_3d.png", dpi=160, bbox_inches="tight")
     plt.close(fig)
 
     plane_cfg = [
@@ -532,13 +584,13 @@ def _save_ee_traj_plots(
             fontsize=10,
         )
         ax.legend(fontsize=9, loc="best")
-        fig.savefig(output_dir / f"ee_traj_plane_{stem}_{pname}.png", dpi=160, bbox_inches="tight")
+        fig.savefig(clip_dir / f"ee_traj_plane_{pname}.png", dpi=160, bbox_inches="tight")
         plt.close(fig)
-    print(f"Saved EE traj plots  → ee_traj_3d_{stem}.png + plane XY/XZ/YZ")
+    print(f"Saved EE traj plots  → {clip_dir.name}/ee_traj_3d.png + plane XY/XZ/YZ")
 
 
 def _save_aggregate_summaries(
-    output_dir: Path,
+    summary_dir: Path,
     per_clip_metrics: list[dict],
 ) -> None:
     """Aggregate per-clip metrics by (plane, shape) and overall."""
@@ -563,14 +615,15 @@ def _save_aggregate_summaries(
             vals = [float(x[k]) for x in items if k in x]
             row[f"mean_{k}"] = float(np.mean(vals)) if vals else None
         row["clip_files"] = [x.get("traj_file", "") for x in items]
+        row["output_relpaths"] = [x.get("output_relpath", "") for x in items]
         agg_rows.append(row)
 
-    json_path = output_dir / "summary_by_plane_shape.json"
+    json_path = summary_dir / "summary_by_plane_shape.json"
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(agg_rows, f, indent=2)
     print(f"Saved aggregate     → {json_path}")
 
-    csv_path = output_dir / "summary_by_plane_shape.csv"
+    csv_path = summary_dir / "summary_by_plane_shape.csv"
     if agg_rows:
         fieldnames = list(agg_rows[0].keys())
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -584,7 +637,7 @@ def _save_aggregate_summaries(
     for k in metric_keys:
         vals = [float(x[k]) for x in per_clip_metrics if k in x]
         overall[f"mean_{k}"] = float(np.mean(vals)) if vals else None
-    overall_path = output_dir / "summary_overall.json"
+    overall_path = summary_dir / "summary_overall.json"
     with open(overall_path, "w", encoding="utf-8") as f:
         json.dump(overall, f, indent=2)
     print(f"Saved overall       → {overall_path}")
@@ -836,13 +889,13 @@ def _run_single_traj_rollout(
     *,
     traj_np: dict[str, np.ndarray],
     z: torch.Tensor,
-    stem: str,
+    clip_id: str,
+    clip_dir: Path,
     model,
     wrapped_env,
     env,
     dev: torch.device,
     num_envs: int,
-    output_dir: Path,
     _wrist_slice: slice,
     _z_body_dim: int,
     episode_len: int | None,
@@ -880,7 +933,7 @@ def _run_single_traj_rollout(
     n_steps = min(Tz, traj_T - 1, expert_qpos.shape[0] - 1)
     if episode_len is not None:
         n_steps = min(n_steps, episode_len)
-    print(f"Rollout [{stem}]: {n_steps} steps (z={Tz}, traj_T={traj_T})")
+    print(f"Rollout [{clip_id}]: {n_steps} steps (z={Tz}, traj_T={traj_T})")
 
     joint_pos = [wrapped_env._env.simulator.dof_state[..., 0].clone().cpu().numpy()]
     _z_actual_list: list[np.ndarray] = []
@@ -908,7 +961,7 @@ def _run_single_traj_rollout(
     )
 
     for i in range(n_steps):
-        print(f"  [{stem}] step {i + 1}/{n_steps}")
+        print(f"  [{clip_id}] step {i + 1}/{n_steps}")
         bmap_obs = _backward_obs_from_env(observation, _last_act_buf)
         with torch.no_grad():
             B_raw = _compute_B_raw(model, bmap_obs)
@@ -951,8 +1004,8 @@ def _run_single_traj_rollout(
     body_input_diag = _compute_body_input_diagnostics(expert_flat, actual_flat, body_idx)
 
     metrics = _save_inference_metrics(
-        output_dir=output_dir,
-        stem=stem,
+        clip_dir=clip_dir,
+        clip_id=clip_id,
         n_steps=n_steps,
         joint_pos_arr=np.stack(joint_pos, axis=0).squeeze(1),
         z_actual_arr=np.stack(_z_actual_list),
@@ -973,14 +1026,13 @@ def _run_single_traj_rollout(
     _save_ee_traj_plots(
         expert_ee_base[: len(policy_ee_base)],
         policy_ee_base,
-        output_dir,
-        stem,
+        clip_dir,
         title_suffix=title_suffix,
     )
 
     if save_mp4 and expert_video is not None:
         new_frames = [np.concatenate([a, b], axis=1) for a, b in zip(expert_video, frames)]
-        video_path = output_dir / f"tracking_{stem}.mp4"
+        video_path = clip_dir / "tracking.mp4"
         media.write_video(str(video_path), new_frames, fps=50)
         print(f"Saved video: {video_path}")
     return metrics
@@ -1085,19 +1137,14 @@ def main(
     print(env.config.simulator)
     print("-" * 80)
 
-    output_dir = model_folder / "tracking_inference_split"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_layout = InferenceOutputLayout.create(model_folder)
+    print(f"Output root: {output_layout.root}")
 
-    paths = sorted(traj_obs_dir.glob(traj_glob))
-    if not paths and traj_glob in ("*.pkl", "*.npz"):
-        alt = "*.npz" if traj_glob == "*.pkl" else "*.pkl"
-        paths = sorted(traj_obs_dir.glob(alt))
-        if paths:
-            print(f"提示: {traj_glob!r} 无匹配，已改用 {alt!r}，共 {len(paths)} 个文件。")
+    paths = _discover_traj_paths(traj_obs_dir, traj_glob)
     if not paths:
         raise FileNotFoundError(
             f"在 {traj_obs_dir} 下未找到匹配 {traj_glob!r} 的文件"
-            f"（若轨迹为另一种格式，请显式设置 --traj-glob，例如 '*.npz' 或 '*.pkl'）"
+            f"（若轨迹为另一种格式，请显式设置 --traj-glob，例如 '**/*_obs.npz' 或 '*.pkl'）"
         )
 
     quality_map = _load_prepare_quality_map(traj_obs_dir)
@@ -1111,11 +1158,13 @@ def main(
     fk_model, fk_data, ee_id = _build_fk_context()
     print(f"FK EE body '{_EE_BODY}' id = {ee_id}")
 
-    traj_items: list[tuple[str, dict[str, np.ndarray], torch.Tensor, dict]] = []
+    traj_items: list[tuple[str, Path, dict[str, np.ndarray], torch.Tensor, dict]] = []
 
     for traj_path in paths:
         print(f"\nLoad trajectory: {traj_path}")
         clip_meta = parse_clip_meta(traj_path)
+        clip_id = _clip_id_from_path(traj_path)
+        clip_dir = output_layout.clip_dir(clip_meta, clip_id)
         traj_np = load_traj_obs_file(traj_path)
         if repair_privileged:
             print("  Repairing privileged_state from state (MuJoCo FK) …")
@@ -1123,26 +1172,26 @@ def main(
         traj_np = align_traj_privileged_for_model(traj_np, model)
         obs_full = traj_to_backward_batch(traj_np, dev)
         z = tracking_inference(tree_map(lambda x: x[1:], obs_full))
-        stem = re.sub(r"[^\w\-.]+", "_", traj_path.stem)
-        joblib.dump(z.detach().cpu().numpy(), output_dir / f"zs_{stem}.pkl")
-        print(f"Saved {output_dir / f'zs_{stem}.pkl'}  (z steps={z.shape[0]})")
-        traj_items.append((stem, traj_np, z, clip_meta))
+        zs_path = clip_dir / "zs_expert.pkl"
+        joblib.dump(z.detach().cpu().numpy(), zs_path)
+        print(f"Saved {zs_path}  (z steps={z.shape[0]})")
+        traj_items.append((clip_id, clip_dir, traj_np, z, clip_meta))
 
     if not traj_items:
         raise RuntimeError("No trajectories processed")
 
     per_clip_metrics: list[dict] = []
-    for stem, traj_np, z, clip_meta in traj_items:
+    for clip_id, clip_dir, traj_np, z, clip_meta in traj_items:
         metrics = _run_single_traj_rollout(
             traj_np=traj_np,
             z=z,
-            stem=stem,
+            clip_id=clip_id,
+            clip_dir=clip_dir,
             model=model,
             wrapped_env=wrapped_env,
             env=env,
             dev=dev,
             num_envs=num_envs,
-            output_dir=output_dir,
             _wrist_slice=_wrist_slice,
             _z_body_dim=_z_body_dim,
             episode_len=episode_len,
@@ -1156,7 +1205,7 @@ def main(
         )
         per_clip_metrics.append(metrics)
 
-    _save_aggregate_summaries(output_dir, per_clip_metrics)
+    _save_aggregate_summaries(output_layout.summary_dir, per_clip_metrics)
 
 
 if __name__ == "__main__":

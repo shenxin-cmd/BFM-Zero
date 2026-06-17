@@ -82,7 +82,7 @@ uv run -m humanoidverse.tracking_inference_split \
 
 ### 2d. V3 批量 clip → tracking inference（`prepare_tracking_clips_batch.py`）
 
-与 data2 相同校验逻辑，但**批量扫描** `custom_circles_src` 下三个 V3 batch 目录，输出扁平 inference 目录（不转 pkl）。
+与 data2 相同校验逻辑，但**批量扫描** `custom_circles_src` 下三个 V3 batch 目录，输出按平面×形状分目录（不转 pkl）。
 
 **输入目录结构**（与 data2 一致，版本后缀 `_v3`）：
 
@@ -92,6 +92,20 @@ custom_circles_src/
   batch_data_xz_v3/clips_obs/{shape}/{plane}/*_obs.npz
   batch_data_yz_v3/clips_obs/{shape}/{plane}/*_obs.npz
   batch_data_*_v3/raw/{shape}/{plane}/seed*.npz   # 可选，用于背靠背校验
+```
+
+**预处理输出目录结构**：
+
+```
+shapes_v3/
+  clips/
+    xy/circle/*.npz
+    xy/ellipse/*.npz
+    ...
+    xz/...
+    yz/...
+  reports/
+    prepare_report.json
 ```
 
 10 种 shape × 3 平面 ≈ **3000** 条；预处理为纯 CPU，较快。
@@ -104,14 +118,33 @@ python scripts/data_preprocess/prepare_tracking_clips_batch.py \
 uv run -m humanoidverse.tracking_inference_split \
     --model-folder results/<your_checkpoint> \
     --traj-obs-dir humanoidverse/data/inference_clips/shapes_v3 \
-    --traj-glob "*_obs.npz" \
+    --traj-glob "**/*_obs.npz" \
     --one-per-shape-plane \
     --z-window 8 --z-ema-alpha 0.6
 ```
 
-`--one-per-shape-plane` 每平面×每形状选 1 条（约 30 条）做 Isaac rollout；汇总误差、EE 对比图、z 序列见 `tracking_inference_split/` 输出。
+`--one-per-shape-plane` 每平面×每形状选 1 条（约 30 条）做 Isaac rollout。
 
-每条 clip 额外输出：
+**Inference 输出目录结构**（`<checkpoint>/tracking_inference_split/`）：
+
+```
+tracking_inference_split/
+  summary/
+    summary_by_plane_shape.json
+    summary_by_plane_shape.csv
+    summary_overall.json
+  clips/
+    yz/circle/<clip_id>/
+      metrics.json
+      body_input.json
+      analysis.pkl
+      zs_expert.pkl
+      z_expert.npz / z_actual.npz / z_actual_smoothed.npz / z_compare.npz
+      ee_traj_3d.png / ee_traj_plane_{xy,xz,yz}.png
+      tracking.mp4          # 若 --save-mp4
+```
+
+每条 clip 目录内文件说明：
 - `z_actual_smoothed_*.npz`：对 Isaac 的 B 投影做与 expert 相同的 `--z-window` / `--z-ema-alpha` 后再 `project_z`（用于公平对比 `z_body`）
 - `body_input_*.json`：B_body 输入在 expert NPZ vs Isaac 间的分组 L2 差（含 root grav/angvel、privileged body）
 - `metrics_*.json` 内 `z_body_cos_expert_vs_actual_smoothed` 等余弦相似度
