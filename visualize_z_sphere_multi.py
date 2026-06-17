@@ -20,6 +20,13 @@ visualize_z_sphere_multi.py
   # 指定 pkl 或 npz（tracking_inference_split 输出的 z_expert_*.npz 等）
   python visualize_z_sphere_multi.py  --pkl-files a.pkl b.npz c.npz
 
+  # expert vs actual vs actual_smoothed（公平对比 z_body）
+  python visualize_z_sphere_multi.py --pkl-files \\
+      tracking_inference_split/z_expert_STEM.npz \\
+      tracking_inference_split/z_actual_STEM.npz \\
+      tracking_inference_split/z_actual_smoothed_STEM.npz \\
+      --labels expert actual actual_smoothed --z-body-dim 324
+
   # 保存动图
   python visualize_z_sphere_multi.py  --pkl-dir /path/pkls --save-gif --save-mp4
 
@@ -67,10 +74,12 @@ def _load_z_file(p: Path) -> np.ndarray:
                 z = np.asarray(d["z_expert"], dtype=np.float32)
             elif "z_actual" in d.files:
                 z = np.asarray(d["z_actual"], dtype=np.float32)
+            elif "z_actual_smoothed" in d.files:
+                z = np.asarray(d["z_actual_smoothed"], dtype=np.float32)
             else:
                 raise KeyError(
-                    f"{p.name}: NPZ must contain 'z', 'z_expert', or 'z_actual'; "
-                    f"found {list(d.files)}"
+                    f"{p.name}: NPZ must contain 'z', 'z_expert', 'z_actual', or "
+                    f"'z_actual_smoothed'; found {list(d.files)}"
                 )
             if "z_body_dim" in d.files and d["z_body_dim"].size == 1:
                 # optional; caller may override via CLI

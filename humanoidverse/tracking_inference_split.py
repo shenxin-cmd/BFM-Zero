@@ -29,6 +29,14 @@
 录制轨迹（``data/recordings/*_obs.npz``）的 ``privileged_state`` 常含错误 body 速度
 （有限差分 ~30× 偏大）。默认 ``--repair-privileged`` 会从 ``state`` 重建 qpos/qvel 并用
 MuJoCo FK 重算 ``privileged_state``，同时对每条轨迹分别 rollout 并保存指标。
+
+Rollout 输出（``<model>/tracking_inference_split/``）：
+  - ``z_expert_{stem}.npz`` / ``z_actual_{stem}.npz``：专家目标 z vs 机器人单帧重编码 z
+  - ``z_actual_smoothed_{stem}.npz``：对 Isaac B 投影施加与 expert 相同的 window+EMA 后再 project_z
+  - ``z_compare_{stem}.npz``：合并上述三条 z 序列
+  - ``body_input_{stem}.json``：B_body 408 维输入（expert NPZ vs Isaac）的分组 L2 差
+  - ``metrics_{stem}.json``：含 ``z_body_cos_expert_vs_actual(_smoothed)`` 等余弦相似度
+  - ``ee_traj_3d_{stem}.png`` + ``ee_traj_plane_{stem}_{xy,xz,yz}.png``：英文 EE 对比图
 """
 from __future__ import annotations
 
@@ -91,15 +99,132 @@ def _wrist_local_pos_slice(config: dict) -> slice:
     return slice(start, start + 3)
 
 
-def _compute_z_actual(model, observation: dict, last_action_buf: "torch.Tensor") -> np.ndarray:
-    """Re-encode current robot observation through backward_map → project_z."""
-    bmap_obs = {
+def _backward_obs_from_env(observation: dict, last_action_buf: "torch.Tensor") -> dict:
+    return {
         "state": observation["state"],
         "privileged_state": observation["privileged_state"],
         "last_action": observation.get("last_action", last_action_buf),
     }
-    z_raw = model.backward_map(bmap_obs)
-    return model.project_z(z_raw)[0].detach().cpu().numpy()
+
+
+def _compute_B_raw(model, bmap_obs: dict) -> np.ndarray:
+    """Raw backward-map output B (before project_z). Shape (z_dim,)."""
+    return model.backward_map(bmap_obs)[0].detach().cpu().numpy()
+
+
+def _compute_z_from_B(model, B: np.ndarray) -> np.ndarray:
+    B_t = torch.from_numpy(B).to(device=next(model.parameters()).device, dtype=torch.float32)
+    if B_t.ndim == 1:
+        B_t = B_t.unsqueeze(0)
+    return model.project_z(B_t)[0].detach().cpu().numpy()
+
+
+def _smooth_and_project_B(
+    model,
+    B_seq: np.ndarray,
+    *,
+    z_window: int,
+    z_ema_alpha: float | None,
+) -> np.ndarray:
+    """Same window mean + EMA + project_z as expert ``tracking_inference``."""
+    dev = next(model.parameters()).device
+    z = torch.from_numpy(np.asarray(B_seq, dtype=np.float32)).to(device=dev)
+    for step in range(z.shape[0]):
+        end_idx = min(step + max(1, z_window), z.shape[0])
+        z[step] = z[step:end_idx].mean(dim=0)
+    if z_ema_alpha is not None and z_ema_alpha < 1.0:
+        for step in range(1, z.shape[0]):
+            z[step] = z_ema_alpha * z[step] + (1.0 - z_ema_alpha) * z[step - 1]
+    return model.project_z(z).detach().cpu().numpy()
+
+
+def _flat_backward_numpy(state: np.ndarray, priv: np.ndarray) -> np.ndarray:
+    return np.concatenate(
+        [np.asarray(state, dtype=np.float64).reshape(-1), np.asarray(priv, dtype=np.float64).reshape(-1)],
+        axis=-1,
+    )
+
+
+def _body_idx_from_model(model) -> np.ndarray:
+    bmap = model._backward_map
+    if hasattr(bmap, "body_idx"):
+        return bmap.body_idx.detach().cpu().numpy()
+    total = int(model.cfg.archi.total_z_dim)
+    return np.arange(int(model.cfg.archi.z_body_dim), dtype=np.int64)
+
+
+def _compute_body_input_diagnostics(
+    expert_flat: np.ndarray,
+    actual_flat: np.ndarray,
+    body_idx: np.ndarray,
+) -> dict:
+    """L2 gaps in B_network body observation slice (expert NPZ vs Isaac)."""
+    n = min(len(expert_flat), len(actual_flat))
+    if n == 0:
+        return {}
+    exp_b = expert_flat[:n, body_idx]
+    act_b = actual_flat[:n, body_idx]
+    diff = act_b - exp_b
+    per_frame = np.linalg.norm(diff, axis=1)
+
+    flat_idx = body_idx.astype(np.int64)
+    root_mask = np.isin(flat_idx, [58, 59, 60, 61, 62, 63])
+    body_dof_mask = np.isin(flat_idx, list(range(22)) + list(range(29, 51)))
+    priv_mask = flat_idx >= 64
+
+    def _masked_mean_l2(mask: np.ndarray) -> float | None:
+        if not np.any(mask):
+            return None
+        return float(np.linalg.norm(diff[:, mask], axis=1).mean())
+
+    return {
+        "n_frames": int(n),
+        "body_input_l2_mean": float(per_frame.mean()),
+        "body_input_l2_p99": float(np.percentile(per_frame, 99)),
+        "body_dof_input_l2_mean": _masked_mean_l2(body_dof_mask),
+        "root_grav_angvel_input_l2_mean": _masked_mean_l2(root_mask),
+        "privileged_body_input_l2_mean": _masked_mean_l2(priv_mask),
+    }
+
+
+def _z_subspace_cosine_metrics(
+    z_expert: np.ndarray,
+    z_actual: np.ndarray,
+    z_actual_smoothed: np.ndarray | None,
+    z_body_dim: int,
+) -> dict:
+    """Cosine similarity between expert and actual z (full / body / hand)."""
+
+    def _mean_cos(a: np.ndarray, b: np.ndarray) -> float:
+        n = min(len(a), len(b))
+        if n == 0:
+            return 0.0
+        ab = (a[:n] * b[:n]).sum(axis=-1)
+        na = np.linalg.norm(a[:n], axis=-1)
+        nb = np.linalg.norm(b[:n], axis=-1)
+        return float(np.mean(ab / (na * nb + 1e-12)))
+
+    zb_e = z_expert[:, :z_body_dim]
+    zh_e = z_expert[:, z_body_dim:]
+    out = {
+        "z_cos_expert_vs_actual": _mean_cos(z_expert, z_actual),
+        "z_body_cos_expert_vs_actual": _mean_cos(zb_e, z_actual[:, :z_body_dim]),
+        "z_hand_cos_expert_vs_actual": _mean_cos(zh_e, z_actual[:, z_body_dim:]),
+    }
+    if z_actual_smoothed is not None:
+        out["z_cos_expert_vs_actual_smoothed"] = _mean_cos(z_expert, z_actual_smoothed)
+        out["z_body_cos_expert_vs_actual_smoothed"] = _mean_cos(
+            zb_e, z_actual_smoothed[:, :z_body_dim]
+        )
+        out["z_hand_cos_expert_vs_actual_smoothed"] = _mean_cos(
+            zh_e, z_actual_smoothed[:, z_body_dim:]
+        )
+    return out
+
+
+def _compute_z_actual(model, observation: dict, last_action_buf: "torch.Tensor") -> np.ndarray:
+    """Re-encode current robot observation: single-frame B → project_z (no smoothing)."""
+    return _compute_z_from_B(model, _compute_B_raw(model, _backward_obs_from_env(observation, last_action_buf)))
 
 
 def _save_inference_metrics(
@@ -114,6 +239,8 @@ def _save_inference_metrics(
     z_expert_arr: np.ndarray,
     z_body_dim: int,
     clip_meta: dict | None = None,
+    z_actual_smoothed_arr: np.ndarray | None = None,
+    body_input_diag: dict | None = None,
 ) -> dict:
     """Compute inference metrics, save pkl/json/npz, return metrics dict."""
     n_cmp = min(n_steps, ref_dof_arr.shape[0] - 1, len(z_actual_arr))
@@ -158,6 +285,13 @@ def _save_inference_metrics(
     if clip_meta:
         metrics.update({k: v for k, v in clip_meta.items() if k not in metrics})
 
+    z_cos = _z_subspace_cosine_metrics(
+        z_exp, z_act, z_actual_smoothed_arr[:n_cmp] if z_actual_smoothed_arr is not None else None, z_body_dim
+    )
+    metrics.update(z_cos)
+    if body_input_diag:
+        metrics.update({k: v for k, v in body_input_diag.items() if v is not None and k not in metrics})
+
     print(f"\n=== Inference Metrics ({stem}) ===")
     for k, v in metrics.items():
         print(f"  {k}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
@@ -171,12 +305,23 @@ def _save_inference_metrics(
         z_body_dim=z_body_dim,
         z_hand_dim=z_hand_dim,
         clip_meta=clip_meta,
+        z_actual_smoothed=z_actual_smoothed_arr[:n_cmp] if z_actual_smoothed_arr is not None else None,
     )
+
+    if body_input_diag:
+        body_path = output_dir / f"body_input_{stem}.json"
+        with open(body_path, "w", encoding="utf-8") as f:
+            json.dump(body_input_diag, f, indent=2)
+        print(f"Saved body input diag → {body_path}")
 
     analysis = {
         "metrics":        metrics,
-        "z_expert":       z_exp,       # [n_cmp, z_dim]  smoothed expert z
-        "z_actual":       z_act,       # [n_cmp, z_dim]  robot's online z encoding
+        "z_expert":       z_exp,
+        "z_actual":       z_act,
+        "z_actual_smoothed": (
+            z_actual_smoothed_arr[:n_cmp] if z_actual_smoothed_arr is not None else None
+        ),
+        "body_input_diag": body_input_diag,
         "joint_pos_pred": jp_pred,     # [n_cmp, 29]
         "joint_pos_ref":  jp_ref,      # [n_cmp, 29]
         "ee_local_pred":  ee_pred,     # [n_cmp, 3]  heading-frame right wrist pos (actual)
@@ -202,6 +347,7 @@ def _save_z_sequences(
     z_body_dim: int,
     z_hand_dim: int,
     clip_meta: dict | None,
+    z_actual_smoothed: np.ndarray | None = None,
 ) -> None:
     """Save expert / actual z as NPZ for sphere visualization."""
     meta = clip_meta or {}
@@ -219,16 +365,28 @@ def _save_z_sequences(
         z=z_actual.astype(np.float32),
         **common,
     )
-    np.savez(
-        output_dir / f"z_compare_{stem}.npz",
-        z_expert=z_expert.astype(np.float32),
-        z_actual=z_actual.astype(np.float32),
-        stem=np.array(stem),
-        plane=np.array(str(meta.get("plane", ""))),
-        shape=np.array(str(meta.get("shape", ""))),
+    if z_actual_smoothed is not None:
+        np.savez(
+            output_dir / f"z_actual_smoothed_{stem}.npz",
+            z=z_actual_smoothed.astype(np.float32),
+            **common,
+        )
+    compare_kw = {
+        "z_expert": z_expert.astype(np.float32),
+        "z_actual": z_actual.astype(np.float32),
+        "stem": np.array(stem),
+        "plane": np.array(str(meta.get("plane", ""))),
+        "shape": np.array(str(meta.get("shape", ""))),
         **common,
-    )
-    print(f"Saved z sequences  → z_expert_{stem}.npz, z_actual_{stem}.npz, z_compare_{stem}.npz")
+    }
+    if z_actual_smoothed is not None:
+        compare_kw["z_actual_smoothed"] = z_actual_smoothed.astype(np.float32)
+    np.savez(output_dir / f"z_compare_{stem}.npz", **compare_kw)
+    saved = f"z_expert_{stem}.npz, z_actual_{stem}.npz"
+    if z_actual_smoothed is not None:
+        saved += f", z_actual_smoothed_{stem}.npz"
+    saved += f", z_compare_{stem}.npz"
+    print(f"Saved z sequences  → {saved}")
 
 
 def _npz_scalar_str(path: Path, key: str) -> str | None:
@@ -693,6 +851,8 @@ def _run_single_traj_rollout(
     fk_data,
     ee_id: int,
     clip_meta: dict | None = None,
+    z_window: int = 1,
+    z_ema_alpha: float | None = None,
 ) -> dict:
     """Reset env to traj init, rollout tracking, save metrics for one trajectory."""
     expert_qpos, ref_root, dof_init_state = _build_expert_qpos(
@@ -724,10 +884,13 @@ def _run_single_traj_rollout(
 
     joint_pos = [wrapped_env._env.simulator.dof_state[..., 0].clone().cpu().numpy()]
     _z_actual_list: list[np.ndarray] = []
+    _B_actual_list: list[np.ndarray] = []
+    _actual_flat_list: list[np.ndarray] = []
     _ee_local_pred_list: list[np.ndarray] = []
     _policy_ee_base_list: list[np.ndarray] = []
     _action_dim = wrapped_env.action_space.shape[-1]
     _last_act_buf = torch.zeros((num_envs, _action_dim), dtype=torch.float32, device=sim_dev)
+    body_idx = _body_idx_from_model(model)
 
     expert_video = None
     frames: list[np.ndarray] = []
@@ -746,8 +909,14 @@ def _run_single_traj_rollout(
 
     for i in range(n_steps):
         print(f"  [{stem}] step {i + 1}/{n_steps}")
+        bmap_obs = _backward_obs_from_env(observation, _last_act_buf)
         with torch.no_grad():
-            _z_actual_list.append(_compute_z_actual(model, observation, _last_act_buf))
+            B_raw = _compute_B_raw(model, bmap_obs)
+            _B_actual_list.append(B_raw)
+            _z_actual_list.append(_compute_z_from_B(model, B_raw))
+        st_np = observation["state"][0].detach().cpu().numpy()
+        priv_np = observation["privileged_state"][0].detach().cpu().numpy()
+        _actual_flat_list.append(_flat_backward_numpy(st_np, priv_np))
         _ee_local_pred_list.append(
             observation["privileged_state"][0, _wrist_slice].detach().cpu().numpy()
         )
@@ -765,6 +934,22 @@ def _run_single_traj_rollout(
     _ref_dof_arr = traj_np["state"][:, :29] + _default_dof
     _ref_ee_arr = traj_np["privileged_state"][:, _wrist_slice].astype(np.float32)
     z_expert_np = z.detach().cpu().numpy()
+
+    B_actual_arr = np.stack(_B_actual_list, axis=0)
+    z_actual_smoothed = _smooth_and_project_B(
+        model, B_actual_arr, z_window=z_window, z_ema_alpha=z_ema_alpha
+    )
+
+    expert_flat = np.stack(
+        [
+            _flat_backward_numpy(traj_np["state"][t], traj_np["privileged_state"][t])
+            for t in range(1, 1 + n_steps)
+        ],
+        axis=0,
+    )
+    actual_flat = np.stack(_actual_flat_list, axis=0)
+    body_input_diag = _compute_body_input_diagnostics(expert_flat, actual_flat, body_idx)
+
     metrics = _save_inference_metrics(
         output_dir=output_dir,
         stem=stem,
@@ -777,6 +962,8 @@ def _run_single_traj_rollout(
         z_expert_arr=z_expert_np,
         z_body_dim=_z_body_dim,
         clip_meta=clip_meta,
+        z_actual_smoothed_arr=z_actual_smoothed,
+        body_input_diag=body_input_diag,
     )
 
     policy_ee_base = np.asarray(_policy_ee_base_list, dtype=np.float64)
@@ -825,6 +1012,8 @@ def main(
                   uses seq_length=8).
     z_ema_alpha : causal low-pass z[t] <- a*z[t] + (1-a)*z[t-1]; None/1.0 = off.
                   Start with z_window=8, z_ema_alpha=0.6 when the right hand jumps.
+                  The same window/EMA is applied to Isaac B projections to produce
+                  ``z_actual_smoothed_*`` for fair comparison with ``z_expert``.
     repair_privileged : recompute privileged_state from state via MuJoCo FK (fixes
                   ~30× velocity bug in recording pipeline). Default True.
     recording_dt: frame interval used when reconstructing root linear velocity from state.
@@ -962,6 +1151,8 @@ def main(
             fk_data=fk_data,
             ee_id=ee_id,
             clip_meta=clip_meta,
+            z_window=z_window,
+            z_ema_alpha=z_ema_alpha,
         )
         per_clip_metrics.append(metrics)
 

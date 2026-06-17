@@ -111,6 +111,11 @@ uv run -m humanoidverse.tracking_inference_split \
 
 `--one-per-shape-plane` 每平面×每形状选 1 条（约 30 条）做 Isaac rollout；汇总误差、EE 对比图、z 序列见 `tracking_inference_split/` 输出。
 
+每条 clip 额外输出：
+- `z_actual_smoothed_*.npz`：对 Isaac 的 B 投影做与 expert 相同的 `--z-window` / `--z-ema-alpha` 后再 `project_z`（用于公平对比 `z_body`）
+- `body_input_*.json`：B_body 输入在 expert NPZ vs Isaac 间的分组 L2 差（含 root grav/angvel、privileged body）
+- `metrics_*.json` 内 `z_body_cos_expert_vs_actual_smoothed` 等余弦相似度
+
 ## 2b. data1 画形状 NPZ（`convert_shape_npz.py`，**已弃用**）
 
 旧版 `data1/{batch_data, batch_data_xy, batch_data_xz}/clips_obs/**/*_obs.npz`。因 IK 解支跳变问题，**请勿再用于合并训练集**；脚本保留仅供对照或复现旧实验。
