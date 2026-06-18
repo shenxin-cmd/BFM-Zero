@@ -1038,6 +1038,18 @@ def _run_single_traj_rollout(
     return metrics
 
 
+def _clip_rollout_done(clip_dir: Path) -> bool:
+    return (clip_dir / "metrics.json").is_file()
+
+
+def _load_expert_z_pkl(zs_path: Path, dev: torch.device) -> torch.Tensor:
+    z_np = joblib.load(zs_path)
+    z = torch.as_tensor(z_np, device=dev, dtype=torch.float32)
+    if z.ndim != 2:
+        raise ValueError(f"{zs_path}: expected 2D z array, got shape {tuple(z.shape)}")
+    return z
+
+
 def main(
     model_folder: Path,
     traj_obs_dir: Path,
@@ -1056,6 +1068,7 @@ def main(
     recording_dt: float = 1.0 / 30.0,
     one_per_shape_plane: bool = False,
     max_clips: int | None = None,
+    resume: bool = False,
 ) -> None:
     """z smoothing options (anti-jump for OOD target trajectories):
 
@@ -1071,6 +1084,8 @@ def main(
     recording_dt: frame interval used when reconstructing root linear velocity from state.
     one_per_shape_plane : keep one clip per (plane, shape) group (~30 for V3 benchmark).
     max_clips   : debug cap on number of trajectories to process.
+    resume      : skip clips that already have ``metrics.json``; reuse ``zs_expert.pkl``
+                  instead of recomputing expert z when present.
     """
     model_folder = Path(model_folder)
     traj_obs_dir = Path(traj_obs_dir)
@@ -1165,23 +1180,53 @@ def main(
         clip_meta = parse_clip_meta(traj_path)
         clip_id = _clip_id_from_path(traj_path)
         clip_dir = output_layout.clip_dir(clip_meta, clip_id)
+        zs_path = clip_dir / "zs_expert.pkl"
+
+        if resume and _clip_rollout_done(clip_dir):
+            print(f"  Resume: rollout already done → {clip_dir / 'metrics.json'}")
+            continue
+
         traj_np = load_traj_obs_file(traj_path)
         if repair_privileged:
             print("  Repairing privileged_state from state (MuJoCo FK) …")
             traj_np = repair_recording_traj(traj_np, dt=recording_dt, verbose=True)
         traj_np = align_traj_privileged_for_model(traj_np, model)
-        obs_full = traj_to_backward_batch(traj_np, dev)
-        z = tracking_inference(tree_map(lambda x: x[1:], obs_full))
-        zs_path = clip_dir / "zs_expert.pkl"
-        joblib.dump(z.detach().cpu().numpy(), zs_path)
-        print(f"Saved {zs_path}  (z steps={z.shape[0]})")
+
+        if resume and zs_path.is_file():
+            z = _load_expert_z_pkl(zs_path, dev)
+            print(f"  Resume: loaded expert z from {zs_path} (z steps={z.shape[0]})")
+        else:
+            obs_full = traj_to_backward_batch(traj_np, dev)
+            z = tracking_inference(tree_map(lambda x: x[1:], obs_full))
+            joblib.dump(z.detach().cpu().numpy(), zs_path)
+            print(f"Saved {zs_path}  (z steps={z.shape[0]})")
         traj_items.append((clip_id, clip_dir, traj_np, z, clip_meta))
 
     if not traj_items:
+        if resume:
+            done = sorted(output_layout.root.glob("clips/*/*/*/metrics.json"))
+            if not done:
+                raise RuntimeError("Resume: no pending clips and no completed metrics.json found")
+            print(f"Resume: all {len(done)} clip(s) already have metrics.json — rebuilding summary only.")
+            per_clip_metrics = []
+            for metrics_path in done:
+                with open(metrics_path, encoding="utf-8") as f:
+                    per_clip_metrics.append(json.load(f))
+            _save_aggregate_summaries(output_layout.summary_dir, per_clip_metrics)
+            return
         raise RuntimeError("No trajectories processed")
 
     per_clip_metrics: list[dict] = []
+    if resume:
+        for metrics_path in sorted(output_layout.root.glob("clips/*/*/*/metrics.json")):
+            with open(metrics_path, encoding="utf-8") as f:
+                per_clip_metrics.append(json.load(f))
+        if per_clip_metrics:
+            print(f"Resume: loaded {len(per_clip_metrics)} existing metrics.json file(s).")
+
     for clip_id, clip_dir, traj_np, z, clip_meta in traj_items:
+        if resume and _clip_rollout_done(clip_dir):
+            continue
         metrics = _run_single_traj_rollout(
             traj_np=traj_np,
             z=z,

@@ -68,22 +68,31 @@ if [[ "${SAVE_VIZ_MP4:-0}" == "1" ]]; then
   VIZ_ARGS+=( --save-mp4 )
 fi
 
+RESUME="${RESUME:-1}"
+
 echo "=== repo:   $REPO_ROOT"
 echo "=== uv:     ${UV[*]}"
+echo "=== resume: $RESUME"
 echo "=== [1/2] tracking_inference_split ==="
 echo "  model:  $MODEL_FOLDER"
 echo "  traj:   $TRAJ_OBS_DIR"
 echo "  output: $OUT_ROOT"
 echo
 
-"${UV[@]}" -m humanoidverse.tracking_inference_split \
-  --model-folder "$MODEL_FOLDER" \
-  --traj-obs-dir "$TRAJ_OBS_DIR" \
-  --traj-glob "**/*_obs.npz" \
-  --one-per-shape-plane \
-  --z-window 8 --z-ema-alpha 0.6 \
-  --disable-dr --disable-obs-noise \
+INFER_ARGS=(
+  --model-folder "$MODEL_FOLDER"
+  --traj-obs-dir "$TRAJ_OBS_DIR"
+  --traj-glob "**/*_obs.npz"
+  --one-per-shape-plane
+  --z-window 8 --z-ema-alpha 0.6
+  --disable-dr --disable-obs-noise
   --episode-len 300 --save-mp4
+)
+if [[ "$RESUME" == "1" ]]; then
+  INFER_ARGS+=( --resume )
+fi
+
+"${UV[@]}" -m humanoidverse.tracking_inference_split "${INFER_ARGS[@]}"
 
 echo
 echo "=== [2/2] z sphere visualization (all clips) ==="
