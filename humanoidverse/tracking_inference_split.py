@@ -915,6 +915,7 @@ def _summarize_hand_jacobian_metrics(
         for key in per_step[0]
     }
     error = stacked["wrist_error"].reshape(-1)
+    error_xyz = stacked["wrist_error_xyz"].reshape(-1, 3)
     error_by_step = stacked["wrist_error"].mean(dim=-1)
     reached_2cm = error_by_step <= 0.02
     first_reached = torch.nonzero(reached_2cm, as_tuple=False)
@@ -927,11 +928,23 @@ def _summarize_hand_jacobian_metrics(
         "jacobian_wrist_error_max": float(error.max()),
         "jacobian_wrist_error_p90": float(torch.quantile(error, 0.90)),
         "jacobian_wrist_error_p95": float(torch.quantile(error, 0.95)),
+        "jacobian_wrist_error_x_bias": float(error_xyz[:, 0].mean()),
+        "jacobian_wrist_error_y_bias": float(error_xyz[:, 1].mean()),
+        "jacobian_wrist_error_z_bias": float(error_xyz[:, 2].mean()),
+        "jacobian_wrist_error_x_mae": float(error_xyz[:, 0].abs().mean()),
+        "jacobian_wrist_error_y_mae": float(error_xyz[:, 1].abs().mean()),
+        "jacobian_wrist_error_z_mae": float(error_xyz[:, 2].abs().mean()),
         "jacobian_gate_mean": float(stacked["jacobian_gate"].mean()),
         "jacobian_active_ratio": float(stacked["jacobian_active"].float().mean()),
         "jacobian_delta_q_raw_norm": float(stacked["delta_q_raw_norm"].mean()),
         "jacobian_delta_q_filtered_norm": float(stacked["delta_q_filtered_norm"].mean()),
         "jacobian_delta_action_norm": float(stacked["delta_action_norm"].mean()),
+        "jacobian_joint_target_correction_norm": float(
+            stacked["joint_target_correction_norm"].mean()
+        ),
+        "jacobian_delta_action_saturation_ratio": float(
+            stacked["delta_action_saturated"].float().mean()
+        ),
         "jacobian_joint_limit_projection_ratio": float(stacked["joint_limit_projected"].float().mean()),
         "jacobian_invalid_input_count": float(stacked["invalid_input"].sum()),
         "jacobian_dls_failure_count": float(stacked["dls_failure"].sum()),
@@ -1387,6 +1400,7 @@ def main(
     jacobian_max_delta_q: float = 0.02,
     jacobian_max_delta_action: float = 0.30,
     jacobian_lowpass_beta: float = 0.85,
+    jacobian_composition_mode: str = "task_priority",
     jacobian_joint_limit_margin: float = 0.05,
     jacobian_max_valid_error: float = 1.0,
     jacobian_use_nullspace: bool = False,
@@ -1519,6 +1533,7 @@ def main(
             max_delta_q=jacobian_max_delta_q,
             max_delta_action=jacobian_max_delta_action,
             lowpass_beta=jacobian_lowpass_beta,
+            composition_mode=jacobian_composition_mode,
             joint_limit_margin=jacobian_joint_limit_margin,
             max_valid_error=jacobian_max_valid_error,
             use_nullspace=jacobian_use_nullspace,

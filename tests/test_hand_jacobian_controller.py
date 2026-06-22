@@ -121,6 +121,13 @@ class HandJacobianControllerTest(unittest.TestCase):
         action, _ = make_controller(2).compute(**data)
         torch.testing.assert_close(action[:, :22], data["action_bfm"][:, :22])
 
+    def test_task_priority_target_is_relative_to_current_q(self) -> None:
+        data = inputs(1)
+        data["action_bfm"][0, 22:29] = 0.2
+        data["current_right_arm_q"][0] = 0.1
+        action, _ = make_controller(1, composition_mode="task_priority").compute(**data)
+        torch.testing.assert_close(action[0, 22:29], 0.1 * torch.ones(7))
+
     def test_joint_limit_projection(self) -> None:
         data = inputs(1)
         data["action_bfm"][0, 22] = 0.09

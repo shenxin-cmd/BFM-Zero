@@ -33,6 +33,7 @@ class HandJacobianControllerConfig:
     max_delta_q: float = 0.02
     max_delta_action: float = 0.30
     lowpass_beta: float = 0.85
+    composition_mode: str = "task_priority"
     joint_limit_margin: float = 0.05
     max_valid_error: float = 1.0
     use_nullspace: bool = False
@@ -55,6 +56,8 @@ class HandJacobianControllerConfig:
             raise ValueError("velocity and correction limits must be positive")
         if not 0.0 <= self.lowpass_beta < 1.0:
             raise ValueError("lowpass_beta must be in [0, 1)")
+        if self.composition_mode not in ("residual", "task_priority"):
+            raise ValueError("composition_mode must be 'residual' or 'task_priority'")
         if self.joint_limit_margin < 0:
             raise ValueError("joint_limit_margin must be non-negative")
         if self.max_valid_error <= 0:
@@ -270,6 +273,7 @@ class HandJacobianController:
         delta_q_raw = torch.nan_to_num(delta_q_raw, nan=0.0, posinf=0.0, neginf=0.0)
 
         q_target_bfm = default_q + hand_action_bfm * safe_scale
+        nullspace_delta = torch.zeros_like(delta_q_raw)
         if self.cfg.use_nullspace:
             if torch.is_tensor(damping):
                 damping_sq = damping.square().reshape(batch_size, 1, 1)
@@ -281,7 +285,7 @@ class HandJacobianController:
             )
             null_projector = self._joint_eye - pinv @ safe_jacobian
             posture_error = self.cfg.nullspace_gain * (q_target_bfm - current_right_arm_q)
-            delta_q_raw += (null_projector @ posture_error.unsqueeze(-1)).squeeze(-1)
+            nullspace_delta = (null_projector @ posture_error.unsqueeze(-1)).squeeze(-1)
 
         delta_q_clipped = delta_q_raw.clamp(-self.cfg.max_delta_q, self.cfg.max_delta_q)
         delta_q_filtered = self.cfg.lowpass_beta * self.prev_delta_q + (1.0 - self.cfg.lowpass_beta) * delta_q_clipped
@@ -290,10 +294,20 @@ class HandJacobianController:
         else:
             gate = torch.ones_like(error_norm)
         gate = torch.where(valid[:, None], gate, torch.zeros_like(gate))
-        delta_q_gated = gate * delta_q_filtered
         self.prev_delta_q.copy_(torch.where(valid[:, None], delta_q_filtered, torch.zeros_like(delta_q_filtered)))
 
-        delta_action = (delta_q_gated / safe_scale).clamp(-self.cfg.max_delta_action, self.cfg.max_delta_action)
+        if self.cfg.composition_mode == "task_priority":
+            # Differential IK is a desired joint target relative to the current
+            # configuration. Blending this target with BFM lets repeated steps
+            # converge instead of applying the same small instantaneous bias to
+            # a freshly regenerated BFM target on every control step.
+            q_target_ik = current_right_arm_q + delta_q_filtered + nullspace_delta
+            joint_correction = gate * (q_target_ik - q_target_bfm)
+        else:
+            joint_correction = gate * (delta_q_filtered + nullspace_delta)
+        delta_action = (joint_correction / safe_scale).clamp(
+            -self.cfg.max_delta_action, self.cfg.max_delta_action
+        )
         q_target_unprojected = q_target_bfm + delta_action * safe_scale
         q_target_final = torch.maximum(torch.minimum(q_target_unprojected, safe_upper), safe_lower)
         projected = (q_target_final - q_target_unprojected).abs().gt(1e-7).any(dim=-1)
@@ -305,11 +319,20 @@ class HandJacobianController:
         action_final[:, self.right_arm_dof_indices] = hand_action_final
         metrics = {
             "wrist_error": torch.nan_to_num(error_norm.squeeze(-1), nan=0.0, posinf=0.0, neginf=0.0),
+            "wrist_error_xyz": torch.nan_to_num(
+                position_error, nan=0.0, posinf=0.0, neginf=0.0
+            ),
             "jacobian_gate": gate.squeeze(-1),
             "jacobian_active": gate.squeeze(-1).gt(0.0),
             "delta_q_raw_norm": torch.linalg.vector_norm(delta_q_raw, dim=-1),
             "delta_q_filtered_norm": torch.linalg.vector_norm(delta_q_filtered, dim=-1),
             "delta_action_norm": torch.linalg.vector_norm(delta_action, dim=-1),
+            "joint_target_correction_norm": torch.linalg.vector_norm(
+                delta_action * safe_scale, dim=-1
+            ),
+            "delta_action_saturated": delta_action.abs().ge(
+                self.cfg.max_delta_action - 1e-7
+            ).any(dim=-1),
             "joint_limit_projected": projected,
             "invalid_input": ~valid,
             "dls_failure": dls_failed,
