@@ -1,7 +1,7 @@
 """Batched right-hand Jacobian precision controller.
 
-The controller is an inference-only residual: it converts a root-frame wrist
-position error into a seven-joint correction and composes that correction in
+The controller is an inference-only residual: it converts a consistently framed
+wrist-position error into a seven-joint correction and composes that correction in
 the same PD-target space as the actor action.  It never changes the actor or a
 checkpoint.
 """
@@ -18,7 +18,7 @@ class HandJacobianControllerConfig:
     """Configuration for :class:`HandJacobianController` (SI units)."""
 
     enabled: bool = False
-    frame: str = "root"
+    frame: str = "heading"
     kp_position: float = 3.0
     kd_position: float = 0.25
     damping: float = 0.08
@@ -42,8 +42,8 @@ class HandJacobianControllerConfig:
     nullspace_gain: float = 0.1
 
     def validate(self) -> None:
-        if self.frame != "root":
-            raise ValueError(f"Only frame='root' is supported, got {self.frame!r}")
+        if self.frame not in ("root", "heading"):
+            raise ValueError(f"frame must be 'root' or 'heading', got {self.frame!r}")
         if self.gate_mode not in ("linear", "none"):
             raise ValueError("gate_mode must be 'linear' or 'none'")
         if self.gate_mode == "linear" and self.gate_far <= self.gate_near:
@@ -186,10 +186,11 @@ class HandJacobianController:
         self,
         *,
         action_bfm: torch.Tensor,
-        current_wrist_pos_root: torch.Tensor,
-        target_wrist_pos_root: torch.Tensor,
-        wrist_linear_vel_root: torch.Tensor,
-        jacobian_pos_root: torch.Tensor,
+        current_wrist_pos_control: torch.Tensor,
+        target_wrist_pos_control: torch.Tensor,
+        wrist_linear_vel_control: torch.Tensor,
+        target_wrist_linear_vel_control: torch.Tensor,
+        jacobian_pos_control: torch.Tensor,
         current_right_arm_q: torch.Tensor,
         default_right_arm_q: torch.Tensor,
         lower_joint_limits: torch.Tensor,
@@ -197,29 +198,37 @@ class HandJacobianController:
         action_scale: torch.Tensor,
         action_lower: torch.Tensor,
         action_upper: torch.Tensor,
+        control_frame: str,
         valid_mask: torch.Tensor | None = None,
         control_dt: float = 1.0,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Apply the residual to an actor action.
 
-        All Cartesian quantities are in the pelvis/root frame. ``action_scale``
+        All Cartesian quantities are in ``cfg.frame``. ``action_scale``
         is radians per *normalized actor action*, including any normalization
         and per-joint action-rescale factors used by the environment.
         """
 
         batch_size, action_dim = action_bfm.shape
+        if control_frame != self.cfg.frame:
+            raise ValueError(
+                f"controller configured for {self.cfg.frame!r}, got {control_frame!r} tensors"
+            )
         if batch_size != self.num_envs:
             raise ValueError(f"controller has B={self.num_envs}, action has B={batch_size}")
         expected_3 = (batch_size, 3)
         for name, value in (
-            ("current_wrist_pos_root", current_wrist_pos_root),
-            ("target_wrist_pos_root", target_wrist_pos_root),
-            ("wrist_linear_vel_root", wrist_linear_vel_root),
+            ("current_wrist_pos_control", current_wrist_pos_control),
+            ("target_wrist_pos_control", target_wrist_pos_control),
+            ("wrist_linear_vel_control", wrist_linear_vel_control),
+            ("target_wrist_linear_vel_control", target_wrist_linear_vel_control),
         ):
             if value.shape != expected_3:
                 raise ValueError(f"{name} must be {expected_3}, got {tuple(value.shape)}")
-        if jacobian_pos_root.shape != (batch_size, 3, 7):
-            raise ValueError(f"jacobian_pos_root must be [B, 3, 7], got {tuple(jacobian_pos_root.shape)}")
+        if jacobian_pos_control.shape != (batch_size, 3, 7):
+            raise ValueError(
+                f"jacobian_pos_control must be [B, 3, 7], got {tuple(jacobian_pos_control.shape)}"
+            )
         if current_right_arm_q.shape != (batch_size, 7):
             raise ValueError(f"current_right_arm_q must be [B, 7], got {tuple(current_right_arm_q.shape)}")
         if self._max_action_index >= action_dim:
@@ -244,12 +253,13 @@ class HandJacobianController:
         )
         safe_scale = torch.where(valid_scale[:, None], scale, torch.ones_like(scale))
 
-        position_error = target_wrist_pos_root - current_wrist_pos_root
+        position_error = target_wrist_pos_control - current_wrist_pos_control
         error_norm = torch.linalg.vector_norm(position_error, dim=-1, keepdim=True)
         finite_input = (
-            torch.isfinite(jacobian_pos_root).all(dim=(-1, -2))
+            torch.isfinite(jacobian_pos_control).all(dim=(-1, -2))
             & torch.isfinite(position_error).all(dim=-1)
-            & torch.isfinite(wrist_linear_vel_root).all(dim=-1)
+            & torch.isfinite(wrist_linear_vel_control).all(dim=-1)
+            & torch.isfinite(target_wrist_linear_vel_control).all(dim=-1)
             & torch.isfinite(current_right_arm_q).all(dim=-1)
             & torch.isfinite(default_q).all(dim=-1)
             & torch.isfinite(hand_action_bfm).all(dim=-1)
@@ -265,10 +275,23 @@ class HandJacobianController:
                 raise ValueError(f"valid_mask must be [B], got {tuple(valid_mask.shape)}")
             valid &= valid_mask.bool()
 
-        safe_jacobian = torch.where(valid[:, None, None], jacobian_pos_root, torch.zeros_like(jacobian_pos_root))
+        safe_jacobian = torch.where(
+            valid[:, None, None], jacobian_pos_control, torch.zeros_like(jacobian_pos_control)
+        )
         safe_error = torch.where(valid[:, None], position_error, torch.zeros_like(position_error))
-        safe_velocity = torch.where(valid[:, None], wrist_linear_vel_root, torch.zeros_like(wrist_linear_vel_root))
-        task_velocity = self.cfg.kp_position * safe_error - self.cfg.kd_position * safe_velocity
+        safe_velocity = torch.where(
+            valid[:, None], wrist_linear_vel_control, torch.zeros_like(wrist_linear_vel_control)
+        )
+        safe_target_velocity = torch.where(
+            valid[:, None],
+            target_wrist_linear_vel_control,
+            torch.zeros_like(target_wrist_linear_vel_control),
+        )
+        task_velocity = (
+            safe_target_velocity
+            + self.cfg.kp_position * safe_error
+            + self.cfg.kd_position * (safe_target_velocity - safe_velocity)
+        )
         velocity_norm = torch.linalg.vector_norm(task_velocity, dim=-1, keepdim=True)
         task_velocity *= (self.cfg.max_task_velocity / velocity_norm.clamp_min(1e-8)).clamp_max(1.0)
 
@@ -358,6 +381,10 @@ class HandJacobianController:
             ),
             "jacobian_gate": gate.squeeze(-1),
             "jacobian_active": gate.squeeze(-1).gt(0.0),
+            "target_velocity_norm": torch.linalg.vector_norm(
+                safe_target_velocity, dim=-1
+            ),
+            "task_velocity_norm": torch.linalg.vector_norm(task_velocity, dim=-1),
             "delta_q_raw_norm": torch.linalg.vector_norm(delta_q_raw, dim=-1),
             "delta_q_filtered_norm": torch.linalg.vector_norm(delta_q_filtered, dim=-1),
             "accumulated_delta_q_norm": torch.linalg.vector_norm(

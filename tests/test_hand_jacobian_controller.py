@@ -39,10 +39,11 @@ def inputs(batch: int) -> dict[str, torch.Tensor]:
     jacobian[:, :, :3] = torch.eye(3)
     return {
         "action_bfm": torch.zeros(batch, 29),
-        "current_wrist_pos_root": torch.zeros(batch, 3),
-        "target_wrist_pos_root": torch.zeros(batch, 3),
-        "wrist_linear_vel_root": torch.zeros(batch, 3),
-        "jacobian_pos_root": jacobian,
+        "current_wrist_pos_control": torch.zeros(batch, 3),
+        "target_wrist_pos_control": torch.zeros(batch, 3),
+        "wrist_linear_vel_control": torch.zeros(batch, 3),
+        "target_wrist_linear_vel_control": torch.zeros(batch, 3),
+        "jacobian_pos_control": jacobian,
         "current_right_arm_q": torch.zeros(batch, 7),
         "default_right_arm_q": torch.zeros(7),
         "lower_joint_limits": -10.0 * torch.ones(7),
@@ -50,10 +51,17 @@ def inputs(batch: int) -> dict[str, torch.Tensor]:
         "action_scale": torch.ones(7),
         "action_lower": -10.0 * torch.ones(7),
         "action_upper": 10.0 * torch.ones(7),
+        "control_frame": "heading",
     }
 
 
 class HandJacobianControllerTest(unittest.TestCase):
+    def test_rejects_coordinate_frame_mismatch(self) -> None:
+        data = inputs(1)
+        data["control_frame"] = "root"
+        with self.assertRaisesRegex(ValueError, "configured for 'heading'"):
+            make_controller(1).compute(**data)
+
     def test_zero_error_is_zero_correction(self) -> None:
         data = inputs(1)
         action, metrics = make_controller(1).compute(**data)
@@ -68,10 +76,21 @@ class HandJacobianControllerTest(unittest.TestCase):
         expected = torch.tensor([[1.0, -2.0, 3.0, 0.0, 0.0, 0.0, 0.0]]) / 1.01
         torch.testing.assert_close(result, expected)
 
+    def test_target_velocity_feedforward(self) -> None:
+        data = inputs(1)
+        data["target_wrist_linear_vel_control"][0, 0] = 0.2
+        action, _ = make_controller(
+            1,
+            composition_mode="integrated_residual",
+            residual_decay=1.0,
+            max_accumulated_delta_q=1.0,
+        ).compute(**data, control_dt=0.1)
+        self.assertAlmostEqual(float(action[0, 22]), 0.02 / 1.01, places=6)
+
     def test_singular_jacobian_is_finite_and_bounded(self) -> None:
         data = inputs(4)
-        data["jacobian_pos_root"].zero_()
-        data["target_wrist_pos_root"][:, 0] = 0.5
+        data["jacobian_pos_control"].zero_()
+        data["target_wrist_pos_control"][:, 0] = 0.5
         action, metrics = make_controller(4, max_delta_q=0.02).compute(**data)
         self.assertTrue(bool(torch.isfinite(action).all()))
         self.assertLessEqual(float(action[:, 22:29].abs().max()), 0.02)
@@ -85,7 +104,7 @@ class HandJacobianControllerTest(unittest.TestCase):
 
     def test_action_unit_conversion(self) -> None:
         data = inputs(1)
-        data["target_wrist_pos_root"][0, 0] = 0.1
+        data["target_wrist_pos_control"][0, 0] = 0.1
         data["action_scale"] = 0.5 * torch.ones(7)
         action, _ = make_controller(
             1,
@@ -115,8 +134,8 @@ class HandJacobianControllerTest(unittest.TestCase):
 
     def test_nan_jacobian_disables_only_invalid_environment(self) -> None:
         data = inputs(2)
-        data["target_wrist_pos_root"][:, 0] = 0.1
-        data["jacobian_pos_root"][0, 0, 0] = float("nan")
+        data["target_wrist_pos_control"][:, 0] = 0.1
+        data["jacobian_pos_control"][0, 0, 0] = float("nan")
         action, metrics = make_controller(2).compute(**data)
         torch.testing.assert_close(action[0], data["action_bfm"][0])
         self.assertGreater(float(action[1, 22]), 0.0)
@@ -126,7 +145,7 @@ class HandJacobianControllerTest(unittest.TestCase):
     def test_only_right_arm_changes(self) -> None:
         data = inputs(2)
         data["action_bfm"] = torch.randn(2, 29) * 0.1
-        data["target_wrist_pos_root"][:, 1] = 0.05
+        data["target_wrist_pos_control"][:, 1] = 0.05
         action, _ = make_controller(2).compute(**data)
         torch.testing.assert_close(action[:, :22], data["action_bfm"][:, :22])
 
@@ -139,7 +158,7 @@ class HandJacobianControllerTest(unittest.TestCase):
 
     def test_integrated_residual_accumulates_with_control_dt(self) -> None:
         data = inputs(1)
-        data["target_wrist_pos_root"][0, 0] = 0.1
+        data["target_wrist_pos_control"][0, 0] = 0.1
         controller = make_controller(
             1,
             composition_mode="integrated_residual",
@@ -155,7 +174,7 @@ class HandJacobianControllerTest(unittest.TestCase):
         data["action_bfm"][0, 22] = 0.09
         # Stay strictly inside max_valid_error=1.0 while still commanding a
         # correction large enough to exceed the 0.09 rad safe upper limit.
-        data["target_wrist_pos_root"][0, 0] = 0.5
+        data["target_wrist_pos_control"][0, 0] = 0.5
         data["lower_joint_limits"] = -0.1 * torch.ones(7)
         data["upper_joint_limits"] = 0.1 * torch.ones(7)
         action, metrics = make_controller(1, joint_limit_margin=0.01).compute(**data)

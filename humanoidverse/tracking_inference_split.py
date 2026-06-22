@@ -77,7 +77,6 @@ from humanoidverse.tracking_inference_npz import (
     _EE_BODY,
     _fk_ee_positions_base,
     _fk_one_step_base,
-    _quat_wxyz_inv_rotate,
 )
 from humanoidverse.utils.helpers import export_meta_policy_as_onnx
 from humanoidverse.utils.recording_obs_repair import repair_recording_traj
@@ -300,6 +299,7 @@ def _save_inference_metrics(
     body_input_diag: dict | None = None,
     jacobian_metrics: dict | None = None,
     body_stability_metrics: dict | None = None,
+    coordinate_frame: str = "heading",
 ) -> dict:
     """Compute inference metrics, save pkl/json/npz, return metrics dict."""
     n_cmp = min(n_steps, ref_dof_arr.shape[0] - 1, len(z_actual_arr))
@@ -318,7 +318,7 @@ def _save_inference_metrics(
     body_dof_err = np.linalg.norm(jp_pred[:, _BODY_DOF_SLICE] - jp_ref[:, _BODY_DOF_SLICE], axis=-1)
     hand_dof_err = np.linalg.norm(jp_pred[:, _HAND_DOF_SLICE] - jp_ref[:, _HAND_DOF_SLICE], axis=-1)
 
-    # ---- EE local (heading-frame) error ----
+    # ---- EE local error (the caller supplies consistently framed arrays) ----
     hand_ee_err = np.linalg.norm(ee_pred - ee_ref, axis=-1)   # metres
 
     # ---- z_hand jump rate (in z_actual) ----
@@ -340,6 +340,7 @@ def _save_inference_metrics(
         "z_hand_spike_rate":      spike_rate,
         "z_body_dim":             int(z_body_dim),
         "z_hand_dim":             int(z_act.shape[1] - z_body_dim),
+        "hand_ee_coordinate_frame": coordinate_frame,
     }
     if clip_meta:
         metrics.update({k: v for k, v in clip_meta.items() if k not in metrics})
@@ -543,6 +544,7 @@ def _save_ee_traj_plots(
     policy_ee_base: np.ndarray,
     clip_dir: Path,
     title_suffix: str = "",
+    frame_name: str = "root",
 ) -> None:
     """Save 3D and XY/XZ/YZ pelvis-frame EE comparison plots (English labels only)."""
     n_cmp = min(len(expert_ee_base), len(policy_ee_base))
@@ -574,7 +576,9 @@ def _save_ee_traj_plots(
     ax.set_xlabel("X (m)")
     ax.set_ylabel("Y (m)")
     ax.set_zlabel("Z (m)")
-    ax.set_title(f"Right-hand EE trajectory (pelvis frame){suffix}\n{subtitle}", fontsize=10)
+    ax.set_title(
+        f"Right-hand EE trajectory ({frame_name} frame){suffix}\n{subtitle}", fontsize=10
+    )
     ax.legend(fontsize=8, loc="best")
     fig.savefig(clip_dir / "ee_traj_3d.png", dpi=160, bbox_inches="tight")
     plt.close(fig)
@@ -900,6 +904,68 @@ def _build_expert_qpos(
     return expert_qpos, ref_root, dof_init
 
 
+def _world_offset_to_heading(
+    world_offset: np.ndarray,
+    root_quat_wxyz: np.ndarray,
+) -> np.ndarray:
+    """Rotate a world vector by inverse root yaw, preserving roll/pitch effects."""
+
+    w, x, y, z = (float(v) for v in root_quat_wxyz)
+    yaw = np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+    cosine = np.cos(yaw)
+    sine = np.sin(yaw)
+    return np.asarray(
+        [
+            cosine * world_offset[0] + sine * world_offset[1],
+            -sine * world_offset[0] + cosine * world_offset[1],
+            world_offset[2],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _fk_ee_positions_heading(
+    fk_model,
+    fk_data,
+    ee_id: int,
+    qpos7_root: np.ndarray,
+    dof_abs_arr: np.ndarray,
+) -> np.ndarray:
+    """Return right-wrist positions in the yaw-only heading frame."""
+
+    qpos7_root = np.asarray(qpos7_root, dtype=np.float64)
+    dof_abs_arr = np.asarray(dof_abs_arr, dtype=np.float64)
+    if qpos7_root.shape != (len(dof_abs_arr), 7):
+        raise ValueError(
+            f"qpos7_root expected {(len(dof_abs_arr), 7)}, got {qpos7_root.shape}"
+        )
+    output = np.zeros((len(dof_abs_arr), 3), dtype=np.float64)
+    for index in range(len(dof_abs_arr)):
+        fk_data.qpos[:7] = qpos7_root[index]
+        fk_data.qpos[7:] = dof_abs_arr[index]
+        fk_data.qvel[:] = 0.0
+        mujoco.mj_forward(fk_model, fk_data)
+        world_offset = fk_data.xpos[ee_id] - fk_data.qpos[:3]
+        output[index] = _world_offset_to_heading(world_offset, fk_data.qpos[3:7])
+    return output
+
+
+def _fk_one_step_control(
+    fk_model,
+    fk_data,
+    ee_id: int,
+    root_state: np.ndarray,
+    dof_pos: np.ndarray,
+    control_frame: str,
+) -> np.ndarray:
+    if control_frame == "root":
+        return _fk_one_step_base(fk_model, fk_data, ee_id, root_state, dof_pos)
+    qpos7 = root_state[[0, 1, 2, 6, 3, 4, 5]].reshape(1, 7)
+    return _fk_ee_positions_heading(
+        fk_model, fk_data, ee_id, qpos7, dof_pos.reshape(1, -1)
+    )[0]
+
+
 def _summarize_hand_jacobian_metrics(
     per_step: list[dict[str, torch.Tensor]],
     *,
@@ -936,6 +1002,8 @@ def _summarize_hand_jacobian_metrics(
         "jacobian_wrist_error_z_mae": float(error_xyz[:, 2].abs().mean()),
         "jacobian_gate_mean": float(stacked["jacobian_gate"].mean()),
         "jacobian_active_ratio": float(stacked["jacobian_active"].float().mean()),
+        "jacobian_target_velocity_norm": float(stacked["target_velocity_norm"].mean()),
+        "jacobian_task_velocity_norm": float(stacked["task_velocity_norm"].mean()),
         "jacobian_delta_q_raw_norm": float(stacked["delta_q_raw_norm"].mean()),
         "jacobian_delta_q_filtered_norm": float(stacked["delta_q_filtered_norm"].mean()),
         "jacobian_accumulated_delta_q_norm": float(
@@ -974,13 +1042,14 @@ def _summarize_hand_jacobian_metrics(
     return out
 
 
-def _finite_difference_wrist_jacobian_root(
+def _finite_difference_wrist_jacobian_control(
     fk_model,
     fk_data,
     ee_id: int,
     root_state: np.ndarray,
     dof_pos: np.ndarray,
     right_arm_indices: np.ndarray,
+    control_frame: str,
     epsilon: float = 1e-4,
 ) -> np.ndarray:
     """Numerically differentiate MuJoCo FK to validate simulator Jacobian frames."""
@@ -991,8 +1060,12 @@ def _finite_difference_wrist_jacobian_root(
         q_minus = dof_pos.copy()
         q_plus[dof_index] += epsilon
         q_minus[dof_index] -= epsilon
-        pos_plus = _fk_one_step_base(fk_model, fk_data, ee_id, root_state, q_plus)
-        pos_minus = _fk_one_step_base(fk_model, fk_data, ee_id, root_state, q_minus)
+        pos_plus = _fk_one_step_control(
+            fk_model, fk_data, ee_id, root_state, q_plus, control_frame
+        )
+        pos_minus = _fk_one_step_control(
+            fk_model, fk_data, ee_id, root_state, q_minus, control_frame
+        )
         jacobian[:, column] = (pos_plus - pos_minus) / (2.0 * epsilon)
     return jacobian
 
@@ -1082,6 +1155,7 @@ def _run_single_traj_rollout(
     jacobian_profile_timing: bool = False,
     jacobian_validate_frame: bool = False,
     reference_dt: float = 1.0 / 30.0,
+    control_frame: str = "heading",
 ) -> dict:
     """Reset env to traj init, rollout tracking, save metrics for one trajectory."""
     expert_qpos, ref_root, dof_init_state = _build_expert_qpos(
@@ -1156,13 +1230,22 @@ def _run_single_traj_rollout(
         expert_video = rgb_renderer.from_qpos(expert_qpos[video_reference_indices])
         frames = [rgb_renderer.render(wrapped_env._env, 0)[0]]
 
-    expert_ee_reference = _fk_ee_positions_base(
-        fk_model,
-        fk_data,
-        ee_id,
-        expert_qpos[:, :7],
-        expert_qpos[:, 7:].astype(np.float64),
-    )
+    if control_frame == "heading":
+        expert_ee_reference = _fk_ee_positions_heading(
+            fk_model,
+            fk_data,
+            ee_id,
+            expert_qpos[:, :7],
+            expert_qpos[:, 7:].astype(np.float64),
+        )
+    else:
+        expert_ee_reference = _fk_ee_positions_base(
+            fk_model,
+            fk_data,
+            ee_id,
+            expert_qpos[:, :7],
+            expert_qpos[:, 7:].astype(np.float64),
+        )
     expert_ee_base = _interpolate_reference_array(
         expert_ee_reference, control_times_s, float(reference_dt)
     )
@@ -1170,8 +1253,20 @@ def _run_single_traj_rollout(
     expert_ee_target_control = _interpolate_reference_array(
         expert_ee_reference, target_times_s, float(reference_dt)
     )
-    expert_ee_targets_root = torch.as_tensor(
+    if len(expert_ee_reference) > 1:
+        expert_ee_velocity_reference = np.gradient(
+            expert_ee_reference, float(reference_dt), axis=0
+        )
+    else:
+        expert_ee_velocity_reference = np.zeros_like(expert_ee_reference)
+    expert_ee_target_velocity_control = _interpolate_reference_array(
+        expert_ee_velocity_reference, target_times_s, float(reference_dt)
+    )
+    expert_ee_targets_control = torch.as_tensor(
         expert_ee_target_control, device=sim_dev, dtype=torch.float32
+    )
+    expert_ee_target_velocities_control = torch.as_tensor(
+        expert_ee_target_velocity_control, device=sim_dev, dtype=torch.float32
     )
 
     for i in range(n_steps):
@@ -1202,7 +1297,9 @@ def _run_single_traj_rollout(
         )
         _fall_list.append(float(fell))
         _d = wrapped_env._env.simulator.dof_state.view(num_envs, -1, 2)[0, :, 0].float().detach().cpu().numpy()
-        _policy_ee_base_list.append(_fk_one_step_base(fk_model, fk_data, ee_id, _rs, _d))
+        _policy_ee_base_list.append(
+            _fk_one_step_control(fk_model, fk_data, ee_id, _rs, _d, control_frame)
+        )
         action_bfm = model.act(
             observation, z_control[i].unsqueeze(0).expand(num_envs, -1), mean=True
         )
@@ -1214,40 +1311,38 @@ def _run_single_traj_rollout(
                 start_event = torch.cuda.Event(enable_timing=True)
                 end_event = torch.cuda.Event(enable_timing=True)
                 start_event.record()
-            target_wrist_pos_root = expert_ee_targets_root[i].expand(num_envs, -1)
-            wrist_data = wrapped_env.get_right_wrist_control_data(target_wrist_pos_root)
+            target_wrist_pos_control = expert_ee_targets_control[i].expand(num_envs, -1)
+            target_wrist_velocity_control = expert_ee_target_velocities_control[i].expand(
+                num_envs, -1
+            )
+            wrist_data = wrapped_env.get_right_wrist_control_data(
+                target_wrist_pos_control,
+                target_wrist_linear_vel_control=target_wrist_velocity_control,
+                control_frame=control_frame,
+            )
             if jacobian_validate_frame and i == 0:
-                jacobian_fd = _finite_difference_wrist_jacobian_root(
+                jacobian_fd = _finite_difference_wrist_jacobian_control(
                     fk_model,
                     fk_data,
                     ee_id,
                     _rs,
                     _d,
                     np.arange(22, 29, dtype=np.int64),
+                    control_frame,
                 )
-                jacobian_selected = wrist_data.jacobian_pos_root[0].detach().float().cpu().numpy()
-                jacobian_raw = wrist_data.jacobian_pos_simulator[0].detach().float().cpu().numpy()
-                root_quat_wxyz = _rs[[6, 3, 4, 5]]
-                jacobian_raw_rotated = np.stack(
-                    [
-                        _quat_wxyz_inv_rotate(root_quat_wxyz, jacobian_raw[:, column])
-                        for column in range(jacobian_raw.shape[1])
-                    ],
-                    axis=1,
-                )
+                jacobian_selected = wrist_data.jacobian_pos_control[0].detach().float().cpu().numpy()
                 print(
-                    "Jacobian finite-difference validation (root frame): "
+                    f"Jacobian finite-difference validation ({control_frame} frame): "
                     f"source_frame={wrist_data.jacobian_source_frame}, "
-                    f"selected={_jacobian_validation_metrics(jacobian_selected, jacobian_fd)}, "
-                    f"raw_as_root={_jacobian_validation_metrics(jacobian_raw, jacobian_fd)}, "
-                    f"raw_world_to_root={_jacobian_validation_metrics(jacobian_raw_rotated, jacobian_fd)}"
+                    f"selected={_jacobian_validation_metrics(jacobian_selected, jacobian_fd)}"
                 )
             action, step_metrics = jacobian_controller.compute(
                 action_bfm=action_bfm,
-                current_wrist_pos_root=wrist_data.current_pos_root,
-                target_wrist_pos_root=wrist_data.target_pos_root,
-                wrist_linear_vel_root=wrist_data.linear_vel_root,
-                jacobian_pos_root=wrist_data.jacobian_pos_root,
+                current_wrist_pos_control=wrist_data.current_pos_control,
+                target_wrist_pos_control=wrist_data.target_pos_control,
+                wrist_linear_vel_control=wrist_data.linear_vel_control,
+                target_wrist_linear_vel_control=wrist_data.target_linear_vel_control,
+                jacobian_pos_control=wrist_data.jacobian_pos_control,
                 current_right_arm_q=wrist_data.right_arm_q,
                 default_right_arm_q=wrist_data.default_right_arm_q,
                 lower_joint_limits=wrist_data.lower_limits,
@@ -1255,6 +1350,7 @@ def _run_single_traj_rollout(
                 action_scale=wrist_data.action_scale,
                 action_lower=wrist_data.action_lower,
                 action_upper=wrist_data.action_upper,
+                control_frame=wrist_data.control_frame,
                 control_dt=control_dt,
             )
             jacobian_step_metrics.append(step_metrics)
@@ -1338,6 +1434,7 @@ def _run_single_traj_rollout(
         body_input_diag=body_input_diag,
         jacobian_metrics=jacobian_summary,
         body_stability_metrics=body_stability_summary,
+        coordinate_frame=control_frame,
     )
 
     policy_ee_base = np.asarray(_policy_ee_base_list, dtype=np.float64)
@@ -1349,6 +1446,7 @@ def _run_single_traj_rollout(
         policy_ee_base,
         clip_dir,
         title_suffix=title_suffix,
+        frame_name=control_frame,
     )
 
     if save_mp4 and expert_video is not None:
@@ -1393,6 +1491,7 @@ def main(
     output_tag: str | None = None,
     use_hand_jacobian: bool = False,
     jacobian_ablation: str | None = None,
+    jacobian_frame: str = "heading",
     jacobian_kp_position: float = 3.0,
     jacobian_kd_position: float = 0.25,
     jacobian_damping: float = 0.08,
@@ -1502,6 +1601,8 @@ def main(
 
     if jacobian_target_offset < 0:
         raise ValueError("jacobian_target_offset must be non-negative")
+    if jacobian_frame not in {"root", "heading"}:
+        raise ValueError("jacobian_frame must be either 'root' or 'heading'")
     if jacobian_ablation is not None:
         ablation = jacobian_ablation.upper()
         if ablation not in {"A", "B", "C", "D"}:
@@ -1528,6 +1629,7 @@ def main(
             )
         jacobian_cfg = HandJacobianControllerConfig(
             enabled=True,
+            frame=jacobian_frame,
             kp_position=jacobian_kp_position,
             kd_position=jacobian_kd_position,
             damping=jacobian_damping,
@@ -1557,12 +1659,14 @@ def main(
             right_arm_dof_indices=torch.arange(22, 29, device=env.device),
         )
         jacobian_probe = wrapped_env.get_right_wrist_control_data(
-            torch.zeros(num_envs, 3, device=env.device)
+            torch.zeros(num_envs, 3, device=env.device),
+            control_frame=jacobian_frame,
         )
         print(
             "Jacobian interface probe: "
-            f"J={tuple(jacobian_probe.jacobian_pos_root.shape)}, "
-            f"wrist={tuple(jacobian_probe.current_pos_root.shape)}, "
+            f"frame={jacobian_probe.control_frame}, "
+            f"J={tuple(jacobian_probe.jacobian_pos_control.shape)}, "
+            f"wrist={tuple(jacobian_probe.current_pos_control.shape)}, "
             f"action_scale={jacobian_probe.action_scale.tolist()}"
         )
         print(f"Hand Jacobian controller: {jacobian_cfg}")
@@ -1669,6 +1773,7 @@ def main(
             jacobian_profile_timing=jacobian_profile_timing,
             jacobian_validate_frame=jacobian_validate_frame,
             reference_dt=recording_dt,
+            control_frame=jacobian_frame,
         )
         per_clip_metrics.append(metrics)
 

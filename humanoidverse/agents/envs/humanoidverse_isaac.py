@@ -18,7 +18,7 @@ from gymnasium import Env
 from gymnasium.vector import VectorEnv
 from humanoidverse.envs.legged_robot_motions.legged_robot_motions import LeggedRobotMotions, compute_humanoid_observations_max
 from humanoidverse.utils.helpers import pre_process_config
-from humanoidverse.utils.torch_utils import quat_rotate_inverse
+from humanoidverse.utils.torch_utils import calc_heading_quat_inv, quat_rotate, quat_rotate_inverse
 from omegaconf import OmegaConf
 from torch.utils._pytree import tree_map
 
@@ -42,15 +42,16 @@ HYDRA_CONFIG_REL_PATH = os.path.join("exp", "bfm_zero", "bfm_zero")
 class RightWristControlData:
     """Simulator tensors needed by the inference-time hand controller.
 
-    Cartesian tensors and the Jacobian are expressed in the full pelvis/root
-    frame (not the yaw-only heading frame). Jacobian rows 0:3 are linear, as
-    specified by the Isaac Gym and PhysX tensor APIs.
+    Cartesian tensors and the Jacobian are expressed in ``control_frame``.
+    Jacobian rows 0:3 are linear, as specified by the simulator tensor APIs.
     """
 
-    current_pos_root: torch.Tensor
-    target_pos_root: torch.Tensor
-    linear_vel_root: torch.Tensor
-    jacobian_pos_root: torch.Tensor
+    current_pos_control: torch.Tensor
+    target_pos_control: torch.Tensor
+    linear_vel_control: torch.Tensor
+    target_linear_vel_control: torch.Tensor
+    jacobian_pos_control: torch.Tensor
+    control_frame: str
     jacobian_pos_simulator: torch.Tensor
     jacobian_source_frame: str
     right_arm_q: torch.Tensor
@@ -787,8 +788,16 @@ class HumanoidVerseVectorEnv(VectorEnv):
             )
         return jacobian_pos_simulator, source_frame
 
-    def get_right_wrist_control_data(self, target_wrist_pos_root: torch.Tensor) -> RightWristControlData:
+    def get_right_wrist_control_data(
+        self,
+        target_wrist_pos_control: torch.Tensor,
+        target_wrist_linear_vel_control: torch.Tensor | None = None,
+        control_frame: str = "heading",
+    ) -> RightWristControlData:
         """Collect and frame-align right-wrist control tensors on the simulator device."""
+
+        if control_frame not in ("root", "heading"):
+            raise ValueError(f"control_frame must be 'root' or 'heading', got {control_frame!r}")
 
         simulator = self._env.simulator
         if not hasattr(self, "_right_arm_dof_indices"):
@@ -824,17 +833,83 @@ class HumanoidVerseVectorEnv(VectorEnv):
         else:
             jacobian_pos_root = jacobian_pos_simulator
 
-        target = torch.as_tensor(target_wrist_pos_root, device=self.device, dtype=current_pos_root.dtype)
+        if control_frame == "heading":
+            heading_quat_inverse = calc_heading_quat_inv(root_quat_world, w_last=True)
+            current_pos_control = quat_rotate(
+                heading_quat_inverse, wrist_offset_world, w_last=True
+            )
+            # d(R_heading^-1 (p_wrist - p_root)) / dt subtracts only the
+            # yaw-frame angular velocity. Roll and pitch remain observable in
+            # the heading frame and therefore must not be removed here.
+            root_x_local = torch.zeros_like(wrist_offset_world)
+            root_x_local[:, 0] = 1.0
+            root_x_world = quat_rotate(root_quat_world, root_x_local, w_last=True)
+            root_x_world_dot = torch.cross(
+                root_angular_vel_world, root_x_world, dim=-1
+            )
+            horizontal_norm_sq = root_x_world[:, 0].square() + root_x_world[:, 1].square()
+            heading_rate = (
+                root_x_world[:, 0] * root_x_world_dot[:, 1]
+                - root_x_world[:, 1] * root_x_world_dot[:, 0]
+            ) / horizontal_norm_sq.clamp_min(1e-8)
+            heading_angular_vel_world = torch.zeros_like(root_angular_vel_world)
+            heading_angular_vel_world[:, 2] = heading_rate
+            wrist_heading_vel_world = (
+                wrist_linear_vel_world
+                - root_linear_vel_world
+                - torch.cross(heading_angular_vel_world, wrist_offset_world, dim=-1)
+            )
+            linear_vel_control = quat_rotate(
+                heading_quat_inverse, wrist_heading_vel_world, w_last=True
+            )
+            jacobian_columns_root = jacobian_pos_root.transpose(-1, -2).reshape(-1, 3)
+            root_quat_per_column = root_quat_world[:, None, :].expand(-1, 7, -1).reshape(-1, 4)
+            jacobian_columns_world = quat_rotate(
+                root_quat_per_column, jacobian_columns_root, w_last=True
+            )
+            heading_inverse_per_column = (
+                heading_quat_inverse[:, None, :].expand(-1, 7, -1).reshape(-1, 4)
+            )
+            jacobian_pos_control = quat_rotate(
+                heading_inverse_per_column, jacobian_columns_world, w_last=True
+            ).reshape(self.num_envs, 7, 3).transpose(-1, -2)
+        else:
+            current_pos_control = current_pos_root
+            linear_vel_control = linear_vel_root
+            jacobian_pos_control = jacobian_pos_root
+
+        target = torch.as_tensor(
+            target_wrist_pos_control, device=self.device, dtype=current_pos_control.dtype
+        )
         if target.shape == (3,):
             target = target.unsqueeze(0).expand(self.num_envs, -1)
         if target.shape != (self.num_envs, 3):
-            raise ValueError(f"target_wrist_pos_root must be [3] or [B, 3], got {tuple(target.shape)}")
+            raise ValueError(
+                f"target_wrist_pos_control must be [3] or [B, 3], got {tuple(target.shape)}"
+            )
+        if target_wrist_linear_vel_control is None:
+            target_velocity = torch.zeros_like(target)
+        else:
+            target_velocity = torch.as_tensor(
+                target_wrist_linear_vel_control,
+                device=self.device,
+                dtype=current_pos_control.dtype,
+            )
+            if target_velocity.shape == (3,):
+                target_velocity = target_velocity.unsqueeze(0).expand(self.num_envs, -1)
+            if target_velocity.shape != (self.num_envs, 3):
+                raise ValueError(
+                    "target_wrist_linear_vel_control must be [3] or [B, 3], "
+                    f"got {tuple(target_velocity.shape)}"
+                )
 
         return RightWristControlData(
-            current_pos_root=current_pos_root,
-            target_pos_root=target,
-            linear_vel_root=linear_vel_root,
-            jacobian_pos_root=jacobian_pos_root,
+            current_pos_control=current_pos_control,
+            target_pos_control=target,
+            linear_vel_control=linear_vel_control,
+            target_linear_vel_control=target_velocity,
+            jacobian_pos_control=jacobian_pos_control,
+            control_frame=control_frame,
             jacobian_pos_simulator=jacobian_pos_simulator,
             jacobian_source_frame=jacobian_source_frame,
             right_arm_q=simulator.dof_pos.index_select(-1, right_arm_indices),
