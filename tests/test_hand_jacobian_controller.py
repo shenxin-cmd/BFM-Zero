@@ -71,10 +71,11 @@ class HandJacobianControllerTest(unittest.TestCase):
     def test_singular_jacobian_is_finite_and_bounded(self) -> None:
         data = inputs(4)
         data["jacobian_pos_root"].zero_()
-        data["target_wrist_pos_root"][:, 0] = 1.0
-        action, _ = make_controller(4, max_delta_q=0.02).compute(**data)
+        data["target_wrist_pos_root"][:, 0] = 0.5
+        action, metrics = make_controller(4, max_delta_q=0.02).compute(**data)
         self.assertTrue(bool(torch.isfinite(action).all()))
         self.assertLessEqual(float(action[:, 22:29].abs().max()), 0.02)
+        self.assertFalse(bool(metrics["invalid_input"].any()))
 
     def test_batched_shapes(self) -> None:
         for batch in (1, 32, 1024):
@@ -123,7 +124,9 @@ class HandJacobianControllerTest(unittest.TestCase):
     def test_joint_limit_projection(self) -> None:
         data = inputs(1)
         data["action_bfm"][0, 22] = 0.09
-        data["target_wrist_pos_root"][0, 0] = 1.0
+        # Stay strictly inside max_valid_error=1.0 while still commanding a
+        # correction large enough to exceed the 0.09 rad safe upper limit.
+        data["target_wrist_pos_root"][0, 0] = 0.5
         data["lower_joint_limits"] = -0.1 * torch.ones(7)
         data["upper_joint_limits"] = 0.1 * torch.ones(7)
         action, metrics = make_controller(1, joint_limit_margin=0.01).compute(**data)
