@@ -87,7 +87,12 @@ class HandJacobianControllerTest(unittest.TestCase):
         data = inputs(1)
         data["target_wrist_pos_root"][0, 0] = 0.1
         data["action_scale"] = 0.5 * torch.ones(7)
-        action, _ = make_controller(1).compute(**data)
+        action, _ = make_controller(
+            1,
+            composition_mode="integrated_residual",
+            residual_decay=1.0,
+            max_accumulated_delta_q=1.0,
+        ).compute(**data)
         expected_delta_q = 0.1 / 1.01
         self.assertAlmostEqual(float(action[0, 22] * 0.5), expected_delta_q, places=6)
 
