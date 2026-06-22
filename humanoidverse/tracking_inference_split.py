@@ -992,6 +992,51 @@ def _jacobian_validation_metrics(candidate: np.ndarray, reference: np.ndarray) -
     }
 
 
+def _interpolate_reference_array(
+    sequence: np.ndarray,
+    times_s: np.ndarray,
+    reference_dt: float,
+) -> np.ndarray:
+    """Linearly sample a reference sequence at physical times."""
+
+    if reference_dt <= 0:
+        raise ValueError("reference_dt must be positive")
+    sequence = np.asarray(sequence)
+    positions = np.clip(times_s / reference_dt, 0.0, sequence.shape[0] - 1.0)
+    lower = np.floor(positions).astype(np.int64)
+    upper = np.minimum(lower + 1, sequence.shape[0] - 1)
+    weight_shape = (len(times_s),) + (1,) * (sequence.ndim - 1)
+    weight = (positions - lower).reshape(weight_shape)
+    return (1.0 - weight) * sequence[lower] + weight * sequence[upper]
+
+
+@torch.no_grad()
+def _resample_projected_z(
+    model,
+    z_reference: torch.Tensor,
+    target_times_s: np.ndarray,
+    reference_dt: float,
+) -> torch.Tensor:
+    """Interpolate frame-1-based z samples onto control times and re-project."""
+
+    positions_np = np.clip(
+        target_times_s / reference_dt - 1.0,
+        0.0,
+        z_reference.shape[0] - 1.0,
+    )
+    lower = torch.as_tensor(
+        np.floor(positions_np).astype(np.int64), device=z_reference.device
+    )
+    upper = torch.clamp(lower + 1, max=z_reference.shape[0] - 1)
+    weight = torch.as_tensor(
+        positions_np - np.floor(positions_np),
+        device=z_reference.device,
+        dtype=z_reference.dtype,
+    ).unsqueeze(-1)
+    interpolated = (1.0 - weight) * z_reference.index_select(0, lower) + weight * z_reference.index_select(0, upper)
+    return model.project_z(interpolated)
+
+
 def _run_single_traj_rollout(
     *,
     traj_np: dict[str, np.ndarray],
@@ -1042,27 +1087,29 @@ def _run_single_traj_rollout(
 
     Tz = z.shape[0]
     traj_T = traj_np["state"].shape[0]
-    n_steps = min(Tz, traj_T - 1, expert_qpos.shape[0] - 1)
+    control_dt = float(wrapped_env._env.dt)
+    reference_duration = min(traj_T - 1, Tz) * float(reference_dt)
+    n_steps = int(np.floor(reference_duration / control_dt + 1e-9))
     if episode_len is not None:
         n_steps = min(n_steps, episode_len)
-    print(f"Rollout [{clip_id}]: {n_steps} steps (z={Tz}, traj_T={traj_T})")
-    control_dt = float(wrapped_env._env.dt)
-    reference_duration = n_steps * float(reference_dt)
-    rollout_duration = n_steps * control_dt
+    control_times_s = np.arange(n_steps, dtype=np.float64) * control_dt
+    next_control_times_s = (np.arange(n_steps, dtype=np.float64) + 1.0) * control_dt
+    z_control = _resample_projected_z(model, z, next_control_times_s, float(reference_dt))
+    print(
+        f"Rollout [{clip_id}]: {n_steps} control steps "
+        f"(z_ref={Tz}, traj_T={traj_T}, reference_dt={reference_dt:.6f}s, control_dt={control_dt:.6f}s)"
+    )
     if abs(reference_dt - control_dt) > 1e-8:
         print(
-            "WARNING: reference/control timebase mismatch: "
-            f"reference_dt={reference_dt:.6f}s ({reference_duration:.3f}s for {n_steps} frames), "
-            f"control_dt={control_dt:.6f}s ({rollout_duration:.3f}s for {n_steps} steps). "
-            "The current one-reference-frame-per-control-step rollout plays the target at "
-            f"{reference_dt / control_dt:.3f}x speed."
+            "Reference timing resampled: "
+            f"{min(traj_T - 1, Tz)} intervals / {reference_duration:.3f}s -> "
+            f"{n_steps} control steps / {n_steps * control_dt:.3f}s"
         )
 
     joint_pos = [wrapped_env._env.simulator.dof_state[..., 0].clone().cpu().numpy()]
     _z_actual_list: list[np.ndarray] = []
     _B_actual_list: list[np.ndarray] = []
     _actual_flat_list: list[np.ndarray] = []
-    _ee_local_pred_list: list[np.ndarray] = []
     _policy_ee_base_list: list[np.ndarray] = []
     _root_state_list: list[np.ndarray] = []
     _torso_tilt_list: list[float] = []
@@ -1081,28 +1128,31 @@ def _run_single_traj_rollout(
     frames: list[np.ndarray] = []
     if save_mp4:
         rgb_renderer = IsaacRendererWithMuJoco(render_size=256)
-        expert_video = rgb_renderer.from_qpos(expert_qpos[: 1 + n_steps])
+        video_times_s = np.arange(n_steps + 1, dtype=np.float64) * control_dt
+        video_reference_indices = np.clip(
+            np.rint(video_times_s / float(reference_dt)).astype(np.int64),
+            0,
+            expert_qpos.shape[0] - 1,
+        )
+        expert_video = rgb_renderer.from_qpos(expert_qpos[video_reference_indices])
         frames = [rgb_renderer.render(wrapped_env._env, 0)[0]]
 
-    target_count = min(n_steps + max(0, jacobian_target_offset), expert_qpos.shape[0] - 1)
-    expert_ee_target_all = _fk_ee_positions_base(
+    expert_ee_reference = _fk_ee_positions_base(
         fk_model,
         fk_data,
         ee_id,
-        expert_qpos[1 : 1 + target_count, :7],
-        expert_qpos[1 : 1 + target_count, 7:].astype(np.float64),
+        expert_qpos[:, :7],
+        expert_qpos[:, 7:].astype(np.float64),
     )
-    # Plot/evaluation uses current-reference frame i against current policy frame i.
-    # The controller separately targets frame i+1 to match z computed from obs[1:].
-    expert_ee_base = _fk_ee_positions_base(
-        fk_model,
-        fk_data,
-        ee_id,
-        expert_qpos[:n_steps, :7],
-        expert_qpos[:n_steps, 7:].astype(np.float64),
+    expert_ee_base = _interpolate_reference_array(
+        expert_ee_reference, control_times_s, float(reference_dt)
+    )
+    target_times_s = next_control_times_s + max(0, jacobian_target_offset) * float(reference_dt)
+    expert_ee_target_control = _interpolate_reference_array(
+        expert_ee_reference, target_times_s, float(reference_dt)
     )
     expert_ee_targets_root = torch.as_tensor(
-        expert_ee_target_all, device=sim_dev, dtype=torch.float32
+        expert_ee_target_control, device=sim_dev, dtype=torch.float32
     )
 
     for i in range(n_steps):
@@ -1115,9 +1165,6 @@ def _run_single_traj_rollout(
         st_np = observation["state"][0].detach().cpu().numpy()
         priv_np = observation["privileged_state"][0].detach().cpu().numpy()
         _actual_flat_list.append(_flat_backward_numpy(st_np, priv_np))
-        _ee_local_pred_list.append(
-            observation["privileged_state"][0, _wrist_slice].detach().cpu().numpy()
-        )
         _rs = wrapped_env._env.simulator.robot_root_states[0].float().detach().cpu().numpy()
         _root_state_list.append(_rs.copy())
         projected_gravity = wrapped_env._env.projected_gravity[0].float().detach().cpu().numpy()
@@ -1137,7 +1184,9 @@ def _run_single_traj_rollout(
         _fall_list.append(float(fell))
         _d = wrapped_env._env.simulator.dof_state.view(num_envs, -1, 2)[0, :, 0].float().detach().cpu().numpy()
         _policy_ee_base_list.append(_fk_one_step_base(fk_model, fk_data, ee_id, _rs, _d))
-        action_bfm = model.act(observation, z[i % len(z)].unsqueeze(0).expand(num_envs, -1), mean=True)
+        action_bfm = model.act(
+            observation, z_control[i].unsqueeze(0).expand(num_envs, -1), mean=True
+        )
         action = action_bfm
         if jacobian_controller is not None:
             cuda_profile = jacobian_profile_timing and action_bfm.is_cuda
@@ -1146,8 +1195,7 @@ def _run_single_traj_rollout(
                 start_event = torch.cuda.Event(enable_timing=True)
                 end_event = torch.cuda.Event(enable_timing=True)
                 start_event.record()
-            target_idx = min(i + max(0, jacobian_target_offset), len(expert_ee_target_all) - 1)
-            target_wrist_pos_root = expert_ee_targets_root[target_idx].expand(num_envs, -1)
+            target_wrist_pos_root = expert_ee_targets_root[i].expand(num_envs, -1)
             wrist_data = wrapped_env.get_right_wrist_control_data(target_wrist_pos_root)
             if jacobian_validate_frame and i == 0:
                 jacobian_fd = _finite_difference_wrist_jacobian_root(
@@ -1204,9 +1252,12 @@ def _run_single_traj_rollout(
             frames.append(rgb_renderer.render(wrapped_env._env, 0)[0])
 
     _default_dof = wrapped_env._env.default_dof_pos[0].cpu().numpy()
-    _ref_dof_arr = traj_np["state"][:, :29] + _default_dof
-    _ref_ee_arr = traj_np["privileged_state"][:, _wrist_slice].astype(np.float32)
-    z_expert_np = z.detach().cpu().numpy()
+    reference_dof_abs = traj_np["state"][:, :29] + _default_dof
+    state_times_s = np.arange(n_steps + 1, dtype=np.float64) * control_dt
+    _ref_dof_arr = _interpolate_reference_array(
+        reference_dof_abs, state_times_s, float(reference_dt)
+    ).astype(np.float32)
+    z_expert_np = z_control.detach().cpu().numpy()
 
     if jacobian_cuda_events:
         # Profiling is opt-in; synchronize once after the rollout, never per step.
@@ -1218,7 +1269,9 @@ def _run_single_traj_rollout(
         timing_ms=jacobian_timing_ms,
     )
     root_states_arr = np.asarray(_root_state_list)
-    ref_root_pos_arr = expert_qpos[: len(root_states_arr), :3]
+    ref_root_pos_arr = _interpolate_reference_array(
+        expert_qpos[:, :3], control_times_s, float(reference_dt)
+    )
     body_stability_summary = {
         "pelvis_position_drift_m": float(
             np.linalg.norm(root_states_arr[:, :3] - ref_root_pos_arr, axis=-1).mean()
@@ -1234,12 +1287,17 @@ def _run_single_traj_rollout(
         model, B_actual_arr, z_window=z_window, z_ema_alpha=z_ema_alpha
     )
 
+    expert_state_control = _interpolate_reference_array(
+        traj_np["state"], control_times_s, float(reference_dt)
+    )
+    expert_priv_control = _interpolate_reference_array(
+        traj_np["privileged_state"], control_times_s, float(reference_dt)
+    )
     expert_flat = np.stack(
         [
-            _flat_backward_numpy(traj_np["state"][t], traj_np["privileged_state"][t])
-            for t in range(1, 1 + n_steps)
-        ],
-        axis=0,
+            _flat_backward_numpy(expert_state_control[t], expert_priv_control[t])
+            for t in range(n_steps)
+        ], axis=0
     )
     actual_flat = np.stack(_actual_flat_list, axis=0)
     body_input_diag = _compute_body_input_diagnostics(expert_flat, actual_flat, body_idx)
@@ -1250,9 +1308,9 @@ def _run_single_traj_rollout(
         n_steps=n_steps,
         joint_pos_arr=np.stack(joint_pos, axis=0).squeeze(1),
         z_actual_arr=np.stack(_z_actual_list),
-        ee_pred_arr=np.stack(_ee_local_pred_list),
+        ee_pred_arr=np.asarray(_policy_ee_base_list, dtype=np.float32),
         ref_dof_arr=_ref_dof_arr,
-        ref_ee_arr=_ref_ee_arr,
+        ref_ee_arr=expert_ee_base.astype(np.float32),
         z_expert_arr=z_expert_np,
         z_body_dim=_z_body_dim,
         clip_meta=clip_meta,
