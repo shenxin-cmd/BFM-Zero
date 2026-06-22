@@ -4,6 +4,7 @@ os.environ["HYDRA_FULL_ERROR"] = "1"
 # For Isaac Sim
 os.environ["OMNI_KIT_ACCEPT_EULA"] = "YES"
 import typing as tp
+from dataclasses import dataclass
 from typing import Any, Dict, Tuple, Union
 
 import gymnasium
@@ -35,6 +36,29 @@ else:
 # THIS_FILE_DIR = os.path.abspath(os.path.dirname(__file__))
 HYDRA_CONFIG_DIR = os.path.join(HUMANOIDVERSE_DIR, "config")
 HYDRA_CONFIG_REL_PATH = os.path.join("exp", "bfm_zero", "bfm_zero")
+
+
+@dataclass
+class RightWristControlData:
+    """Simulator tensors needed by the inference-time hand controller.
+
+    Cartesian tensors and the Jacobian are expressed in the full pelvis/root
+    frame (not the yaw-only heading frame). Jacobian rows 0:3 are linear, as
+    specified by the Isaac Gym and PhysX tensor APIs.
+    """
+
+    current_pos_root: torch.Tensor
+    target_pos_root: torch.Tensor
+    linear_vel_root: torch.Tensor
+    jacobian_pos_root: torch.Tensor
+    right_arm_q: torch.Tensor
+    default_right_arm_q: torch.Tensor
+    lower_limits: torch.Tensor
+    upper_limits: torch.Tensor
+    action_scale: torch.Tensor
+    action_lower: torch.Tensor
+    action_upper: torch.Tensor
+    right_arm_dof_indices: torch.Tensor
 
 
 def _expert_source_base_weights(file_names: list, source_weights: dict[str, float]) -> list[float]:
@@ -639,6 +663,172 @@ class HumanoidVerseVectorEnv(VectorEnv):
             observation = tree_map(lambda x: x.cpu().numpy(), observation)
 
         return observation
+
+    def _initialize_right_wrist_control_metadata(self) -> None:
+        """Validate ordering once and cache static action/Jacobian metadata."""
+
+        simulator = self._env.simulator
+        expected_names = list(self._env.config.robot.right_arm_dof_names)
+        if len(expected_names) != 7:
+            raise RuntimeError(f"Expected seven configured right-arm joints, got {expected_names}")
+        name_to_index = {name: i for i, name in enumerate(simulator.dof_names)}
+        missing = [name for name in expected_names if name not in name_to_index]
+        if missing:
+            raise RuntimeError(f"Configured right-arm joints absent from simulator order: {missing}")
+        indices_list = [name_to_index[name] for name in expected_names]
+        actual_names = [simulator.dof_names[i] for i in indices_list]
+        if actual_names != expected_names:
+            raise RuntimeError(f"Right-arm order mismatch: simulator={actual_names}, config={expected_names}")
+        if indices_list != list(range(22, 29)):
+            raise RuntimeError(f"This 29-DoF actor expects right arm at action indices 22:29, got {indices_list}")
+        wrist_name = "right_wrist_yaw_link"
+        if wrist_name not in simulator.body_names:
+            raise RuntimeError(f"Body {wrist_name!r} is absent from simulator body order")
+
+        dtype = simulator.dof_pos.dtype
+        indices = torch.tensor(indices_list, device=self.device, dtype=torch.long)
+        control_cfg = self._env.config.robot.control
+        action_scale = torch.full(
+            (self._env.num_dof,), float(control_cfg.action_scale), device=self.device, dtype=dtype
+        )
+        if control_cfg.get("action_rescale", False):
+            effort = torch.as_tensor(self._env.config.robot.dof_effort_limit_list, device=self.device, dtype=dtype)
+            action_scale *= effort / self._env.p_gains
+        if control_cfg.get("normalize_action", False):
+            normalize_to = float(control_cfg.get("normalize_action_to") or control_cfg.action_clip_value)
+            action_scale *= normalize_to / float(control_cfg.normalize_action_from)
+
+        self._right_arm_dof_indices_list = indices_list
+        self._right_arm_dof_indices = indices
+        self._right_wrist_body_index = simulator.body_names.index(wrist_name)
+        self._right_arm_action_scale = action_scale.index_select(0, indices)
+        self._right_arm_action_lower = torch.as_tensor(
+            self.single_action_space.low, device=self.device, dtype=dtype
+        ).index_select(0, indices)
+        self._right_arm_action_upper = torch.as_tensor(
+            self.single_action_space.high, device=self.device, dtype=dtype
+        ).index_select(0, indices)
+        if hasattr(simulator, "_robot") and hasattr(simulator._robot, "root_physx_view"):
+            self._right_wrist_raw_body_index = int(simulator.body_ids[self._right_wrist_body_index])
+            self._right_arm_raw_dof_indices = torch.tensor(
+                [simulator.dof_ids[i] for i in indices_list], device=self.device, dtype=torch.long
+            )
+            self._right_wrist_raw_body_count = max(int(i) for i in simulator.body_ids) + 1
+            self._right_arm_raw_dof_count = max(int(i) for i in simulator.dof_ids) + 1
+
+    def _right_wrist_jacobian_world(self, wrist_body_index: int, right_arm_indices: torch.Tensor) -> torch.Tensor:
+        """Slice the cached simulator Jacobian into ``[B, 3, 7]`` world-frame rows.
+
+        Isaac Gym includes six floating-base columns for a free-base asset;
+        PhysX/Isaac Sim exposes articulation-joint columns in its internal joint
+        order. Body and joint offsets are inferred from the returned tensor and
+        the simulator's explicit order maps rather than hard-coded.
+        """
+
+        simulator = self._env.simulator
+        if hasattr(simulator, "jacobian"):
+            jacobian = simulator.jacobian
+            raw_body_index = wrist_body_index
+            raw_dof_indices = right_arm_indices
+            raw_body_count = simulator.num_bodies
+            raw_dof_count = simulator.num_dof
+        elif hasattr(simulator, "_robot") and hasattr(simulator._robot, "root_physx_view"):
+            jacobian = simulator._robot.root_physx_view.get_jacobians()
+            raw_body_index = self._right_wrist_raw_body_index
+            raw_dof_indices = self._right_arm_raw_dof_indices
+            raw_body_count = self._right_wrist_raw_body_count
+            raw_dof_count = self._right_arm_raw_dof_count
+        else:
+            raise RuntimeError(
+                f"Simulator {type(simulator).__name__} does not expose a supported batched Jacobian API"
+            )
+
+        if jacobian.ndim != 4 or jacobian.shape[-2] != 6:
+            raise RuntimeError(f"Expected Jacobian [B, bodies, 6, columns], got {tuple(jacobian.shape)}")
+        if jacobian.shape[0] != self.num_envs:
+            raise RuntimeError(f"Jacobian batch {jacobian.shape[0]} != num_envs {self.num_envs}")
+
+        if jacobian.shape[1] == raw_body_count:
+            jacobian_body_index = raw_body_index
+        elif jacobian.shape[1] == raw_body_count - 1:
+            # Fixed-base tensor APIs omit the root link from the Jacobian body axis.
+            jacobian_body_index = raw_body_index - 1
+        else:
+            raise RuntimeError(
+                f"Cannot map Jacobian body axis {jacobian.shape[1]} to articulation body count {raw_body_count}"
+            )
+        if not 0 <= jacobian_body_index < jacobian.shape[1]:
+            raise RuntimeError(f"Mapped wrist Jacobian body index {jacobian_body_index} is invalid")
+
+        if jacobian.shape[-1] == raw_dof_count:
+            jacobian_dof_indices = raw_dof_indices
+        elif jacobian.shape[-1] == raw_dof_count + 6:
+            # Isaac Gym free-base actors prepend 6 unactuated root columns.
+            jacobian_dof_indices = raw_dof_indices + 6
+        else:
+            raise RuntimeError(
+                f"Cannot map Jacobian columns {jacobian.shape[-1]} to articulation DoFs {raw_dof_count}"
+            )
+        jacobian_dof_indices = jacobian_dof_indices.to(device=jacobian.device, dtype=torch.long)
+        jacobian_pos_world = jacobian[:, jacobian_body_index, 0:3, :].index_select(-1, jacobian_dof_indices)
+        if jacobian_pos_world.shape != (self.num_envs, 3, 7):
+            raise RuntimeError(f"Right-wrist Jacobian slice has shape {tuple(jacobian_pos_world.shape)}, expected [B, 3, 7]")
+        return jacobian_pos_world
+
+    def get_right_wrist_control_data(self, target_wrist_pos_root: torch.Tensor) -> RightWristControlData:
+        """Collect and frame-align right-wrist control tensors on the simulator device."""
+
+        simulator = self._env.simulator
+        if not hasattr(self, "_right_arm_dof_indices"):
+            self._initialize_right_wrist_control_metadata()
+        right_arm_indices = self._right_arm_dof_indices
+        wrist_body_index = self._right_wrist_body_index
+        root_state = simulator.robot_root_states
+        root_pos_world = root_state[:, 0:3]
+        root_quat_world = root_state[:, 3:7]  # xyzw
+        root_linear_vel_world = root_state[:, 7:10]
+        root_angular_vel_world = root_state[:, 10:13]
+        wrist_pos_world = simulator._rigid_body_pos[:, wrist_body_index]
+        wrist_linear_vel_world = simulator._rigid_body_vel[:, wrist_body_index]
+        wrist_offset_world = wrist_pos_world - root_pos_world
+
+        current_pos_root = quat_rotate_inverse(root_quat_world, wrist_offset_world, w_last=True)
+        wrist_relative_vel_world = (
+            wrist_linear_vel_world
+            - root_linear_vel_world
+            - torch.cross(root_angular_vel_world, wrist_offset_world, dim=-1)
+        )
+        linear_vel_root = quat_rotate_inverse(root_quat_world, wrist_relative_vel_world, w_last=True)
+
+        jacobian_pos_world = self._right_wrist_jacobian_world(wrist_body_index, right_arm_indices)
+        root_quat_per_column = root_quat_world[:, None, :].expand(-1, 7, -1).reshape(-1, 4)
+        jacobian_columns_world = jacobian_pos_world.transpose(-1, -2).reshape(-1, 3)
+        jacobian_pos_root = quat_rotate_inverse(
+            root_quat_per_column, jacobian_columns_world, w_last=True
+        ).reshape(self.num_envs, 7, 3).transpose(-1, -2)
+
+        target = torch.as_tensor(target_wrist_pos_root, device=self.device, dtype=current_pos_root.dtype)
+        if target.shape == (3,):
+            target = target.unsqueeze(0).expand(self.num_envs, -1)
+        if target.shape != (self.num_envs, 3):
+            raise ValueError(f"target_wrist_pos_root must be [3] or [B, 3], got {tuple(target.shape)}")
+
+        return RightWristControlData(
+            current_pos_root=current_pos_root,
+            target_pos_root=target,
+            linear_vel_root=linear_vel_root,
+            jacobian_pos_root=jacobian_pos_root,
+            right_arm_q=simulator.dof_pos.index_select(-1, right_arm_indices),
+            default_right_arm_q=(
+                self._env.default_dof_pos + self._env.default_dof_pos_offset
+            ).index_select(-1, right_arm_indices),
+            lower_limits=simulator.hard_dof_pos_limits[:, 0].index_select(0, right_arm_indices),
+            upper_limits=simulator.hard_dof_pos_limits[:, 1].index_select(0, right_arm_indices),
+            action_scale=self._right_arm_action_scale,
+            action_lower=self._right_arm_action_lower,
+            action_upper=self._right_arm_action_upper,
+            right_arm_dof_indices=right_arm_indices,
+        )
 
     def get_episodic_dr_info(self) -> Dict[str, np.ndarray]:
         """Get the episodic domain randomization information."""

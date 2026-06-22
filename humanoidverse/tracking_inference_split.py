@@ -45,6 +45,7 @@ from __future__ import annotations
 import csv
 import os
 import re
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -68,6 +69,10 @@ from torch.utils._pytree import tree_map
 import humanoidverse
 from humanoidverse.agents.envs.humanoidverse_isaac import HumanoidVerseIsaacConfig, IsaacRendererWithMuJoco
 from humanoidverse.agents.load_utils import load_model_from_checkpoint_dir
+from humanoidverse.controllers.hand_jacobian_controller import (
+    HandJacobianController,
+    HandJacobianControllerConfig,
+)
 from humanoidverse.tracking_inference_npz import (
     _EE_BODY,
     _fk_ee_positions_base,
@@ -237,8 +242,11 @@ class InferenceOutputLayout:
     root: Path
 
     @classmethod
-    def create(cls, model_folder: Path) -> "InferenceOutputLayout":
+    def create(cls, model_folder: Path, run_name: str | None = None) -> "InferenceOutputLayout":
         root = model_folder / "tracking_inference_split"
+        if run_name:
+            safe_name = re.sub(r"[^\w\-.]+", "_", run_name)
+            root = root / safe_name
         root.mkdir(parents=True, exist_ok=True)
         summary = root / "summary"
         summary.mkdir(parents=True, exist_ok=True)
@@ -289,6 +297,8 @@ def _save_inference_metrics(
     clip_meta: dict | None = None,
     z_actual_smoothed_arr: np.ndarray | None = None,
     body_input_diag: dict | None = None,
+    jacobian_metrics: dict | None = None,
+    body_stability_metrics: dict | None = None,
 ) -> dict:
     """Compute inference metrics, save pkl/json/npz, return metrics dict."""
     n_cmp = min(n_steps, ref_dof_arr.shape[0] - 1, len(z_actual_arr))
@@ -339,6 +349,10 @@ def _save_inference_metrics(
     metrics.update(z_cos)
     if body_input_diag:
         metrics.update({k: v for k, v in body_input_diag.items() if v is not None and k not in metrics})
+    if jacobian_metrics:
+        metrics.update(jacobian_metrics)
+    if body_stability_metrics:
+        metrics.update(body_stability_metrics)
 
     print(f"\n=== Inference Metrics ({clip_id}) ===")
     for k, v in metrics.items():
@@ -885,6 +899,61 @@ def _build_expert_qpos(
     return expert_qpos, ref_root, dof_init
 
 
+def _summarize_hand_jacobian_metrics(
+    per_step: list[dict[str, torch.Tensor]],
+    *,
+    control_dt: float,
+    timing_ms: list[float],
+) -> dict[str, float]:
+    """Aggregate controller diagnostics without synchronizing inside the rollout."""
+
+    if not per_step:
+        return {}
+    stacked = {
+        key: torch.stack([step[key] for step in per_step], dim=0).detach().float().cpu()
+        for key in per_step[0]
+    }
+    error = stacked["wrist_error"].reshape(-1)
+    error_by_step = stacked["wrist_error"].mean(dim=-1)
+    reached_2cm = error_by_step <= 0.02
+    first_reached = torch.nonzero(reached_2cm, as_tuple=False)
+    hold_10 = False
+    if reached_2cm.numel() >= 10:
+        hold_10 = bool(reached_2cm.unfold(0, 10, 1).all(dim=-1).any().item())
+    out = {
+        "jacobian_wrist_error_mean": float(error.mean()),
+        "jacobian_wrist_error_median": float(error.median()),
+        "jacobian_wrist_error_max": float(error.max()),
+        "jacobian_wrist_error_p90": float(torch.quantile(error, 0.90)),
+        "jacobian_wrist_error_p95": float(torch.quantile(error, 0.95)),
+        "jacobian_gate_mean": float(stacked["jacobian_gate"].mean()),
+        "jacobian_active_ratio": float(stacked["jacobian_active"].float().mean()),
+        "jacobian_delta_q_raw_norm": float(stacked["delta_q_raw_norm"].mean()),
+        "jacobian_delta_q_filtered_norm": float(stacked["delta_q_filtered_norm"].mean()),
+        "jacobian_delta_action_norm": float(stacked["delta_action_norm"].mean()),
+        "jacobian_joint_limit_projection_ratio": float(stacked["joint_limit_projected"].float().mean()),
+        "jacobian_invalid_input_count": float(stacked["invalid_input"].sum()),
+        "jacobian_dls_failure_count": float(stacked["dls_failure"].sum()),
+        "jacobian_steady_state_error_last_10": float(error_by_step[-10:].mean()),
+        "jacobian_steady_state_error_last_25": float(error_by_step[-25:].mean()),
+        "jacobian_success_rate_1cm": float((error <= 0.01).float().mean()),
+        "jacobian_success_rate_2cm": float((error <= 0.02).float().mean()),
+        "jacobian_success_rate_5cm": float((error <= 0.05).float().mean()),
+        "jacobian_time_to_reach_2cm_s": (
+            float(first_reached[0, 0]) * control_dt if first_reached.numel() else -1.0
+        ),
+        "jacobian_hold_success_2cm_10frames": float(hold_10),
+    }
+    finite_sigma = stacked["sigma_min"][torch.isfinite(stacked["sigma_min"])]
+    if finite_sigma.numel():
+        out["jacobian_sigma_min_mean"] = float(finite_sigma.mean())
+        out["jacobian_sigma_min_min"] = float(finite_sigma.min())
+    if timing_ms:
+        out["jacobian_total_ms_mean"] = float(np.mean(timing_ms))
+        out["jacobian_total_ms_p95"] = float(np.percentile(timing_ms, 95))
+    return out
+
+
 def _run_single_traj_rollout(
     *,
     traj_np: dict[str, np.ndarray],
@@ -906,6 +975,9 @@ def _run_single_traj_rollout(
     clip_meta: dict | None = None,
     z_window: int = 1,
     z_ema_alpha: float | None = None,
+    jacobian_controller: HandJacobianController | None = None,
+    jacobian_target_offset: int = 0,
+    jacobian_profile_timing: bool = False,
 ) -> dict:
     """Reset env to traj init, rollout tracking, save metrics for one trajectory."""
     expert_qpos, ref_root, dof_init_state = _build_expert_qpos(
@@ -941,9 +1013,18 @@ def _run_single_traj_rollout(
     _actual_flat_list: list[np.ndarray] = []
     _ee_local_pred_list: list[np.ndarray] = []
     _policy_ee_base_list: list[np.ndarray] = []
+    _root_state_list: list[np.ndarray] = []
+    _torso_tilt_list: list[float] = []
+    _foot_slip_list: list[float] = []
+    _fall_list: list[float] = []
     _action_dim = wrapped_env.action_space.shape[-1]
     _last_act_buf = torch.zeros((num_envs, _action_dim), dtype=torch.float32, device=sim_dev)
     body_idx = _body_idx_from_model(model)
+    jacobian_step_metrics: list[dict[str, torch.Tensor]] = []
+    jacobian_timing_ms: list[float] = []
+    jacobian_cuda_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+    if jacobian_controller is not None:
+        jacobian_controller.reset()
 
     expert_video = None
     frames: list[np.ndarray] = []
@@ -952,12 +1033,17 @@ def _run_single_traj_rollout(
         expert_video = rgb_renderer.from_qpos(expert_qpos[: 1 + n_steps])
         frames = [rgb_renderer.render(wrapped_env._env, 0)[0]]
 
-    expert_ee_base = _fk_ee_positions_base(
+    target_count = min(n_steps + max(0, jacobian_target_offset), expert_qpos.shape[0] - 1)
+    expert_ee_base_all = _fk_ee_positions_base(
         fk_model,
         fk_data,
         ee_id,
-        expert_qpos[1 : 1 + n_steps, :7],
-        expert_qpos[1 : 1 + n_steps, 7:].astype(np.float64),
+        expert_qpos[1 : 1 + target_count, :7],
+        expert_qpos[1 : 1 + target_count, 7:].astype(np.float64),
+    )
+    expert_ee_base = expert_ee_base_all[:n_steps]
+    expert_ee_targets_root = torch.as_tensor(
+        expert_ee_base_all, device=sim_dev, dtype=torch.float32
     )
 
     for i in range(n_steps):
@@ -974,11 +1060,60 @@ def _run_single_traj_rollout(
             observation["privileged_state"][0, _wrist_slice].detach().cpu().numpy()
         )
         _rs = wrapped_env._env.simulator.robot_root_states[0].float().detach().cpu().numpy()
+        _root_state_list.append(_rs.copy())
+        projected_gravity = wrapped_env._env.projected_gravity[0].float().detach().cpu().numpy()
+        _torso_tilt_list.append(float(np.arctan2(np.linalg.norm(projected_gravity[:2]), -projected_gravity[2])))
+        foot_vel = wrapped_env._env.simulator._rigid_body_vel[0, wrapped_env._env.feet_indices].float().detach().cpu().numpy()
+        foot_force = wrapped_env._env.simulator.contact_forces[0, wrapped_env._env.feet_indices].float().detach().cpu().numpy()
+        foot_contact = foot_force[:, 2] > 1.0
+        _foot_slip_list.append(
+            float(np.linalg.norm(foot_vel[foot_contact, :2], axis=-1).mean()) if np.any(foot_contact) else 0.0
+        )
+        termination_cfg = wrapped_env._env.config.termination_scales
+        fell = (
+            _rs[2] < float(termination_cfg.termination_min_base_height)
+            or abs(projected_gravity[0]) > float(termination_cfg.termination_gravity_x)
+            or abs(projected_gravity[1]) > float(termination_cfg.termination_gravity_y)
+        )
+        _fall_list.append(float(fell))
         _d = wrapped_env._env.simulator.dof_state.view(num_envs, -1, 2)[0, :, 0].float().detach().cpu().numpy()
         _policy_ee_base_list.append(_fk_one_step_base(fk_model, fk_data, ee_id, _rs, _d))
-        action = model.act(observation, z[i % len(z)].unsqueeze(0).expand(num_envs, -1), mean=True)
+        action_bfm = model.act(observation, z[i % len(z)].unsqueeze(0).expand(num_envs, -1), mean=True)
+        action = action_bfm
+        if jacobian_controller is not None:
+            cuda_profile = jacobian_profile_timing and action_bfm.is_cuda
+            cpu_start = time.perf_counter() if jacobian_profile_timing and not action_bfm.is_cuda else None
+            if cuda_profile:
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+                start_event.record()
+            target_idx = min(i + max(0, jacobian_target_offset), len(expert_ee_base_all) - 1)
+            target_wrist_pos_root = expert_ee_targets_root[target_idx].expand(num_envs, -1)
+            wrist_data = wrapped_env.get_right_wrist_control_data(target_wrist_pos_root)
+            action, step_metrics = jacobian_controller.compute(
+                action_bfm=action_bfm,
+                current_wrist_pos_root=wrist_data.current_pos_root,
+                target_wrist_pos_root=wrist_data.target_pos_root,
+                wrist_linear_vel_root=wrist_data.linear_vel_root,
+                jacobian_pos_root=wrist_data.jacobian_pos_root,
+                current_right_arm_q=wrist_data.right_arm_q,
+                default_right_arm_q=wrist_data.default_right_arm_q,
+                lower_joint_limits=wrist_data.lower_limits,
+                upper_joint_limits=wrist_data.upper_limits,
+                action_scale=wrist_data.action_scale,
+                action_lower=wrist_data.action_lower,
+                action_upper=wrist_data.action_upper,
+            )
+            jacobian_step_metrics.append(step_metrics)
+            if cuda_profile:
+                end_event.record()
+                jacobian_cuda_events.append((start_event, end_event))
+            elif cpu_start is not None:
+                jacobian_timing_ms.append((time.perf_counter() - cpu_start) * 1000.0)
         _last_act_buf = action.detach()
         observation, _r, _t, _trunc, _info = wrapped_env.step(action, to_numpy=False)
+        if jacobian_controller is not None:
+            jacobian_controller.reset(_t | _trunc)
         joint_pos.append(wrapped_env._env.simulator.dof_state[..., 0].clone().cpu().numpy())
         if save_mp4:
             frames.append(rgb_renderer.render(wrapped_env._env, 0)[0])
@@ -987,6 +1122,27 @@ def _run_single_traj_rollout(
     _ref_dof_arr = traj_np["state"][:, :29] + _default_dof
     _ref_ee_arr = traj_np["privileged_state"][:, _wrist_slice].astype(np.float32)
     z_expert_np = z.detach().cpu().numpy()
+
+    if jacobian_cuda_events:
+        # Profiling is opt-in; synchronize once after the rollout, never per step.
+        torch.cuda.synchronize(device=action.device)
+        jacobian_timing_ms.extend(start.elapsed_time(end) for start, end in jacobian_cuda_events)
+    jacobian_summary = _summarize_hand_jacobian_metrics(
+        jacobian_step_metrics,
+        control_dt=float(wrapped_env._env.dt),
+        timing_ms=jacobian_timing_ms,
+    )
+    root_states_arr = np.asarray(_root_state_list)
+    ref_root_pos_arr = expert_qpos[: len(root_states_arr), :3]
+    body_stability_summary = {
+        "pelvis_position_drift_m": float(
+            np.linalg.norm(root_states_arr[:, :3] - ref_root_pos_arr, axis=-1).mean()
+        ),
+        "torso_tilt_mean_rad": float(np.mean(_torso_tilt_list)),
+        "torso_tilt_max_rad": float(np.max(_torso_tilt_list)),
+        "foot_slip_mean_mps": float(np.mean(_foot_slip_list)),
+        "fall_rate": float(np.mean(_fall_list)),
+    }
 
     B_actual_arr = np.stack(_B_actual_list, axis=0)
     z_actual_smoothed = _smooth_and_project_B(
@@ -1017,6 +1173,8 @@ def _run_single_traj_rollout(
         clip_meta=clip_meta,
         z_actual_smoothed_arr=z_actual_smoothed,
         body_input_diag=body_input_diag,
+        jacobian_metrics=jacobian_summary,
+        body_stability_metrics=body_stability_summary,
     )
 
     policy_ee_base = np.asarray(_policy_ee_base_list, dtype=np.float64)
@@ -1069,6 +1227,29 @@ def main(
     one_per_shape_plane: bool = False,
     max_clips: int | None = None,
     resume: bool = False,
+    output_tag: str | None = None,
+    use_hand_jacobian: bool = False,
+    jacobian_ablation: str | None = None,
+    jacobian_kp_position: float = 3.0,
+    jacobian_kd_position: float = 0.25,
+    jacobian_damping: float = 0.08,
+    jacobian_adaptive_damping: bool = False,
+    jacobian_min_damping: float = 0.02,
+    jacobian_max_damping: float = 0.20,
+    jacobian_singularity_threshold: float = 0.05,
+    jacobian_gate_mode: str = "linear",
+    jacobian_gate_near: float = 0.02,
+    jacobian_gate_far: float = 0.10,
+    jacobian_max_task_velocity: float = 0.30,
+    jacobian_max_delta_q: float = 0.02,
+    jacobian_max_delta_action: float = 0.30,
+    jacobian_lowpass_beta: float = 0.85,
+    jacobian_joint_limit_margin: float = 0.05,
+    jacobian_max_valid_error: float = 1.0,
+    jacobian_use_nullspace: bool = False,
+    jacobian_nullspace_gain: float = 0.1,
+    jacobian_target_offset: int = 0,
+    jacobian_profile_timing: bool = False,
 ) -> None:
     """z smoothing options (anti-jump for OOD target trajectories):
 
@@ -1152,7 +1333,73 @@ def main(
     print(env.config.simulator)
     print("-" * 80)
 
-    output_layout = InferenceOutputLayout.create(model_folder)
+    if jacobian_target_offset < 0:
+        raise ValueError("jacobian_target_offset must be non-negative")
+    if jacobian_ablation is not None:
+        ablation = jacobian_ablation.upper()
+        if ablation not in {"A", "B", "C", "D"}:
+            raise ValueError("jacobian_ablation must be one of A, B, C, D")
+        use_hand_jacobian = ablation != "A"
+        if ablation == "B":
+            jacobian_gate_mode = "none"
+            jacobian_lowpass_beta = 0.0
+        elif ablation == "C":
+            jacobian_gate_mode = "linear"
+            jacobian_lowpass_beta = 0.0
+        elif ablation == "D":
+            jacobian_gate_mode = "linear"
+        if output_tag is None:
+            output_tag = f"jacobian_{ablation}"
+
+    jacobian_controller = None
+    if use_hand_jacobian:
+        expected_names = list(env.config.robot.right_arm_dof_names)
+        actual_names = list(env.simulator.dof_names[22:29])
+        if actual_names != expected_names:
+            raise RuntimeError(
+                f"Actor action indices 22:29 are not the configured right arm: actual={actual_names}, expected={expected_names}"
+            )
+        jacobian_cfg = HandJacobianControllerConfig(
+            enabled=True,
+            kp_position=jacobian_kp_position,
+            kd_position=jacobian_kd_position,
+            damping=jacobian_damping,
+            adaptive_damping=jacobian_adaptive_damping,
+            min_damping=jacobian_min_damping,
+            max_damping=jacobian_max_damping,
+            singularity_threshold=jacobian_singularity_threshold,
+            gate_mode=jacobian_gate_mode,
+            gate_near=jacobian_gate_near,
+            gate_far=jacobian_gate_far,
+            max_task_velocity=jacobian_max_task_velocity,
+            max_delta_q=jacobian_max_delta_q,
+            max_delta_action=jacobian_max_delta_action,
+            lowpass_beta=jacobian_lowpass_beta,
+            joint_limit_margin=jacobian_joint_limit_margin,
+            max_valid_error=jacobian_max_valid_error,
+            use_nullspace=jacobian_use_nullspace,
+            nullspace_gain=jacobian_nullspace_gain,
+        )
+        jacobian_controller = HandJacobianController(
+            jacobian_cfg,
+            num_envs=num_envs,
+            device=env.device,
+            right_arm_dof_indices=torch.arange(22, 29, device=env.device),
+        )
+        jacobian_probe = wrapped_env.get_right_wrist_control_data(
+            torch.zeros(num_envs, 3, device=env.device)
+        )
+        print(
+            "Jacobian interface probe: "
+            f"J={tuple(jacobian_probe.jacobian_pos_root.shape)}, "
+            f"wrist={tuple(jacobian_probe.current_pos_root.shape)}, "
+            f"action_scale={jacobian_probe.action_scale.tolist()}"
+        )
+        print(f"Hand Jacobian controller: {jacobian_cfg}")
+    else:
+        print("Hand Jacobian controller: disabled (actor behavior is unchanged)")
+
+    output_layout = InferenceOutputLayout.create(model_folder, output_tag)
     print(f"Output root: {output_layout.root}")
 
     paths = _discover_traj_paths(traj_obs_dir, traj_glob)
@@ -1247,6 +1494,9 @@ def main(
             clip_meta=clip_meta,
             z_window=z_window,
             z_ema_alpha=z_ema_alpha,
+            jacobian_controller=jacobian_controller,
+            jacobian_target_offset=jacobian_target_offset,
+            jacobian_profile_timing=jacobian_profile_timing,
         )
         per_clip_metrics.append(metrics)
 
