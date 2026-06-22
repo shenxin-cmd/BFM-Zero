@@ -938,6 +938,12 @@ def _summarize_hand_jacobian_metrics(
         "jacobian_active_ratio": float(stacked["jacobian_active"].float().mean()),
         "jacobian_delta_q_raw_norm": float(stacked["delta_q_raw_norm"].mean()),
         "jacobian_delta_q_filtered_norm": float(stacked["delta_q_filtered_norm"].mean()),
+        "jacobian_accumulated_delta_q_norm": float(
+            stacked["accumulated_delta_q_norm"].mean()
+        ),
+        "jacobian_accumulated_delta_q_saturation_ratio": float(
+            stacked["accumulated_delta_q_saturated"].float().mean()
+        ),
         "jacobian_delta_action_norm": float(stacked["delta_action_norm"].mean()),
         "jacobian_joint_target_correction_norm": float(
             stacked["joint_target_correction_norm"].mean()
@@ -1249,6 +1255,7 @@ def _run_single_traj_rollout(
                 action_scale=wrist_data.action_scale,
                 action_lower=wrist_data.action_lower,
                 action_upper=wrist_data.action_upper,
+                control_dt=control_dt,
             )
             jacobian_step_metrics.append(step_metrics)
             if cuda_profile:
@@ -1400,7 +1407,9 @@ def main(
     jacobian_max_delta_q: float = 0.02,
     jacobian_max_delta_action: float = 0.30,
     jacobian_lowpass_beta: float = 0.85,
-    jacobian_composition_mode: str = "task_priority",
+    jacobian_composition_mode: str = "integrated_residual",
+    jacobian_residual_decay: float = 0.995,
+    jacobian_max_accumulated_delta_q: float = 0.05,
     jacobian_joint_limit_margin: float = 0.05,
     jacobian_max_valid_error: float = 1.0,
     jacobian_use_nullspace: bool = False,
@@ -1534,6 +1543,8 @@ def main(
             max_delta_action=jacobian_max_delta_action,
             lowpass_beta=jacobian_lowpass_beta,
             composition_mode=jacobian_composition_mode,
+            residual_decay=jacobian_residual_decay,
+            max_accumulated_delta_q=jacobian_max_accumulated_delta_q,
             joint_limit_margin=jacobian_joint_limit_margin,
             max_valid_error=jacobian_max_valid_error,
             use_nullspace=jacobian_use_nullspace,

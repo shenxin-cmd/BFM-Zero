@@ -33,7 +33,9 @@ class HandJacobianControllerConfig:
     max_delta_q: float = 0.02
     max_delta_action: float = 0.30
     lowpass_beta: float = 0.85
-    composition_mode: str = "task_priority"
+    composition_mode: str = "integrated_residual"
+    residual_decay: float = 0.995
+    max_accumulated_delta_q: float = 0.05
     joint_limit_margin: float = 0.05
     max_valid_error: float = 1.0
     use_nullspace: bool = False
@@ -56,8 +58,14 @@ class HandJacobianControllerConfig:
             raise ValueError("velocity and correction limits must be positive")
         if not 0.0 <= self.lowpass_beta < 1.0:
             raise ValueError("lowpass_beta must be in [0, 1)")
-        if self.composition_mode not in ("residual", "task_priority"):
-            raise ValueError("composition_mode must be 'residual' or 'task_priority'")
+        if self.composition_mode not in ("residual", "integrated_residual", "task_priority"):
+            raise ValueError(
+                "composition_mode must be 'residual', 'integrated_residual', or 'task_priority'"
+            )
+        if not 0.0 <= self.residual_decay <= 1.0:
+            raise ValueError("residual_decay must be in [0, 1]")
+        if self.max_accumulated_delta_q <= 0:
+            raise ValueError("max_accumulated_delta_q must be positive")
         if self.joint_limit_margin < 0:
             raise ValueError("joint_limit_margin must be non-negative")
         if self.max_valid_error <= 0:
@@ -143,6 +151,7 @@ class HandJacobianController:
         self.right_arm_dof_indices = indices
         self._max_action_index = int(indices.max())
         self.prev_delta_q = torch.zeros(self.num_envs, 7, device=self.device)
+        self.accumulated_delta_q = torch.zeros(self.num_envs, 7, device=self.device)
         self._task_eye = torch.eye(3, device=self.device).expand(self.num_envs, 3, 3)
         self._joint_eye = torch.eye(7, device=self.device).expand(self.num_envs, 7, 7)
 
@@ -151,14 +160,18 @@ class HandJacobianController:
 
         if env_ids is None:
             self.prev_delta_q.zero_()
+            self.accumulated_delta_q.zero_()
             return
         ids_or_mask = torch.as_tensor(env_ids, device=self.device)
         if ids_or_mask.dtype == torch.bool:
             if ids_or_mask.shape != (self.num_envs,):
                 raise ValueError(f"boolean reset mask must be [B], got {tuple(ids_or_mask.shape)}")
             self.prev_delta_q.masked_fill_(ids_or_mask[:, None], 0.0)
+            self.accumulated_delta_q.masked_fill_(ids_or_mask[:, None], 0.0)
         else:
-            self.prev_delta_q[ids_or_mask.long()] = 0.0
+            ids = ids_or_mask.long()
+            self.prev_delta_q[ids] = 0.0
+            self.accumulated_delta_q[ids] = 0.0
 
     @staticmethod
     def _as_batch_7(value: torch.Tensor, batch_size: int, name: str) -> torch.Tensor:
@@ -185,6 +198,7 @@ class HandJacobianController:
         action_lower: torch.Tensor,
         action_upper: torch.Tensor,
         valid_mask: torch.Tensor | None = None,
+        control_dt: float = 1.0,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Apply the residual to an actor action.
 
@@ -210,6 +224,8 @@ class HandJacobianController:
             raise ValueError(f"current_right_arm_q must be [B, 7], got {tuple(current_right_arm_q.shape)}")
         if self._max_action_index >= action_dim:
             raise ValueError("right-arm index is outside actor action dimension")
+        if control_dt <= 0:
+            raise ValueError("control_dt must be positive")
 
         default_q = self._as_batch_7(default_right_arm_q, batch_size, "default_right_arm_q")
         lower = self._as_batch_7(lower_joint_limits, batch_size, "lower_joint_limits")
@@ -287,7 +303,12 @@ class HandJacobianController:
             posture_error = self.cfg.nullspace_gain * (q_target_bfm - current_right_arm_q)
             nullspace_delta = (null_projector @ posture_error.unsqueeze(-1)).squeeze(-1)
 
-        delta_q_clipped = delta_q_raw.clamp(-self.cfg.max_delta_q, self.cfg.max_delta_q)
+        delta_q_step_raw = (
+            delta_q_raw * float(control_dt)
+            if self.cfg.composition_mode == "integrated_residual"
+            else delta_q_raw
+        )
+        delta_q_clipped = delta_q_step_raw.clamp(-self.cfg.max_delta_q, self.cfg.max_delta_q)
         delta_q_filtered = self.cfg.lowpass_beta * self.prev_delta_q + (1.0 - self.cfg.lowpass_beta) * delta_q_clipped
         if self.cfg.gate_mode == "linear":
             gate = compute_linear_gate(error_norm, self.cfg.gate_near, self.cfg.gate_far)
@@ -303,6 +324,19 @@ class HandJacobianController:
             # a freshly regenerated BFM target on every control step.
             q_target_ik = current_right_arm_q + delta_q_filtered + nullspace_delta
             joint_correction = gate * (q_target_ik - q_target_bfm)
+        elif self.cfg.composition_mode == "integrated_residual":
+            accumulated = (
+                self.cfg.residual_decay * self.accumulated_delta_q
+                + delta_q_filtered
+                + float(control_dt) * nullspace_delta
+            ).clamp(
+                -self.cfg.max_accumulated_delta_q,
+                self.cfg.max_accumulated_delta_q,
+            )
+            self.accumulated_delta_q.copy_(
+                torch.where(valid[:, None], accumulated, torch.zeros_like(accumulated))
+            )
+            joint_correction = gate * self.accumulated_delta_q
         else:
             joint_correction = gate * (delta_q_filtered + nullspace_delta)
         delta_action = (joint_correction / safe_scale).clamp(
@@ -326,6 +360,12 @@ class HandJacobianController:
             "jacobian_active": gate.squeeze(-1).gt(0.0),
             "delta_q_raw_norm": torch.linalg.vector_norm(delta_q_raw, dim=-1),
             "delta_q_filtered_norm": torch.linalg.vector_norm(delta_q_filtered, dim=-1),
+            "accumulated_delta_q_norm": torch.linalg.vector_norm(
+                self.accumulated_delta_q, dim=-1
+            ),
+            "accumulated_delta_q_saturated": self.accumulated_delta_q.abs().ge(
+                self.cfg.max_accumulated_delta_q - 1e-7
+            ).any(dim=-1),
             "delta_action_norm": torch.linalg.vector_norm(delta_action, dim=-1),
             "joint_target_correction_norm": torch.linalg.vector_norm(
                 delta_action * safe_scale, dim=-1

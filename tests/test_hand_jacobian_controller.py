@@ -99,10 +99,14 @@ class HandJacobianControllerTest(unittest.TestCase):
     def test_partial_reset_only_clears_selected_filter_state(self) -> None:
         controller = make_controller(3)
         controller.prev_delta_q[:] = torch.tensor([[1.0] * 7, [2.0] * 7, [3.0] * 7])
+        controller.accumulated_delta_q[:] = controller.prev_delta_q
         controller.reset(torch.tensor([1]))
         torch.testing.assert_close(controller.prev_delta_q[0], torch.ones(7))
         torch.testing.assert_close(controller.prev_delta_q[1], torch.zeros(7))
         torch.testing.assert_close(controller.prev_delta_q[2], 3.0 * torch.ones(7))
+        torch.testing.assert_close(controller.accumulated_delta_q[0], torch.ones(7))
+        torch.testing.assert_close(controller.accumulated_delta_q[1], torch.zeros(7))
+        torch.testing.assert_close(controller.accumulated_delta_q[2], 3.0 * torch.ones(7))
 
     def test_nan_jacobian_disables_only_invalid_environment(self) -> None:
         data = inputs(2)
@@ -127,6 +131,19 @@ class HandJacobianControllerTest(unittest.TestCase):
         data["current_right_arm_q"][0] = 0.1
         action, _ = make_controller(1, composition_mode="task_priority").compute(**data)
         torch.testing.assert_close(action[0, 22:29], 0.1 * torch.ones(7))
+
+    def test_integrated_residual_accumulates_with_control_dt(self) -> None:
+        data = inputs(1)
+        data["target_wrist_pos_root"][0, 0] = 0.1
+        controller = make_controller(
+            1,
+            composition_mode="integrated_residual",
+            residual_decay=1.0,
+            max_accumulated_delta_q=1.0,
+        )
+        action_1, _ = controller.compute(**data, control_dt=0.1)
+        action_2, _ = controller.compute(**data, control_dt=0.1)
+        self.assertAlmostEqual(float(action_2[0, 22]), 2.0 * float(action_1[0, 22]), places=6)
 
     def test_joint_limit_projection(self) -> None:
         data = inputs(1)
