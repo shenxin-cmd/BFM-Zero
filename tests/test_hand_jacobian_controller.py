@@ -76,16 +76,18 @@ class HandJacobianControllerTest(unittest.TestCase):
         expected = torch.tensor([[1.0, -2.0, 3.0, 0.0, 0.0, 0.0, 0.0]]) / 1.01
         torch.testing.assert_close(result, expected)
 
-    def test_target_velocity_feedforward(self) -> None:
+    def test_target_velocity_error_feedback(self) -> None:
         data = inputs(1)
         data["target_wrist_linear_vel_control"][0, 0] = 0.2
         action, _ = make_controller(
             1,
+            kd_position=0.25,
             composition_mode="integrated_residual",
             residual_decay=1.0,
             max_accumulated_delta_q=1.0,
         ).compute(**data, control_dt=0.1)
-        self.assertAlmostEqual(float(action[0, 22]), 0.02 / 1.01, places=6)
+        expected_delta_q = 0.25 * 0.2 * 0.1 / 1.01
+        self.assertAlmostEqual(float(action[0, 22]), expected_delta_q, places=6)
 
     def test_singular_jacobian_is_finite_and_bounded(self) -> None:
         data = inputs(4)

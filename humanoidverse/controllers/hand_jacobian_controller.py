@@ -287,10 +287,12 @@ class HandJacobianController:
             target_wrist_linear_vel_control,
             torch.zeros_like(target_wrist_linear_vel_control),
         )
-        task_velocity = (
-            safe_target_velocity
-            + self.cfg.kp_position * safe_error
-            + self.cfg.kd_position * (safe_target_velocity - safe_velocity)
+        # This controller is a residual on top of BFM, whose action already
+        # contains the nominal target motion. Adding the full target velocity
+        # here would command that motion twice. Only close the position and
+        # velocity errors left by the actor.
+        task_velocity = self.cfg.kp_position * safe_error + self.cfg.kd_position * (
+            safe_target_velocity - safe_velocity
         )
         velocity_norm = torch.linalg.vector_norm(task_velocity, dim=-1, keepdim=True)
         task_velocity *= (self.cfg.max_task_velocity / velocity_norm.clamp_min(1e-8)).clamp_max(1.0)

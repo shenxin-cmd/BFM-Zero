@@ -1154,6 +1154,7 @@ def _run_single_traj_rollout(
     jacobian_target_offset: int = 0,
     jacobian_profile_timing: bool = False,
     jacobian_validate_frame: bool = False,
+    jacobian_validate_frame_step: int = 0,
     reference_dt: float = 1.0 / 30.0,
     control_frame: str = "heading",
 ) -> dict:
@@ -1212,6 +1213,7 @@ def _run_single_traj_rollout(
     _last_act_buf = torch.zeros((num_envs, _action_dim), dtype=torch.float32, device=sim_dev)
     body_idx = _body_idx_from_model(model)
     jacobian_step_metrics: list[dict[str, torch.Tensor]] = []
+    jacobian_validation_summary: dict[str, float | int | str] = {}
     jacobian_timing_ms: list[float] = []
     jacobian_cuda_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
     if jacobian_controller is not None:
@@ -1320,7 +1322,8 @@ def _run_single_traj_rollout(
                 target_wrist_linear_vel_control=target_wrist_velocity_control,
                 control_frame=control_frame,
             )
-            if jacobian_validate_frame and i == 0:
+            validation_step = min(max(0, jacobian_validate_frame_step), n_steps - 1)
+            if jacobian_validate_frame and i == validation_step:
                 jacobian_fd = _finite_difference_wrist_jacobian_control(
                     fk_model,
                     fk_data,
@@ -1331,10 +1334,33 @@ def _run_single_traj_rollout(
                     control_frame,
                 )
                 jacobian_selected = wrist_data.jacobian_pos_control[0].detach().float().cpu().numpy()
+                validation_values = _jacobian_validation_metrics(
+                    jacobian_selected, jacobian_fd
+                )
+                current_fk_control = _fk_one_step_control(
+                    fk_model, fk_data, ee_id, _rs, _d, control_frame
+                )
+                current_sim_control = (
+                    wrist_data.current_pos_control[0].detach().float().cpu().numpy()
+                )
+                position_disagreement = float(
+                    np.linalg.norm(current_sim_control - current_fk_control)
+                )
+                jacobian_validation_summary = {
+                    "jacobian_validation_frame": control_frame,
+                    "jacobian_validation_step": int(i),
+                    "jacobian_validation_relative_l2": float(
+                        validation_values["relative_l2"]
+                    ),
+                    "jacobian_validation_max_abs": float(validation_values["max_abs"]),
+                    "jacobian_validation_cosine": float(validation_values["cosine"]),
+                    "jacobian_validation_sim_mujoco_position_error_m": position_disagreement,
+                }
                 print(
                     f"Jacobian finite-difference validation ({control_frame} frame): "
                     f"source_frame={wrist_data.jacobian_source_frame}, "
-                    f"selected={_jacobian_validation_metrics(jacobian_selected, jacobian_fd)}"
+                    f"selected={validation_values}, "
+                    f"sim_mujoco_position_error_m={position_disagreement:.6f}"
                 )
             action, step_metrics = jacobian_controller.compute(
                 action_bfm=action_bfm,
@@ -1384,6 +1410,7 @@ def _run_single_traj_rollout(
         control_dt=float(wrapped_env._env.dt),
         timing_ms=jacobian_timing_ms,
     )
+    jacobian_summary.update(jacobian_validation_summary)
     root_states_arr = np.asarray(_root_state_list)
     ref_root_pos_arr = _interpolate_reference_array(
         expert_qpos[:, :3], control_times_s, float(reference_dt)
@@ -1516,6 +1543,7 @@ def main(
     jacobian_target_offset: int = 0,
     jacobian_profile_timing: bool = False,
     jacobian_validate_frame: bool = False,
+    jacobian_validate_frame_step: int = 0,
 ) -> None:
     """z smoothing options (anti-jump for OOD target trajectories):
 
@@ -1601,6 +1629,8 @@ def main(
 
     if jacobian_target_offset < 0:
         raise ValueError("jacobian_target_offset must be non-negative")
+    if jacobian_validate_frame_step < 0:
+        raise ValueError("jacobian_validate_frame_step must be non-negative")
     if jacobian_frame not in {"root", "heading"}:
         raise ValueError("jacobian_frame must be either 'root' or 'heading'")
     if jacobian_ablation is not None:
@@ -1772,6 +1802,7 @@ def main(
             jacobian_target_offset=jacobian_target_offset,
             jacobian_profile_timing=jacobian_profile_timing,
             jacobian_validate_frame=jacobian_validate_frame,
+            jacobian_validate_frame_step=jacobian_validate_frame_step,
             reference_dt=recording_dt,
             control_frame=jacobian_frame,
         )
