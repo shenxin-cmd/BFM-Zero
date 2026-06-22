@@ -51,6 +51,8 @@ class RightWristControlData:
     target_pos_root: torch.Tensor
     linear_vel_root: torch.Tensor
     jacobian_pos_root: torch.Tensor
+    jacobian_pos_simulator: torch.Tensor
+    jacobian_source_frame: str
     right_arm_q: torch.Tensor
     default_right_arm_q: torch.Tensor
     lower_limits: torch.Tensor
@@ -716,24 +718,30 @@ class HumanoidVerseVectorEnv(VectorEnv):
             self._right_wrist_raw_body_count = max(int(i) for i in simulator.body_ids) + 1
             self._right_arm_raw_dof_count = max(int(i) for i in simulator.dof_ids) + 1
 
-    def _right_wrist_jacobian_world(self, wrist_body_index: int, right_arm_indices: torch.Tensor) -> torch.Tensor:
-        """Slice the cached simulator Jacobian into ``[B, 3, 7]`` world-frame rows.
+    def _right_wrist_jacobian_simulator(
+        self, wrist_body_index: int, right_arm_indices: torch.Tensor
+    ) -> tuple[torch.Tensor, str]:
+        """Slice the cached simulator Jacobian and report its documented frame.
 
         Isaac Gym includes six floating-base columns for a free-base asset;
         PhysX/Isaac Sim exposes articulation-joint columns in its internal joint
         order. Body and joint offsets are inferred from the returned tensor and
-        the simulator's explicit order maps rather than hard-coded.
+        the simulator's explicit order maps rather than hard-coded. PhysX view
+        Jacobians are root-frame quantities (as used by Isaac Lab differential
+        IK); legacy Isaac Gym tensors are world-frame quantities.
         """
 
         simulator = self._env.simulator
         if hasattr(simulator, "jacobian"):
             jacobian = simulator.jacobian
+            source_frame = "world"
             raw_body_index = wrist_body_index
             raw_dof_indices = right_arm_indices
             raw_body_count = simulator.num_bodies
             raw_dof_count = simulator.num_dof
         elif hasattr(simulator, "_robot") and hasattr(simulator._robot, "root_physx_view"):
             jacobian = simulator._robot.root_physx_view.get_jacobians()
+            source_frame = "root"
             raw_body_index = self._right_wrist_raw_body_index
             raw_dof_indices = self._right_arm_raw_dof_indices
             raw_body_count = self._right_wrist_raw_body_count
@@ -770,10 +778,14 @@ class HumanoidVerseVectorEnv(VectorEnv):
                 f"Cannot map Jacobian columns {jacobian.shape[-1]} to articulation DoFs {raw_dof_count}"
             )
         jacobian_dof_indices = jacobian_dof_indices.to(device=jacobian.device, dtype=torch.long)
-        jacobian_pos_world = jacobian[:, jacobian_body_index, 0:3, :].index_select(-1, jacobian_dof_indices)
-        if jacobian_pos_world.shape != (self.num_envs, 3, 7):
-            raise RuntimeError(f"Right-wrist Jacobian slice has shape {tuple(jacobian_pos_world.shape)}, expected [B, 3, 7]")
-        return jacobian_pos_world
+        jacobian_pos_simulator = jacobian[:, jacobian_body_index, 0:3, :].index_select(
+            -1, jacobian_dof_indices
+        )
+        if jacobian_pos_simulator.shape != (self.num_envs, 3, 7):
+            raise RuntimeError(
+                f"Right-wrist Jacobian slice has shape {tuple(jacobian_pos_simulator.shape)}, expected [B, 3, 7]"
+            )
+        return jacobian_pos_simulator, source_frame
 
     def get_right_wrist_control_data(self, target_wrist_pos_root: torch.Tensor) -> RightWristControlData:
         """Collect and frame-align right-wrist control tensors on the simulator device."""
@@ -800,12 +812,17 @@ class HumanoidVerseVectorEnv(VectorEnv):
         )
         linear_vel_root = quat_rotate_inverse(root_quat_world, wrist_relative_vel_world, w_last=True)
 
-        jacobian_pos_world = self._right_wrist_jacobian_world(wrist_body_index, right_arm_indices)
-        root_quat_per_column = root_quat_world[:, None, :].expand(-1, 7, -1).reshape(-1, 4)
-        jacobian_columns_world = jacobian_pos_world.transpose(-1, -2).reshape(-1, 3)
-        jacobian_pos_root = quat_rotate_inverse(
-            root_quat_per_column, jacobian_columns_world, w_last=True
-        ).reshape(self.num_envs, 7, 3).transpose(-1, -2)
+        jacobian_pos_simulator, jacobian_source_frame = self._right_wrist_jacobian_simulator(
+            wrist_body_index, right_arm_indices
+        )
+        if jacobian_source_frame == "world":
+            root_quat_per_column = root_quat_world[:, None, :].expand(-1, 7, -1).reshape(-1, 4)
+            jacobian_columns_world = jacobian_pos_simulator.transpose(-1, -2).reshape(-1, 3)
+            jacobian_pos_root = quat_rotate_inverse(
+                root_quat_per_column, jacobian_columns_world, w_last=True
+            ).reshape(self.num_envs, 7, 3).transpose(-1, -2)
+        else:
+            jacobian_pos_root = jacobian_pos_simulator
 
         target = torch.as_tensor(target_wrist_pos_root, device=self.device, dtype=current_pos_root.dtype)
         if target.shape == (3,):
@@ -818,6 +835,8 @@ class HumanoidVerseVectorEnv(VectorEnv):
             target_pos_root=target,
             linear_vel_root=linear_vel_root,
             jacobian_pos_root=jacobian_pos_root,
+            jacobian_pos_simulator=jacobian_pos_simulator,
+            jacobian_source_frame=jacobian_source_frame,
             right_arm_q=simulator.dof_pos.index_select(-1, right_arm_indices),
             default_right_arm_q=(
                 self._env.default_dof_pos + self._env.default_dof_pos_offset

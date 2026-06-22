@@ -77,6 +77,7 @@ from humanoidverse.tracking_inference_npz import (
     _EE_BODY,
     _fk_ee_positions_base,
     _fk_one_step_base,
+    _quat_wxyz_inv_rotate,
 )
 from humanoidverse.utils.helpers import export_meta_policy_as_onnx
 from humanoidverse.utils.recording_obs_repair import repair_recording_traj
@@ -954,6 +955,43 @@ def _summarize_hand_jacobian_metrics(
     return out
 
 
+def _finite_difference_wrist_jacobian_root(
+    fk_model,
+    fk_data,
+    ee_id: int,
+    root_state: np.ndarray,
+    dof_pos: np.ndarray,
+    right_arm_indices: np.ndarray,
+    epsilon: float = 1e-4,
+) -> np.ndarray:
+    """Numerically differentiate MuJoCo FK to validate simulator Jacobian frames."""
+
+    jacobian = np.zeros((3, len(right_arm_indices)), dtype=np.float64)
+    for column, dof_index in enumerate(right_arm_indices):
+        q_plus = dof_pos.copy()
+        q_minus = dof_pos.copy()
+        q_plus[dof_index] += epsilon
+        q_minus[dof_index] -= epsilon
+        pos_plus = _fk_one_step_base(fk_model, fk_data, ee_id, root_state, q_plus)
+        pos_minus = _fk_one_step_base(fk_model, fk_data, ee_id, root_state, q_minus)
+        jacobian[:, column] = (pos_plus - pos_minus) / (2.0 * epsilon)
+    return jacobian
+
+
+def _jacobian_validation_metrics(candidate: np.ndarray, reference: np.ndarray) -> dict[str, float]:
+    diff = candidate - reference
+    denom = np.linalg.norm(reference) + 1e-12
+    cosine = float(
+        np.sum(candidate * reference)
+        / ((np.linalg.norm(candidate) + 1e-12) * (np.linalg.norm(reference) + 1e-12))
+    )
+    return {
+        "relative_l2": float(np.linalg.norm(diff) / denom),
+        "max_abs": float(np.max(np.abs(diff))),
+        "cosine": cosine,
+    }
+
+
 def _run_single_traj_rollout(
     *,
     traj_np: dict[str, np.ndarray],
@@ -978,6 +1016,8 @@ def _run_single_traj_rollout(
     jacobian_controller: HandJacobianController | None = None,
     jacobian_target_offset: int = 0,
     jacobian_profile_timing: bool = False,
+    jacobian_validate_frame: bool = False,
+    reference_dt: float = 1.0 / 30.0,
 ) -> dict:
     """Reset env to traj init, rollout tracking, save metrics for one trajectory."""
     expert_qpos, ref_root, dof_init_state = _build_expert_qpos(
@@ -1006,6 +1046,17 @@ def _run_single_traj_rollout(
     if episode_len is not None:
         n_steps = min(n_steps, episode_len)
     print(f"Rollout [{clip_id}]: {n_steps} steps (z={Tz}, traj_T={traj_T})")
+    control_dt = float(wrapped_env._env.dt)
+    reference_duration = n_steps * float(reference_dt)
+    rollout_duration = n_steps * control_dt
+    if abs(reference_dt - control_dt) > 1e-8:
+        print(
+            "WARNING: reference/control timebase mismatch: "
+            f"reference_dt={reference_dt:.6f}s ({reference_duration:.3f}s for {n_steps} frames), "
+            f"control_dt={control_dt:.6f}s ({rollout_duration:.3f}s for {n_steps} steps). "
+            "The current one-reference-frame-per-control-step rollout plays the target at "
+            f"{reference_dt / control_dt:.3f}x speed."
+        )
 
     joint_pos = [wrapped_env._env.simulator.dof_state[..., 0].clone().cpu().numpy()]
     _z_actual_list: list[np.ndarray] = []
@@ -1034,16 +1085,24 @@ def _run_single_traj_rollout(
         frames = [rgb_renderer.render(wrapped_env._env, 0)[0]]
 
     target_count = min(n_steps + max(0, jacobian_target_offset), expert_qpos.shape[0] - 1)
-    expert_ee_base_all = _fk_ee_positions_base(
+    expert_ee_target_all = _fk_ee_positions_base(
         fk_model,
         fk_data,
         ee_id,
         expert_qpos[1 : 1 + target_count, :7],
         expert_qpos[1 : 1 + target_count, 7:].astype(np.float64),
     )
-    expert_ee_base = expert_ee_base_all[:n_steps]
+    # Plot/evaluation uses current-reference frame i against current policy frame i.
+    # The controller separately targets frame i+1 to match z computed from obs[1:].
+    expert_ee_base = _fk_ee_positions_base(
+        fk_model,
+        fk_data,
+        ee_id,
+        expert_qpos[:n_steps, :7],
+        expert_qpos[:n_steps, 7:].astype(np.float64),
+    )
     expert_ee_targets_root = torch.as_tensor(
-        expert_ee_base_all, device=sim_dev, dtype=torch.float32
+        expert_ee_target_all, device=sim_dev, dtype=torch.float32
     )
 
     for i in range(n_steps):
@@ -1087,9 +1146,35 @@ def _run_single_traj_rollout(
                 start_event = torch.cuda.Event(enable_timing=True)
                 end_event = torch.cuda.Event(enable_timing=True)
                 start_event.record()
-            target_idx = min(i + max(0, jacobian_target_offset), len(expert_ee_base_all) - 1)
+            target_idx = min(i + max(0, jacobian_target_offset), len(expert_ee_target_all) - 1)
             target_wrist_pos_root = expert_ee_targets_root[target_idx].expand(num_envs, -1)
             wrist_data = wrapped_env.get_right_wrist_control_data(target_wrist_pos_root)
+            if jacobian_validate_frame and i == 0:
+                jacobian_fd = _finite_difference_wrist_jacobian_root(
+                    fk_model,
+                    fk_data,
+                    ee_id,
+                    _rs,
+                    _d,
+                    np.arange(22, 29, dtype=np.int64),
+                )
+                jacobian_selected = wrist_data.jacobian_pos_root[0].detach().float().cpu().numpy()
+                jacobian_raw = wrist_data.jacobian_pos_simulator[0].detach().float().cpu().numpy()
+                root_quat_wxyz = _rs[[6, 3, 4, 5]]
+                jacobian_raw_rotated = np.stack(
+                    [
+                        _quat_wxyz_inv_rotate(root_quat_wxyz, jacobian_raw[:, column])
+                        for column in range(jacobian_raw.shape[1])
+                    ],
+                    axis=1,
+                )
+                print(
+                    "Jacobian finite-difference validation (root frame): "
+                    f"source_frame={wrist_data.jacobian_source_frame}, "
+                    f"selected={_jacobian_validation_metrics(jacobian_selected, jacobian_fd)}, "
+                    f"raw_as_root={_jacobian_validation_metrics(jacobian_raw, jacobian_fd)}, "
+                    f"raw_world_to_root={_jacobian_validation_metrics(jacobian_raw_rotated, jacobian_fd)}"
+                )
             action, step_metrics = jacobian_controller.compute(
                 action_bfm=action_bfm,
                 current_wrist_pos_root=wrist_data.current_pos_root,
@@ -1250,6 +1335,7 @@ def main(
     jacobian_nullspace_gain: float = 0.1,
     jacobian_target_offset: int = 0,
     jacobian_profile_timing: bool = False,
+    jacobian_validate_frame: bool = False,
 ) -> None:
     """z smoothing options (anti-jump for OOD target trajectories):
 
@@ -1497,6 +1583,8 @@ def main(
             jacobian_controller=jacobian_controller,
             jacobian_target_offset=jacobian_target_offset,
             jacobian_profile_timing=jacobian_profile_timing,
+            jacobian_validate_frame=jacobian_validate_frame,
+            reference_dt=recording_dt,
         )
         per_clip_metrics.append(metrics)
 
