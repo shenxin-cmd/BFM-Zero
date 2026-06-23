@@ -1072,15 +1072,29 @@ def _finite_difference_wrist_jacobian_control(
 
 def _jacobian_validation_metrics(candidate: np.ndarray, reference: np.ndarray) -> dict[str, float]:
     diff = candidate - reference
-    denom = np.linalg.norm(reference) + 1e-12
+    candidate_norm = np.linalg.norm(candidate)
+    reference_norm = np.linalg.norm(reference)
+    denom = reference_norm + 1e-12
+    dot = float(np.sum(candidate * reference))
     cosine = float(
-        np.sum(candidate * reference)
-        / ((np.linalg.norm(candidate) + 1e-12) * (np.linalg.norm(reference) + 1e-12))
+        dot / ((candidate_norm + 1e-12) * (reference_norm + 1e-12))
+    )
+    # Scalar multiplying the simulator Jacobian that best matches the
+    # finite-difference reference in least squares. This separates a mostly
+    # harmless global scale mismatch from a frame/direction error.
+    optimal_candidate_scale = dot / (float(candidate_norm**2) + 1e-12)
+    scaled_relative_l2 = float(
+        np.linalg.norm(optimal_candidate_scale * candidate - reference) / denom
     )
     return {
         "relative_l2": float(np.linalg.norm(diff) / denom),
         "max_abs": float(np.max(np.abs(diff))),
         "cosine": cosine,
+        "candidate_norm": float(candidate_norm),
+        "reference_norm": float(reference_norm),
+        "candidate_to_reference_norm_ratio": float(candidate_norm / denom),
+        "optimal_candidate_scale": float(optimal_candidate_scale),
+        "scaled_relative_l2": scaled_relative_l2,
     }
 
 
@@ -1349,13 +1363,14 @@ def _run_single_traj_rollout(
                 jacobian_validation_summary = {
                     "jacobian_validation_frame": control_frame,
                     "jacobian_validation_step": int(i),
-                    "jacobian_validation_relative_l2": float(
-                        validation_values["relative_l2"]
-                    ),
-                    "jacobian_validation_max_abs": float(validation_values["max_abs"]),
-                    "jacobian_validation_cosine": float(validation_values["cosine"]),
                     "jacobian_validation_sim_mujoco_position_error_m": position_disagreement,
                 }
+                jacobian_validation_summary.update(
+                    {
+                        f"jacobian_validation_{key}": float(value)
+                        for key, value in validation_values.items()
+                    }
+                )
                 print(
                     f"Jacobian finite-difference validation ({control_frame} frame): "
                     f"source_frame={wrist_data.jacobian_source_frame}, "
