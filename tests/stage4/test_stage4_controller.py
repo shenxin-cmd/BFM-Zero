@@ -1,6 +1,11 @@
 import torch
 
-from humanoidverse.agents.stage4 import DLSHandController, HandTaskCommand, resolve_right_arm_joint_indices
+from humanoidverse.agents.stage4 import (
+    DLSHandController,
+    HandTaskCommand,
+    body_action_indices_for_stage4,
+    resolve_right_arm_joint_indices,
+)
 
 G1_29DOF_NAMES = (
     "left_hip_pitch_joint",
@@ -79,3 +84,26 @@ def test_dls_hand_controller_outputs_full_action_with_locked_wrist():
     assert torch.all(out.full_action[:, list(indices.wrist_action_indices)] == 0.0)
     assert out.active_joint_delta.shape == (1, 4)
     assert out.active_joint_delta[0, 0] > 0.0
+
+
+def test_body_action_indices_for_stage4_excludes_active_hand_and_locked_wrist():
+    indices = resolve_right_arm_joint_indices(
+        dof_names=G1_29DOF_NAMES,
+        active_joint_names=(
+            "right_shoulder_pitch_joint",
+            "right_shoulder_roll_joint",
+            "right_shoulder_yaw_joint",
+            "right_elbow_joint",
+        ),
+        wrist_joint_names=(
+            "right_wrist_roll_joint",
+            "right_wrist_pitch_joint",
+            "right_wrist_yaw_joint",
+        ),
+    )
+
+    body_indices = body_action_indices_for_stage4(action_dim=29, indices=indices)
+
+    assert len(body_indices) == 22
+    assert not set(body_indices) & set(indices.controlled_action_indices)
+    assert set(body_indices) | set(indices.controlled_action_indices) == set(range(29))

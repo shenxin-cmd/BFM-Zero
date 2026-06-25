@@ -19,7 +19,9 @@ from .controller import (
     DLSHandControllerOutput,
     HandTaskCommand,
     active_target_to_action,
+    body_action_indices_for_stage4,
     coordination_gate_raw,
+    dls_hand_action_from_snapshot,
 )
 from .env_adapter import Stage4EnvSnapshot, build_stage4_env_snapshot
 from .kinematics import (
@@ -49,10 +51,12 @@ __all__ = [
     "assemble_full_action",
     "apply_joint_limit_scaling",
     "active_target_to_action",
+    "body_action_indices_for_stage4",
     "build_stage4_env_snapshot",
     "clamp_wrist_pd_target",
     "coordination_gate_raw",
     "damped_least_squares",
+    "dls_hand_action_from_snapshot",
     "finite_difference_position_jacobian",
     "get_isaacsim_root_physx_jacobians",
     "heading_to_world_frame",

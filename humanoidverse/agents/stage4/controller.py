@@ -7,6 +7,7 @@ import torch
 
 from .actions import RightArmJointIndices, assemble_full_action
 from .control import adaptive_damping, apply_joint_limit_scaling, damped_least_squares, joint_margin_scale
+from .env_adapter import Stage4EnvSnapshot
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,14 @@ class DLSHandControllerOutput:
     damping: torch.Tensor
     sigma_min: torch.Tensor
     joint_margin: torch.Tensor
+
+
+def body_action_indices_for_stage4(*, action_dim: int, indices: RightArmJointIndices) -> tuple[int, ...]:
+    controlled = set(indices.controlled_action_indices)
+    body_indices = tuple(idx for idx in range(action_dim) if idx not in controlled)
+    if len(body_indices) + len(controlled) != action_dim:
+        raise ValueError("Stage 4 body/action indices do not cover action_dim exactly once")
+    return body_indices
 
 
 def active_target_to_action(
@@ -191,3 +200,43 @@ class CoordinationGate:
         filtered = self.ema_alpha * self.previous_gate + (1.0 - self.ema_alpha) * raw_gate
         self.previous_gate = filtered.clamp(0.0, 1.0)
         return self.previous_gate
+
+
+def dls_hand_action_from_snapshot(
+    *,
+    body_action: torch.Tensor,
+    snapshot: Stage4EnvSnapshot,
+    command: HandTaskCommand,
+    action_dim: int,
+    dls_gain: float = 1.0,
+    max_joint_delta: float = 0.05,
+    damping_min: float = 0.02,
+    damping_max: float = 0.20,
+    singular_value_threshold: float = 0.08,
+    joint_limit_margin: float = 0.15,
+) -> DLSHandControllerOutput:
+    """Assemble a full env action from body policy output plus Stage 4 DLS hand control."""
+
+    body_indices = body_action_indices_for_stage4(action_dim=action_dim, indices=snapshot.indices)
+    controller = DLSHandController(
+        indices=snapshot.indices,
+        action_dim=action_dim,
+        body_indices=body_indices,
+        dls_gain=dls_gain,
+        max_joint_delta=max_joint_delta,
+        damping_min=damping_min,
+        damping_max=damping_max,
+        singular_value_threshold=singular_value_threshold,
+        joint_limit_margin=joint_limit_margin,
+    )
+    return controller.step(
+        body_action=body_action,
+        active_q=snapshot.active_q,
+        wrist_pos_root=snapshot.end_effector_pos_heading,
+        command=command,
+        active_position_jacobian=snapshot.active_position_jacobian_heading,
+        active_lower=snapshot.active_lower,
+        active_upper=snapshot.active_upper,
+        default_active_joint_pos=snapshot.default_active_joint_pos,
+        action_scale=snapshot.action_scale,
+    )

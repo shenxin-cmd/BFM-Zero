@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import torch
 
-from humanoidverse.agents.stage4 import build_stage4_env_snapshot
+from humanoidverse.agents.stage4 import HandTaskCommand, build_stage4_env_snapshot, dls_hand_action_from_snapshot
 
 
 class _DummyRootPhysxView:
@@ -74,3 +74,34 @@ def test_build_stage4_env_snapshot_reads_env_tensors_and_heading_jacobian():
     assert torch.allclose(snapshot.active_position_jacobian_heading, snapshot.active_position_jacobian_world)
     assert snapshot.default_active_joint_pos.shape == (1, 4)
     assert snapshot.action_scale == 0.25
+
+
+def test_dls_hand_action_from_snapshot_preserves_body_action_and_locks_wrist():
+    env = _make_dummy_env()
+    snapshot = build_stage4_env_snapshot(env)
+    body_action = torch.randn(2, 22, requires_grad=True)
+    command = HandTaskCommand(
+        target_pos_root=snapshot.end_effector_pos_heading + torch.tensor([[0.01, 0.0, 0.0], [0.02, 0.0, 0.0]]),
+        target_lin_vel_root=torch.zeros(2, 3),
+        position_mask=torch.ones(2, 1),
+        velocity_mask=torch.zeros(2, 1),
+        command_id=torch.zeros(2, dtype=torch.long),
+        command_done=torch.zeros(2, 1, dtype=torch.bool),
+    )
+
+    out = dls_hand_action_from_snapshot(
+        body_action=body_action,
+        snapshot=snapshot,
+        command=command,
+        action_dim=29,
+        max_joint_delta=0.03,
+    )
+
+    body_indices = [idx for idx in range(29) if idx not in snapshot.indices.controlled_action_indices]
+    assert out.full_action.shape == (2, 29)
+    assert torch.allclose(out.full_action[:, body_indices], body_action)
+    assert torch.all(out.full_action[:, list(snapshot.indices.wrist_action_indices)] == 0.0)
+    assert out.active_hand_action.shape == (2, 4)
+    out.full_action[:, body_indices].sum().backward()
+    assert body_action.grad is not None
+    assert torch.all(body_action.grad == 1.0)
