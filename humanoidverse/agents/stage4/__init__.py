@@ -23,7 +23,10 @@ from .controller import (
 )
 from .kinematics import (
     finite_difference_position_jacobian,
+    get_isaacsim_root_physx_jacobians,
     heading_to_world_frame,
+    resolve_body_index,
+    select_isaacsim_active_position_jacobian,
     select_active_position_jacobian,
     world_to_heading_frame,
 )
@@ -45,9 +48,12 @@ __all__ = [
     "coordination_gate_raw",
     "damped_least_squares",
     "finite_difference_position_jacobian",
+    "get_isaacsim_root_physx_jacobians",
     "heading_to_world_frame",
     "joint_margin_scale",
+    "resolve_body_index",
     "resolve_right_arm_joint_indices",
+    "select_isaacsim_active_position_jacobian",
     "select_active_position_jacobian",
     "world_to_heading_frame",
     "zero_wrist_actions",

@@ -29,6 +29,7 @@ class Stage4Config(BaseConfig):
         "right_wrist_pitch_joint",
         "right_wrist_yaw_joint",
     )
+    end_effector_body_name: str = "right_wrist_yaw_link"
 
     wrist_absolute_target: float = 0.0
     enforce_wrist_zero_before_env_step: bool = True

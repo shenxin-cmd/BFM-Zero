@@ -76,6 +76,69 @@ def select_active_position_jacobian(
     return selected
 
 
+def resolve_body_index(body_names: Sequence[str], body_name: str) -> int:
+    try:
+        return tuple(body_names).index(body_name)
+    except ValueError as exc:
+        raise ValueError(f"Body name {body_name!r} was not found in body_names") from exc
+
+
+def select_isaacsim_active_position_jacobian(
+    jacobians: torch.Tensor,
+    *,
+    body_index: int,
+    active_dof_indices: Sequence[int] | torch.Tensor,
+    num_dofs: int,
+    floating_base_dof: int = 6,
+    linear_rows: tuple[int, int, int] = (0, 1, 2),
+) -> torch.Tensor:
+    """Select the Stage 4 3x4 Jacobian from IsaacSim/PhysX articulation Jacobians.
+
+    PhysX may expose Jacobian columns as either `num_dofs` actuated columns or
+    `floating_base_dof + num_dofs` columns. The latter convention reserves the
+    first six columns for the floating base, so active DOF columns are offset by
+    six before slicing.
+    """
+
+    if jacobians.ndim < 4 or jacobians.shape[-2] != 6:
+        raise ValueError(f"Expected jacobians shape [..., num_bodies, 6, columns], got {jacobians.shape}")
+    if not 0 <= body_index < jacobians.shape[-3]:
+        raise ValueError(f"body_index={body_index} is outside jacobians body dimension {jacobians.shape[-3]}")
+
+    columns = jacobians.shape[-1]
+    if columns == num_dofs:
+        dof_offset = 0
+    elif columns == num_dofs + floating_base_dof:
+        dof_offset = floating_base_dof
+    else:
+        raise ValueError(
+            f"Unexpected IsaacSim Jacobian column count {columns}; expected {num_dofs} or {num_dofs + floating_base_dof}"
+        )
+
+    if isinstance(active_dof_indices, torch.Tensor):
+        active_idx = active_dof_indices.to(device=jacobians.device, dtype=torch.long)
+    else:
+        active_idx = torch.tensor(tuple(active_dof_indices), device=jacobians.device, dtype=torch.long)
+    if active_idx.numel() != 4:
+        raise ValueError(f"Expected exactly 4 active DOF indices, got {active_idx.numel()}")
+
+    row_idx = torch.tensor(linear_rows, device=jacobians.device, dtype=torch.long)
+    position_jacobian = jacobians[..., body_index, :, :].index_select(-2, row_idx)
+    return select_active_position_jacobian(position_jacobian, active_idx + dof_offset)
+
+
+def get_isaacsim_root_physx_jacobians(simulator) -> torch.Tensor:
+    robot = getattr(simulator, "_robot", None)
+    root_physx_view = getattr(robot, "root_physx_view", None) if robot is not None else None
+    get_jacobians = getattr(root_physx_view, "get_jacobians", None)
+    if get_jacobians is None:
+        raise AttributeError("IsaacSim simulator does not expose root_physx_view.get_jacobians()")
+    jacobians = get_jacobians()
+    if not isinstance(jacobians, torch.Tensor):
+        jacobians = torch.as_tensor(jacobians)
+    return jacobians
+
+
 def finite_difference_position_jacobian(
     fk_fn: Callable[[torch.Tensor], torch.Tensor],
     q: torch.Tensor,
