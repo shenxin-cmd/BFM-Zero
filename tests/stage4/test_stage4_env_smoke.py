@@ -9,6 +9,10 @@ def _stage4_env_smoke_enabled() -> bool:
     return os.environ.get("RUN_STAGE4_ISAAC_SMOKE", "0") == "1"
 
 
+def _stage4_isaac_fd_enabled() -> bool:
+    return os.environ.get("RUN_STAGE4_ISAAC_FD_JACOBIAN", "0") == "1"
+
+
 @pytest.mark.skipif(not _stage4_env_smoke_enabled(), reason="Set RUN_STAGE4_ISAAC_SMOKE=1 to run IsaacSim smoke")
 def test_stage4_isaac_env_wrist_lock_smoke():
     from humanoidverse.agents.envs.humanoidverse_isaac import HumanoidVerseIsaacConfig
@@ -76,6 +80,116 @@ def test_stage4_isaac_env_wrist_lock_smoke():
 
         wrist_abs_max = base_env.simulator.dof_pos[:, wrist_indices].abs().max().item()
         assert wrist_abs_max < wrist_abs_limit, f"wrist_abs_max={wrist_abs_max:.4f} exceeds {wrist_abs_limit}"
+    finally:
+        if env is not None:
+            env.close()
+
+
+@pytest.mark.skipif(
+    not (_stage4_env_smoke_enabled() and _stage4_isaac_fd_enabled()),
+    reason="Set RUN_STAGE4_ISAAC_SMOKE=1 and RUN_STAGE4_ISAAC_FD_JACOBIAN=1 to run real IsaacSim Jacobian finite differences",
+)
+def test_stage4_isaacsim_multi_pose_active_arm_jacobian_finite_difference():
+    from humanoidverse.agents.envs.humanoidverse_isaac import HumanoidVerseIsaacConfig
+    from humanoidverse.agents.stage4 import (
+        Stage4Config,
+        get_isaacsim_root_physx_jacobians,
+        resolve_body_index,
+        resolve_right_arm_joint_indices,
+        select_isaacsim_active_position_jacobian,
+    )
+
+    num_envs = 1
+    eps = float(os.environ.get("STAGE4_FD_EPS", "0.001"))
+    atol = float(os.environ.get("STAGE4_FD_ATOL", "0.08"))
+    lafan_tail_path = os.environ.get("STAGE4_SMOKE_MOTION_FILE", "humanoidverse/data/lafan_29dof_10s-clipped.pkl")
+
+    cfg = HumanoidVerseIsaacConfig(
+        name="humanoidverse_isaac",
+        device=os.environ.get("STAGE4_SMOKE_DEVICE", "cuda:0"),
+        lafan_tail_path=lafan_tail_path,
+        enable_cameras=False,
+        max_episode_length_s=2.0,
+        disable_obs_noise=True,
+        disable_domain_randomization=True,
+        relative_config_path="exp/bfm_zero/bfm_zero",
+        include_last_action=True,
+        include_history_actor=True,
+        root_height_obs=True,
+        hydra_overrides=[
+            "robot=g1/g1_29dof_hard_waist",
+            "robot.control.action_scale=0.25",
+            "robot.control.action_clip_value=5.0",
+            "robot.control.normalize_action_to=5.0",
+            "env.config.lie_down_init=False",
+            "env.config.lie_down_init_prob=0.0",
+        ],
+    )
+
+    env = None
+    try:
+        env, _ = cfg.build(num_envs=num_envs)
+        base_env = env.unwrapped
+        stage4_cfg = Stage4Config()
+        base_env.config.stage4 = {
+            "hand_control_mode": "task_space_4dof",
+            "end_effector_body_name": "right_wrist_yaw_link",
+            "enforce_wrist_zero_before_env_step": True,
+            "enforce_wrist_zero_after_pd_target_build": True,
+            "wrist_absolute_target": 0.0,
+        }
+        env.reset()
+
+        indices = resolve_right_arm_joint_indices(base_env.simulator.dof_names, stage4_cfg)
+        active_idx = torch.tensor(indices.active_dof_indices, device=base_env.device, dtype=torch.long)
+        wrist_idx = torch.tensor(indices.locked_wrist_dof_indices, device=base_env.device, dtype=torch.long)
+        body_index = resolve_body_index(base_env.simulator.body_names, stage4_cfg.end_effector_body_name)
+        env_ids = torch.arange(num_envs, device=base_env.device)
+
+        def sync_pose(active_q: torch.Tensor) -> torch.Tensor:
+            dof_state = base_env.simulator.dof_state.clone()
+            dof_state[:, :, 1] = 0.0
+            dof_state[:, active_idx, 0] = active_q.to(device=base_env.device, dtype=dof_state.dtype)
+            dof_state[:, wrist_idx, 0] = 0.0
+            dof_state[:, wrist_idx, 1] = 0.0
+            base_env.simulator.set_dof_state_tensor(env_ids, dof_state)
+            base_env.simulator.scene.update(dt=0.0)
+            return base_env.simulator._rigid_body_pos[:, body_index].clone()
+
+        default_active = base_env.default_dof_pos[:, active_idx].clone().to(base_env.device)
+        pose_specs = {
+            "default": default_active,
+            "elbow_bent": default_active + torch.tensor([[0.0, 0.0, 0.0, 0.45]], device=base_env.device),
+            "shoulder_forward": default_active + torch.tensor([[0.35, 0.0, 0.0, 0.20]], device=base_env.device),
+            "random_safe": default_active + torch.tensor([[0.18, -0.16, 0.14, 0.32]], device=base_env.device),
+        }
+
+        for pose_name, active_q in pose_specs.items():
+            sync_pose(active_q)
+            jacobians = get_isaacsim_root_physx_jacobians(base_env.simulator)
+            physx_jac = select_isaacsim_active_position_jacobian(
+                jacobians,
+                body_index=body_index,
+                active_dof_indices=indices.active_dof_indices,
+                num_dofs=base_env.num_dof,
+            )
+
+            fd_columns = []
+            for col in range(active_idx.numel()):
+                delta = torch.zeros_like(active_q)
+                delta[:, col] = eps
+                pos_plus = sync_pose(active_q + delta)
+                pos_minus = sync_pose(active_q - delta)
+                fd_columns.append(((pos_plus - pos_minus) / (2.0 * eps)).unsqueeze(-1))
+            fd_jac = torch.cat(fd_columns, dim=-1)
+            sync_pose(active_q)
+
+            max_abs_err = (physx_jac - fd_jac).abs().max().item()
+            sigma_min = torch.linalg.svdvals(physx_jac).amin().item()
+            print(f"{pose_name}: fd_max_abs_err={max_abs_err:.6f}, sigma_min={sigma_min:.6e}")
+            assert torch.isfinite(physx_jac).all()
+            assert torch.isfinite(fd_jac).all()
+            assert max_abs_err < atol, f"{pose_name} fd_max_abs_err={max_abs_err:.6f} >= {atol}"
     finally:
         if env is not None:
             env.close()
