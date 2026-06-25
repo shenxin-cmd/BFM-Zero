@@ -753,6 +753,23 @@ class LeggedRobotBase(BaseTask):
             wrist_absolute_target=wrist_absolute_target,
         )
 
+    def _stage4_zero_wrist_default_offsets(self, env_ids):
+        if not self._stage4_task_space_enabled():
+            return
+        env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+        indices = self._stage4_get_right_arm_indices()
+        wrist_idx = torch.tensor(indices.wrist_dof_indices, device=self.device, dtype=torch.long)
+        self.default_dof_pos_offset[env_ids.unsqueeze(-1), wrist_idx] = 0.0
+
+    def _stage4_zero_wrist_reset_state(self, env_ids):
+        if not self._stage4_task_space_enabled():
+            return
+        env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+        indices = self._stage4_get_right_arm_indices()
+        wrist_idx = torch.tensor(indices.wrist_dof_indices, device=self.device, dtype=torch.long)
+        self.target_robot_dof_state[env_ids.unsqueeze(-1), wrist_idx, 0] = 0.0
+        self.target_robot_dof_state[env_ids.unsqueeze(-1), wrist_idx, 1] = 0.0
+
     def _create_terrain(self):
         super()._create_terrain()
 
@@ -974,6 +991,7 @@ class LeggedRobotBase(BaseTask):
 
         if self.config.domain_rand.randomize_default_dof_pos:
             self.default_dof_pos_offset[env_ids] = torch_rand_float(self.config.domain_rand.default_dof_pos_noise_range[0], self.config.domain_rand.default_dof_pos_noise_range[1], (len(env_ids), self.num_dof), device=self.device)
+            self._stage4_zero_wrist_default_offsets(env_ids)
 
     def _push_robots(self, env_ids = None):
         """ Random pushes the robots. Emulates an impulse by setting a randomized base velocity. 
@@ -1040,6 +1058,7 @@ class LeggedRobotBase(BaseTask):
         else:
             self.target_robot_dof_state[env_ids, :, 0] = (self.default_dof_pos + self.default_dof_pos_offset[env_ids]) * torch_rand_float(0.5, 1.5, (len(env_ids), self.num_dof), device=str(self.device))
             self.target_robot_dof_state[env_ids, :, 1] = 0.
+        self._stage4_zero_wrist_reset_state(env_ids)
 
 
     def _reset_root_states(self, env_ids, target_root_states=None):
