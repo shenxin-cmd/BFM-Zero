@@ -27,6 +27,10 @@ def _make_dummy_env():
     body_names = [*(f"body_{i}" for i in range(29)), "right_wrist_yaw_link"]
     num_envs = 2
     dof_pos = torch.arange(num_envs * 29, dtype=torch.float32).reshape(num_envs, 29) * 0.01
+    default_dof_pos = torch.zeros(1, 29)
+    default_dof_pos_offset = torch.zeros(num_envs, 29)
+    default_dof_pos[:, [22, 23, 24, 25]] = torch.tensor([[0.10, -0.20, 0.05, 0.30]])
+    default_dof_pos_offset[:, [22, 23, 24, 25]] = torch.tensor([[0.01, 0.02, -0.03, 0.04], [-0.02, 0.03, 0.01, -0.01]])
     root_states = torch.zeros(num_envs, 13)
     root_states[:, 3:7] = torch.tensor([0.0, 0.0, 0.0, 1.0])
     rigid_body_pos = torch.zeros(num_envs, 30, 3)
@@ -55,7 +59,8 @@ def _make_dummy_env():
         dof_names=dof_names,
         body_names=body_names,
         dof_pos_limits=torch.stack([torch.full((29,), -1.0), torch.full((29,), 1.0)], dim=-1),
-        default_dof_pos=torch.zeros(1, 29),
+        default_dof_pos=default_dof_pos,
+        default_dof_pos_offset=default_dof_pos_offset,
     )
 
 
@@ -74,7 +79,11 @@ def test_build_stage4_env_snapshot_reads_env_tensors_and_heading_jacobian():
     assert snapshot.active_position_jacobian_world.shape == (2, 3, 4)
     assert snapshot.active_position_jacobian_heading.shape == (2, 3, 4)
     assert torch.allclose(snapshot.active_position_jacobian_heading, snapshot.active_position_jacobian_world)
-    assert snapshot.default_active_joint_pos.shape == (1, 4)
+    assert snapshot.active_pd_reference_pos.shape == (2, 4)
+    assert torch.allclose(
+        snapshot.active_pd_reference_pos,
+        torch.tensor([[0.11, -0.18, 0.02, 0.34], [0.08, -0.17, 0.06, 0.29]]),
+    )
     assert snapshot.action_scale == 0.25
 
 
@@ -104,6 +113,8 @@ def test_dls_hand_action_from_snapshot_preserves_body_action_and_locks_wrist():
     assert torch.allclose(out.full_action[:, body_indices], body_action)
     assert torch.all(out.full_action[:, list(snapshot.indices.wrist_action_indices)] == 0.0)
     assert out.active_hand_action.shape == (2, 4)
+    reconstructed_active_pd_target = out.active_hand_action * snapshot.action_scale + snapshot.active_pd_reference_pos
+    assert torch.allclose(reconstructed_active_pd_target, out.active_joint_target)
     out.full_action[:, body_indices].sum().backward()
     assert body_action.grad is not None
     assert torch.all(body_action.grad == 1.0)

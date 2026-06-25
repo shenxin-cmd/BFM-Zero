@@ -3,6 +3,7 @@ import torch
 from humanoidverse.agents.stage4 import (
     DLSHandController,
     HandTaskCommand,
+    active_target_to_action,
     body_action_indices_for_stage4,
     resolve_right_arm_joint_indices,
 )
@@ -76,7 +77,7 @@ def test_dls_hand_controller_outputs_full_action_with_locked_wrist():
         active_position_jacobian=jac,
         active_lower=torch.full((1, 4), -1.0),
         active_upper=torch.full((1, 4), 1.0),
-        default_active_joint_pos=torch.zeros(1, 4),
+        active_pd_reference_pos=torch.zeros(1, 4),
         action_scale=1.0,
     )
 
@@ -107,3 +108,22 @@ def test_body_action_indices_for_stage4_excludes_active_hand_and_locked_wrist():
     assert len(body_indices) == 22
     assert not set(body_indices) & set(indices.controlled_action_indices)
     assert set(body_indices) | set(indices.controlled_action_indices) == set(range(29))
+
+
+def test_active_target_to_action_round_trips_env_pd_semantics_with_offset():
+    q_current = torch.tensor([[0.2, -0.1, 0.05, 0.4], [0.0, 0.3, -0.2, 0.1]])
+    dq = torch.tensor([[0.03, -0.02, 0.01, 0.0], [-0.01, 0.02, 0.0, 0.03]])
+    q_cmd = q_current + dq
+    default_dof_pos = torch.tensor([[0.1, -0.2, 0.0, 0.25]])
+    default_dof_pos_offset = torch.tensor([[0.02, 0.03, -0.01, 0.04], [-0.03, 0.01, 0.02, -0.02]])
+    action_scale = 0.25
+    active_pd_reference_pos = default_dof_pos + default_dof_pos_offset
+
+    action = active_target_to_action(
+        q_cmd,
+        active_pd_reference_pos=active_pd_reference_pos,
+        action_scale=action_scale,
+    )
+    reconstructed_pd_target = action * action_scale + default_dof_pos + default_dof_pos_offset
+
+    assert torch.allclose(reconstructed_pd_target, q_cmd)

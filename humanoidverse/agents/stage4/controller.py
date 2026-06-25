@@ -43,12 +43,20 @@ def body_action_indices_for_stage4(*, action_dim: int, indices: RightArmJointInd
 def active_target_to_action(
     active_joint_target: torch.Tensor,
     *,
-    default_active_joint_pos: torch.Tensor,
+    active_pd_reference_pos: torch.Tensor,
     action_scale: float,
 ) -> torch.Tensor:
+    """Convert absolute active joint targets to env action offsets.
+
+    Env PD semantics are:
+    `joint_target = action * action_scale + default_dof_pos + default_dof_pos_offset`.
+    Therefore Stage 4 must subtract the full active PD reference, not only the
+    static default pose.
+    """
+
     if action_scale == 0:
         raise ValueError("action_scale must be non-zero")
-    return (active_joint_target - default_active_joint_pos) / action_scale
+    return (active_joint_target - active_pd_reference_pos) / action_scale
 
 
 class DLSHandController:
@@ -56,7 +64,8 @@ class DLSHandController:
 
     This wrapper is intentionally explicit about PD action semantics: DLS produces
     active joint targets, then `active_target_to_action` converts those absolute
-    targets to current env action offsets via `(target - default) / action_scale`.
+    targets to current env action offsets via
+    `(target - default_dof_pos - default_dof_pos_offset) / action_scale`.
     """
 
     def __init__(
@@ -92,7 +101,7 @@ class DLSHandController:
         active_position_jacobian: torch.Tensor,
         active_lower: torch.Tensor,
         active_upper: torch.Tensor,
-        default_active_joint_pos: torch.Tensor,
+        active_pd_reference_pos: torch.Tensor,
         action_scale: float,
     ) -> DLSHandControllerOutput:
         position_error = (command.target_pos_root - wrist_pos_root) * command.position_mask
@@ -119,7 +128,7 @@ class DLSHandController:
         active_target = active_q + dq
         active_action = active_target_to_action(
             active_target,
-            default_active_joint_pos=default_active_joint_pos,
+            active_pd_reference_pos=active_pd_reference_pos,
             action_scale=action_scale,
         )
         full_action = assemble_full_action(
@@ -237,6 +246,6 @@ def dls_hand_action_from_snapshot(
         active_position_jacobian=snapshot.active_position_jacobian_heading,
         active_lower=snapshot.active_lower,
         active_upper=snapshot.active_upper,
-        default_active_joint_pos=snapshot.default_active_joint_pos,
+        active_pd_reference_pos=snapshot.active_pd_reference_pos,
         action_scale=snapshot.action_scale,
     )
