@@ -95,6 +95,8 @@ def test_stage4_isaacsim_multi_pose_active_arm_jacobian_finite_difference():
         Stage4Config,
         get_isaacsim_root_physx_jacobians,
         resolve_body_index,
+        resolve_isaacsim_physx_body_index,
+        resolve_isaacsim_physx_dof_indices,
         resolve_right_arm_joint_indices,
         select_isaacsim_active_position_jacobian,
     )
@@ -148,6 +150,8 @@ def test_stage4_isaacsim_multi_pose_active_arm_jacobian_finite_difference():
         active_idx = torch.tensor(indices.active_dof_indices, device=base_env.device, dtype=torch.long)
         wrist_idx = torch.tensor(indices.wrist_dof_indices, device=base_env.device, dtype=torch.long)
         body_index = resolve_body_index(base_env.simulator.body_names, stage4_cfg.end_effector_body_name)
+        physx_body_index = resolve_isaacsim_physx_body_index(base_env.simulator, body_index)
+        physx_active_dof_indices = resolve_isaacsim_physx_dof_indices(base_env.simulator, indices.active_dof_indices)
         env_ids = torch.arange(num_envs, device=base_env.device)
 
         def sync_pose(active_q: torch.Tensor) -> torch.Tensor:
@@ -173,8 +177,8 @@ def test_stage4_isaacsim_multi_pose_active_arm_jacobian_finite_difference():
             jacobians = get_isaacsim_root_physx_jacobians(base_env.simulator)
             physx_jac = select_isaacsim_active_position_jacobian(
                 jacobians,
-                body_index=body_index,
-                active_dof_indices=indices.active_dof_indices,
+                body_index=physx_body_index,
+                active_dof_indices=physx_active_dof_indices,
                 num_dofs=base_env.num_dof,
             )
 

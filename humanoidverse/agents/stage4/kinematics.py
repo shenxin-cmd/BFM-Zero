@@ -121,6 +121,31 @@ def resolve_body_index(body_names: Sequence[str], body_name: str) -> int:
         raise ValueError(f"Body name {body_name!r} was not found in body_names") from exc
 
 
+def resolve_isaacsim_physx_body_index(simulator, humanoidverse_body_index: int) -> int:
+    """Map a humanoidverse/config body index to the raw IsaacSim PhysX body index."""
+
+    body_ids = getattr(simulator, "body_ids", None)
+    if body_ids is None:
+        return int(humanoidverse_body_index)
+    return int(body_ids[int(humanoidverse_body_index)])
+
+
+def resolve_isaacsim_physx_dof_indices(
+    simulator,
+    humanoidverse_dof_indices: Sequence[int] | torch.Tensor,
+) -> tuple[int, ...]:
+    """Map humanoidverse/config DOF indices to raw IsaacSim PhysX DOF indices."""
+
+    if isinstance(humanoidverse_dof_indices, torch.Tensor):
+        hv_indices = tuple(int(idx) for idx in humanoidverse_dof_indices.detach().cpu().tolist())
+    else:
+        hv_indices = tuple(int(idx) for idx in humanoidverse_dof_indices)
+    dof_ids = getattr(simulator, "dof_ids", None)
+    if dof_ids is None:
+        return hv_indices
+    return tuple(int(dof_ids[idx]) for idx in hv_indices)
+
+
 def select_isaacsim_active_position_jacobian(
     jacobians: torch.Tensor,
     *,

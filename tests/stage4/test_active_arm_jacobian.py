@@ -4,6 +4,8 @@ import torch
 from humanoidverse.agents.stage4 import (
     finite_difference_position_jacobian,
     resolve_body_index,
+    resolve_isaacsim_physx_body_index,
+    resolve_isaacsim_physx_dof_indices,
     select_active_position_jacobian,
     select_isaacsim_active_position_jacobian,
 )
@@ -49,6 +51,27 @@ def test_resolve_body_index_uses_name_not_position_guess():
 
     with pytest.raises(ValueError, match="right_hand_link"):
         resolve_body_index(body_names, "right_hand_link")
+
+
+def test_resolve_isaacsim_physx_indices_use_raw_simulator_mappings():
+    simulator = type(
+        "DummySimulator",
+        (),
+        {
+            "body_ids": [0, 4, 7],
+            "dof_ids": [10, 11, 12, 13, 22, 23],
+        },
+    )()
+
+    assert resolve_isaacsim_physx_body_index(simulator, 2) == 7
+    assert resolve_isaacsim_physx_dof_indices(simulator, (2, 3, 4, 5)) == (12, 13, 22, 23)
+
+
+def test_resolve_isaacsim_physx_indices_fall_back_when_mapping_absent():
+    simulator = type("DummySimulator", (), {})()
+
+    assert resolve_isaacsim_physx_body_index(simulator, 2) == 2
+    assert resolve_isaacsim_physx_dof_indices(simulator, (2, 3, 4, 5)) == (2, 3, 4, 5)
 
 
 def test_select_isaacsim_active_position_jacobian_handles_actuated_columns():

@@ -36,10 +36,14 @@ def _make_dummy_env():
     rigid_body_pos = torch.zeros(num_envs, 30, 3)
     rigid_body_pos[:, 29] = torch.tensor([[0.3, -0.2, 1.1], [0.4, -0.1, 1.2]])
     jacobians = torch.zeros(num_envs, 30, 6, 35)
-    for local_col, jac_col in enumerate((28, 29, 30, 31)):
-        jacobians[:, 29, :3, jac_col] = torch.eye(3, 4)[:, local_col]
+    body_ids = [*range(29), 7]
+    dof_ids = [*range(22), 12, 13, 14, 15, 26, 27, 28]
+    for local_col, raw_dof_id in enumerate((12, 13, 14, 15)):
+        jacobians[:, 7, :3, raw_dof_id + 6] = torch.eye(3, 4)[:, local_col]
     simulator = SimpleNamespace(
         dof_pos=dof_pos,
+        dof_ids=dof_ids,
+        body_ids=body_ids,
         robot_root_states=root_states,
         _rigid_body_pos=rigid_body_pos,
         _robot=SimpleNamespace(root_physx_view=_DummyRootPhysxView(jacobians)),

@@ -9,6 +9,8 @@ from .actions import RightArmJointIndices, resolve_right_arm_joint_indices
 from .kinematics import (
     get_isaacsim_root_physx_jacobians,
     resolve_body_index,
+    resolve_isaacsim_physx_body_index,
+    resolve_isaacsim_physx_dof_indices,
     rotate_position_jacobian_world_to_heading,
     select_isaacsim_active_position_jacobian,
     world_to_heading_frame,
@@ -105,10 +107,12 @@ def build_stage4_env_snapshot(base_env, stage4_cfg: Any = None) -> Stage4EnvSnap
     active_pd_reference_pos = pd_reference_pos.index_select(-1, active_idx)
 
     jacobians = get_isaacsim_root_physx_jacobians(simulator)
+    physx_body_index = resolve_isaacsim_physx_body_index(simulator, body_index)
+    physx_active_dof_indices = resolve_isaacsim_physx_dof_indices(simulator, indices.active_dof_indices)
     active_position_jacobian_world = select_isaacsim_active_position_jacobian(
         jacobians,
-        body_index=body_index,
-        active_dof_indices=indices.active_dof_indices,
+        body_index=physx_body_index,
+        active_dof_indices=physx_active_dof_indices,
         num_dofs=len(base_env.dof_names),
     )
     active_position_jacobian_heading = rotate_position_jacobian_world_to_heading(
