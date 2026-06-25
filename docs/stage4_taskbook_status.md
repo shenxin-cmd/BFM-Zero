@@ -21,6 +21,13 @@ Current status at the time of writing:
 - Stage4 ordinary tests on server: `42 passed, 2 skipped`.
 - Opt-in IsaacSim Stage4 smoke tests on server: both passed.
 
+Update on 2026-06-25:
+
+- Latest Stage4 commit checked in this update: `d942bde stage4 add static reach dls evaluation smoke`.
+- Latest ordinary Stage4 tests on server: `55 passed, 6 skipped`.
+- Current status should be read as: Stage4A safety/tooling foundation complete; Stage4B DLS-only validation is in progress and has passed the current smoke gates, but full Stage4B evaluation/training is not complete.
+- No formal long training has been run.
+
 ## 1. Taskbook Requirements Interpreted From The PDF
 
 The taskbook describes Stage4 as:
@@ -662,3 +669,124 @@ Only after this passes should `train_bfm_zero_split_z` be wired to `task_space_4
 ## 7. One-Sentence Summary
 
 The code has completed and tested the Stage4 DLS-only task-space control foundation: name-based 4DoF right-arm mapping, multi-layer wrist absolute-zero locking, heading-frame IsaacSim Jacobian extraction, DLS full-action assembly, and real-env smoke tests. The next blocker is not numerical control but deciding the formal task-space command source, replay/observation schema, Stage4 body actor structure, checkpoint migration plan, and allowed body coordination residual scope.
+
+## 8. Stage4B Update After Real IsaacSim Validation
+
+This section records the additional validation completed after the initial status document.
+
+### 8.1 DLS Joint Target To Env Action Round Trip
+
+Completed.
+
+Implemented and tested the correct PD semantics:
+
+```text
+q_cmd = q_current + dq
+action = (q_cmd - default_dof_pos - default_dof_pos_offset) / action_scale
+```
+
+The test verifies that the env-reconstructed PD target equals the intended absolute `q_cmd`.
+
+### 8.2 Real IsaacSim Multi-Pose Jacobian Finite Difference
+
+Completed as an opt-in smoke.
+
+Important conclusion:
+
+- Before mapping fix, default-pose FD error was about `0.195688` and `sigma_min` was about `1e-10`.
+- Root cause was mixing humanoidverse/config body and DOF indices with raw IsaacSim/PhysX Jacobian indices.
+- After mapping `body_ids` and `dof_ids`, real IsaacSim multi-pose FD passed:
+  - default error about `0.069585`, `sigma_min about 0.1215`
+  - elbow-bent error about `0.063420`, `sigma_min about 0.0914`
+  - shoulder-forward error about `0.068925`, `sigma_min about 0.1095`
+  - random-safe error about `0.063673`, `sigma_min about 0.1024`
+
+Therefore, the earlier near-zero singular value should not be interpreted as proof that body coordination is inherently required.
+
+### 8.3 Wrist Reset And Domain Randomization
+
+Completed for current Stage4 task-space path.
+
+Implemented:
+
+- Stage4 default reset locks right wrist `q=0` and `dq=0`.
+- Stage4 target-state reset locks right wrist `q=0` and `dq=0`.
+- `LeggedRobotMotions` motion-reference reset also locks right wrist after motion initialization.
+- Stage4 domain randomization clears the three right-wrist `default_dof_pos_offset` entries after default-offset randomization.
+- Legacy modes keep previous behavior.
+
+Real IsaacSim reset smoke passed:
+
+```text
+reset wrist q/dq/offset abs max = 0.000000e+00, 0.000000e+00, 0.000000e+00
+non_wrist_offset_mean=0.500000
+```
+
+### 8.4 Null-Space Comfortable Posture And Limiter
+
+Completed at DLS controller/tooling level and real rollout smoke level.
+
+Implemented:
+
+- 4DoF null-space projector for the `3x4` active arm Jacobian.
+- Comfortable-posture null-space update.
+- `JointCommandLimiter` integration in the DLS controller at the absolute active joint target layer, before normalized action conversion.
+
+Real IsaacSim limiter rollout smoke passed:
+
+```text
+max_active_target_jump=0.006000
+allowed=0.006010
+max_action_jump=0.024000
+final_error=0.391508
+sigma_min_last=1.038025e-04
+```
+
+Interpretation:
+
+- Limiter is active in the real `snapshot -> DLS -> limiter -> env.step` path.
+- This smoke is not a reaching-performance pass. The low `sigma_min` and high final error indicate this random motion/target scene can be near singular.
+
+### 8.5 Static Reach DLS Evaluation
+
+Completed as an opt-in evaluation smoke and reusable evaluation helper.
+
+Implemented:
+
+- `humanoidverse/agents/stage4/evaluation.py`
+- `evaluate_static_reach_dls`
+- Per-target metrics:
+  - steady-state error
+  - max action jump
+  - minimum sigma
+  - minimum joint margin
+
+Real IsaacSim static reach evaluation smoke passed:
+
+```text
+steady_error_mean=0.265757
+steady_error_max=0.346388
+max_action_jump=0.024000
+min_sigma=3.617078e-03
+min_joint_margin=0.000000
+```
+
+Interpretation:
+
+- The evaluation path is now runnable and records useful Stage4B metrics.
+- DLS-only static reach is not yet performance-complete; current metrics show near-limit and near-singular cases.
+- This supports the next decision point: whether to add body coordination residual, learned hand residual, or revise command/task distribution.
+
+### 8.6 Current Remaining Stage4B Work
+
+Still not complete:
+
+- Formal command sampler module with `static_reach`, `motion_reference`, and `external_task` modes.
+- Motion-reference command mode with lookahead 1 or 2 frames.
+- Snapshot end-effector linear velocity.
+- Body actor wrapper path with `forward_body(obs, z_body)`.
+- Checkpoint migration report from Stage3 to Stage4.
+- Rule-based waist-only body coordination residual.
+- Full Stage4B evaluation report over a larger target set.
+- Any learned hand residual or learned body coordination residual.
+- Replay buffer schema changes; these remain intentionally deferred during DLS-only validation.
