@@ -491,3 +491,83 @@ def test_stage4_isaac_env_dls_limiter_rollout_smoke():
     finally:
         if env is not None:
             env.close()
+
+
+@pytest.mark.skipif(not _stage4_env_smoke_enabled(), reason="Set RUN_STAGE4_ISAAC_SMOKE=1 to run IsaacSim smoke")
+def test_stage4_isaac_env_static_reach_evaluation_smoke():
+    from humanoidverse.agents.envs.humanoidverse_isaac import HumanoidVerseIsaacConfig
+    from humanoidverse.agents.stage4 import evaluate_static_reach_dls
+
+    num_envs = int(os.environ.get("STAGE4_SMOKE_NUM_ENVS", "2"))
+    steps_per_target = int(os.environ.get("STAGE4_STATIC_REACH_STEPS", "8"))
+    lafan_tail_path = os.environ.get("STAGE4_SMOKE_MOTION_FILE", "humanoidverse/data/lafan_29dof_10s-clipped.pkl")
+
+    cfg = HumanoidVerseIsaacConfig(
+        name="humanoidverse_isaac",
+        device=os.environ.get("STAGE4_SMOKE_DEVICE", "cuda:0"),
+        lafan_tail_path=lafan_tail_path,
+        enable_cameras=False,
+        max_episode_length_s=2.0,
+        disable_obs_noise=True,
+        disable_domain_randomization=True,
+        relative_config_path="exp/bfm_zero/bfm_zero",
+        include_last_action=True,
+        include_history_actor=True,
+        root_height_obs=True,
+        hydra_overrides=[
+            "robot=g1/g1_29dof_hard_waist",
+            "robot.control.action_scale=0.25",
+            "robot.control.action_clip_value=5.0",
+            "robot.control.normalize_action_to=5.0",
+            "env.config.lie_down_init=False",
+            "env.config.lie_down_init_prob=0.0",
+        ],
+    )
+
+    env = None
+    try:
+        env, _ = cfg.build(num_envs=num_envs)
+        base_env = env.unwrapped
+        base_env.config.stage4 = {
+            "hand_control_mode": "task_space_4dof",
+            "end_effector_body_name": "right_wrist_yaw_link",
+            "enforce_wrist_zero_before_env_step": True,
+            "enforce_wrist_zero_after_pd_target_build": True,
+            "wrist_absolute_target": 0.0,
+        }
+        obs, info = env.reset()
+        assert "state" in obs
+
+        target_offsets = torch.tensor(
+            [
+                [0.05, 0.00, 0.02],
+                [0.02, 0.04, 0.00],
+                [-0.02, 0.02, 0.03],
+            ],
+            device=base_env.device,
+        )
+        result = evaluate_static_reach_dls(
+            env,
+            target_offsets_heading=target_offsets,
+            steps_per_target=steps_per_target,
+            max_joint_velocity=0.30,
+            comfortable_q=torch.zeros(num_envs, 4, device=base_env.device),
+            nullspace_gain=0.2,
+            max_nullspace_delta=0.03,
+        )
+
+        print(
+            "static reach eval "
+            f"steady_error_mean={result.steady_state_error.mean().item():.6f}, "
+            f"steady_error_max={result.steady_state_error.max().item():.6f}, "
+            f"max_action_jump={result.max_action_jump.max().item():.6f}, "
+            f"min_sigma={result.min_sigma_min.min().item():.6e}, "
+            f"min_joint_margin={result.min_joint_margin.min().item():.6f}"
+        )
+        assert torch.isfinite(result.steady_state_error).all()
+        assert torch.isfinite(result.max_action_jump).all()
+        assert torch.isfinite(result.min_sigma_min).all()
+        assert torch.isfinite(result.min_joint_margin).all()
+    finally:
+        if env is not None:
+            env.close()

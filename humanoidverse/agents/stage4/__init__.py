@@ -27,6 +27,7 @@ from .controller import (
     dls_hand_action_from_snapshot,
 )
 from .env_adapter import Stage4EnvSnapshot, build_stage4_env_snapshot
+from .evaluation import StaticReachEvaluationResult, evaluate_static_reach_dls
 from .kinematics import (
     finite_difference_position_jacobian,
     get_isaacsim_root_physx_jacobians,
@@ -52,6 +53,7 @@ __all__ = [
     "RightArmJointIndices",
     "Stage4Config",
     "Stage4EnvSnapshot",
+    "StaticReachEvaluationResult",
     "adaptive_damping",
     "assemble_full_action",
     "apply_joint_limit_scaling",
@@ -64,6 +66,7 @@ __all__ = [
     "damped_least_squares",
     "damped_pseudoinverse",
     "dls_hand_action_from_snapshot",
+    "evaluate_static_reach_dls",
     "finite_difference_position_jacobian",
     "get_isaacsim_root_physx_jacobians",
     "heading_to_world_frame",
