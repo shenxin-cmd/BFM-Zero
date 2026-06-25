@@ -543,6 +543,7 @@ class LeggedRobotMotions(LeggedRobotBase):
             target_dof_vel = dof_vel + torch.randn_like(dof_vel) * dof_vel_noise
             self.target_robot_dof_state[env_ids, :, 0] = target_dof_pos
             self.target_robot_dof_state[env_ids, :, 1] = target_dof_vel
+        self._stage4_zero_wrist_reset_state(env_ids)
         
 
 

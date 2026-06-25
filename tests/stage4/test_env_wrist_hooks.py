@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import torch
 
 from humanoidverse.envs.legged_base_task.legged_robot_base import LeggedRobotBase
+from humanoidverse.envs.legged_robot_motions.legged_robot_motions import LeggedRobotMotions
 
 G1_29DOF_NAMES = (
     "left_hip_pitch_joint",
@@ -159,3 +160,17 @@ def test_legacy_domain_randomization_keeps_existing_wrist_offset_behavior():
     env._episodic_domain_randomization(torch.tensor([0]))
 
     assert torch.all(env.default_dof_pos_offset[:, [26, 27, 28]] == 0.5)
+
+
+def test_stage4_motion_reset_hard_locks_wrist_after_motion_reference_init():
+    env = _make_env_with_stage4(enabled=True)
+    env.target_robot_dof_state = torch.empty(2, 29, 2)
+    target_state = torch.ones(2, 29, 2)
+    target_state[:, [26, 27, 28], 0] = 0.9
+    target_state[:, [26, 27, 28], 1] = -0.6
+
+    LeggedRobotMotions._reset_dofs(env, torch.tensor([0, 1]), target_state=target_state)
+
+    assert torch.all(env.target_robot_dof_state[:, [26, 27, 28], 0] == 0.0)
+    assert torch.all(env.target_robot_dof_state[:, [26, 27, 28], 1] == 0.0)
+    assert torch.all(env.target_robot_dof_state[:, 25, 0] == 1.0)
