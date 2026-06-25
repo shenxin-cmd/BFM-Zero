@@ -3,6 +3,7 @@ import torch
 from humanoidverse.agents.stage4 import (
     DLSHandController,
     HandTaskCommand,
+    JointCommandLimiter,
     active_target_to_action,
     body_action_indices_for_stage4,
     resolve_right_arm_joint_indices,
@@ -127,3 +128,115 @@ def test_active_target_to_action_round_trips_env_pd_semantics_with_offset():
     reconstructed_pd_target = action * action_scale + default_dof_pos + default_dof_pos_offset
 
     assert torch.allclose(reconstructed_pd_target, q_cmd)
+
+
+def test_dls_controller_applies_joint_command_limiter_to_active_joint_targets():
+    indices = resolve_right_arm_joint_indices(
+        dof_names=G1_29DOF_NAMES,
+        active_joint_names=(
+            "right_shoulder_pitch_joint",
+            "right_shoulder_roll_joint",
+            "right_shoulder_yaw_joint",
+            "right_elbow_joint",
+        ),
+        wrist_joint_names=(
+            "right_wrist_roll_joint",
+            "right_wrist_pitch_joint",
+            "right_wrist_yaw_joint",
+        ),
+    )
+    body_indices = tuple(idx for idx in range(29) if idx not in indices.controlled_action_indices)
+    limiter = JointCommandLimiter(
+        action_dim=4,
+        num_envs=1,
+        device="cpu",
+        max_joint_velocity=0.5,
+    )
+    controller = DLSHandController(
+        indices=indices,
+        action_dim=29,
+        body_indices=body_indices,
+        max_joint_delta=0.5,
+    )
+    limiter.step(torch.zeros(1, 4), dt=0.1)
+    command = HandTaskCommand(
+        target_pos_root=torch.tensor([[1.0, 0.0, 0.0]]),
+        target_lin_vel_root=torch.zeros(1, 3),
+        position_mask=torch.ones(1, 1),
+        velocity_mask=torch.zeros(1, 1),
+        command_id=torch.zeros(1, dtype=torch.long),
+        command_done=torch.zeros(1, 1, dtype=torch.bool),
+    )
+    jac = torch.zeros(1, 3, 4)
+    jac[:, :3, :3] = torch.eye(3)
+    common_kwargs = dict(
+        body_action=torch.zeros(1, len(body_indices)),
+        active_q=torch.zeros(1, 4),
+        wrist_pos_root=torch.zeros(1, 3),
+        command=command,
+        active_position_jacobian=jac,
+        active_lower=torch.full((1, 4), -1.0),
+        active_upper=torch.full((1, 4), 1.0),
+        active_pd_reference_pos=torch.zeros(1, 4),
+        action_scale=1.0,
+    )
+
+    out = controller.step(**common_kwargs, joint_command_limiter=limiter, dt=0.1)
+
+    assert torch.allclose(out.active_joint_target[:, 0], torch.tensor([0.05]))
+    assert torch.allclose(out.active_hand_action, out.active_joint_target)
+
+
+def test_dls_controller_adds_comfortable_posture_nullspace_motion():
+    indices = resolve_right_arm_joint_indices(
+        dof_names=G1_29DOF_NAMES,
+        active_joint_names=(
+            "right_shoulder_pitch_joint",
+            "right_shoulder_roll_joint",
+            "right_shoulder_yaw_joint",
+            "right_elbow_joint",
+        ),
+        wrist_joint_names=(
+            "right_wrist_roll_joint",
+            "right_wrist_pitch_joint",
+            "right_wrist_yaw_joint",
+        ),
+    )
+    body_indices = tuple(idx for idx in range(29) if idx not in indices.controlled_action_indices)
+    controller = DLSHandController(
+        indices=indices,
+        action_dim=29,
+        body_indices=body_indices,
+        max_joint_delta=0.5,
+        comfortable_q=torch.tensor([0.0, 0.0, 0.0, 0.6]),
+        nullspace_gain=1.0,
+        max_nullspace_delta=0.5,
+        damping_min=0.0,
+        damping_max=0.0,
+    )
+    command = HandTaskCommand(
+        target_pos_root=torch.zeros(1, 3),
+        target_lin_vel_root=torch.zeros(1, 3),
+        position_mask=torch.ones(1, 1),
+        velocity_mask=torch.zeros(1, 1),
+        command_id=torch.zeros(1, dtype=torch.long),
+        command_done=torch.zeros(1, 1, dtype=torch.bool),
+    )
+    jac = torch.zeros(1, 3, 4)
+    jac[:, :3, :3] = torch.eye(3)
+
+    out = controller.step(
+        body_action=torch.zeros(1, len(body_indices)),
+        active_q=torch.zeros(1, 4),
+        wrist_pos_root=torch.zeros(1, 3),
+        command=command,
+        active_position_jacobian=jac,
+        active_lower=torch.full((1, 4), -1.0),
+        active_upper=torch.full((1, 4), 1.0),
+        active_pd_reference_pos=torch.zeros(1, 4),
+        action_scale=1.0,
+    )
+
+    task_motion = (jac @ out.active_joint_delta.unsqueeze(-1)).squeeze(-1)
+    assert torch.allclose(task_motion, torch.zeros_like(task_motion), atol=1e-5)
+    assert out.active_joint_delta[0, 3] > 0.0

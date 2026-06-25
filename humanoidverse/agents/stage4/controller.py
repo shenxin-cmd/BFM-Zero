@@ -6,7 +6,14 @@ from typing import Sequence
 import torch
 
 from .actions import RightArmJointIndices, assemble_full_action
-from .control import adaptive_damping, apply_joint_limit_scaling, damped_least_squares, joint_margin_scale
+from .control import (
+    JointCommandLimiter,
+    adaptive_damping,
+    apply_joint_limit_scaling,
+    comfortable_posture_nullspace_delta,
+    damped_least_squares,
+    joint_margin_scale,
+)
 from .env_adapter import Stage4EnvSnapshot
 
 
@@ -80,6 +87,9 @@ class DLSHandController:
         damping_max: float = 0.20,
         singular_value_threshold: float = 0.08,
         joint_limit_margin: float = 0.15,
+        comfortable_q: torch.Tensor | Sequence[float] | None = None,
+        nullspace_gain: float = 0.0,
+        max_nullspace_delta: float = 0.02,
     ) -> None:
         self.indices = indices
         self.action_dim = action_dim
@@ -90,6 +100,9 @@ class DLSHandController:
         self.damping_max = damping_max
         self.singular_value_threshold = singular_value_threshold
         self.joint_limit_margin = joint_limit_margin
+        self.comfortable_q = comfortable_q
+        self.nullspace_gain = nullspace_gain
+        self.max_nullspace_delta = max_nullspace_delta
 
     def step(
         self,
@@ -103,6 +116,8 @@ class DLSHandController:
         active_upper: torch.Tensor,
         active_pd_reference_pos: torch.Tensor,
         action_scale: float,
+        joint_command_limiter: JointCommandLimiter | None = None,
+        dt: float | None = None,
     ) -> DLSHandControllerOutput:
         position_error = (command.target_pos_root - wrist_pos_root) * command.position_mask
         damping, sigma_min = adaptive_damping(
@@ -125,7 +140,31 @@ class DLSHandController:
             active_upper,
             margin=self.joint_limit_margin,
         )
+        if self.comfortable_q is not None and self.nullspace_gain > 0.0:
+            comfortable_q = torch.as_tensor(self.comfortable_q, dtype=active_q.dtype, device=active_q.device)
+            if comfortable_q.ndim == 1:
+                comfortable_q = comfortable_q.unsqueeze(0).expand_as(active_q)
+            nullspace_dq = comfortable_posture_nullspace_delta(
+                active_position_jacobian,
+                active_q,
+                comfortable_q,
+                damping,
+                gain=self.nullspace_gain,
+                max_joint_delta=self.max_nullspace_delta,
+            )
+            dq = apply_joint_limit_scaling(
+                active_q,
+                dq + nullspace_dq,
+                active_lower,
+                active_upper,
+                margin=self.joint_limit_margin,
+            )
         active_target = active_q + dq
+        if joint_command_limiter is not None:
+            if dt is None:
+                raise ValueError("dt must be provided when joint_command_limiter is used")
+            active_target = joint_command_limiter.step(active_target, dt=dt)
+            dq = active_target - active_q
         active_action = active_target_to_action(
             active_target,
             active_pd_reference_pos=active_pd_reference_pos,
@@ -223,6 +262,11 @@ def dls_hand_action_from_snapshot(
     damping_max: float = 0.20,
     singular_value_threshold: float = 0.08,
     joint_limit_margin: float = 0.15,
+    comfortable_q: torch.Tensor | Sequence[float] | None = None,
+    nullspace_gain: float = 0.0,
+    max_nullspace_delta: float = 0.02,
+    joint_command_limiter: JointCommandLimiter | None = None,
+    dt: float | None = None,
 ) -> DLSHandControllerOutput:
     """Assemble a full env action from body policy output plus Stage 4 DLS hand control."""
 
@@ -237,6 +281,9 @@ def dls_hand_action_from_snapshot(
         damping_max=damping_max,
         singular_value_threshold=singular_value_threshold,
         joint_limit_margin=joint_limit_margin,
+        comfortable_q=comfortable_q,
+        nullspace_gain=nullspace_gain,
+        max_nullspace_delta=max_nullspace_delta,
     )
     return controller.step(
         body_action=body_action,
@@ -248,4 +295,6 @@ def dls_hand_action_from_snapshot(
         active_upper=snapshot.active_upper,
         active_pd_reference_pos=snapshot.active_pd_reference_pos,
         action_scale=snapshot.action_scale,
+        joint_command_limiter=joint_command_limiter,
+        dt=dt,
     )

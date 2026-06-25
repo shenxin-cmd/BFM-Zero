@@ -58,6 +58,53 @@ def damped_least_squares(
     return dq.clamp(min=-max_joint_delta, max=max_joint_delta)
 
 
+def damped_pseudoinverse(jacobian: torch.Tensor, damping: torch.Tensor | float) -> torch.Tensor:
+    """Damped right pseudoinverse for Stage 4 3x4 position Jacobians."""
+
+    if jacobian.shape[-2:] != (3, 4):
+        raise ValueError(f"Expected jacobian shape [...,3,4], got {jacobian.shape}")
+    jj_t = jacobian @ jacobian.transpose(-1, -2)
+    eye = torch.eye(3, dtype=jacobian.dtype, device=jacobian.device).expand_as(jj_t)
+    damping_tensor = torch.as_tensor(damping, dtype=jacobian.dtype, device=jacobian.device)
+    while damping_tensor.ndim < jj_t.ndim - 1:
+        damping_tensor = damping_tensor.unsqueeze(-1)
+    damping_sq = damping_tensor.square().unsqueeze(-1)
+    return jacobian.transpose(-1, -2) @ torch.linalg.inv(jj_t + damping_sq * eye)
+
+
+def nullspace_projector(jacobian: torch.Tensor, damping: torch.Tensor | float = 0.0) -> torch.Tensor:
+    """Project 4D joint updates into the null-space of the 3D primary task."""
+
+    jacobian_pinv = damped_pseudoinverse(jacobian, damping)
+    identity = torch.eye(4, dtype=jacobian.dtype, device=jacobian.device)
+    identity = identity.expand(*jacobian.shape[:-2], 4, 4)
+    return identity - jacobian_pinv @ jacobian
+
+
+def comfortable_posture_nullspace_delta(
+    jacobian: torch.Tensor,
+    q: torch.Tensor,
+    comfortable_q: torch.Tensor,
+    damping: torch.Tensor | float,
+    *,
+    gain: float = 0.2,
+    max_joint_delta: float = 0.02,
+) -> torch.Tensor:
+    """Null-space joint update toward a comfortable 4DoF posture."""
+
+    if q.shape != comfortable_q.shape:
+        raise ValueError(f"q and comfortable_q shapes must match, got {q.shape} and {comfortable_q.shape}")
+    if q.shape[-1] != 4:
+        raise ValueError(f"Expected q shape [...,4], got {q.shape}")
+    if max_joint_delta <= 0:
+        raise ValueError("max_joint_delta must be positive")
+
+    desired = gain * (comfortable_q.to(device=q.device, dtype=q.dtype) - q)
+    projector = nullspace_projector(jacobian, damping)
+    projected = (projector @ desired.unsqueeze(-1)).squeeze(-1)
+    return projected.clamp(min=-max_joint_delta, max=max_joint_delta)
+
+
 def joint_margin_scale(
     q: torch.Tensor,
     lower: torch.Tensor,
