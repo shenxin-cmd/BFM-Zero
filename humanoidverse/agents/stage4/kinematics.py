@@ -36,6 +36,19 @@ def world_to_heading_frame(
     return _rotate_flat(heading_inv, local)
 
 
+def rotate_vectors_world_to_heading_frame(
+    vectors_world: torch.Tensor,
+    *,
+    root_quat_xyzw: torch.Tensor,
+) -> torch.Tensor:
+    """Rotate world-frame vectors into the root heading frame without translation."""
+
+    heading_inv = calc_heading_quat_inv(root_quat_xyzw, w_last=True)
+    if vectors_world.ndim == heading_inv.ndim + 1:
+        heading_inv = heading_inv.unsqueeze(-2).expand(*vectors_world.shape[:-1], 4)
+    return _rotate_flat(heading_inv, vectors_world)
+
+
 def heading_to_world_frame(
     points_heading: torch.Tensor,
     *,
@@ -49,6 +62,31 @@ def heading_to_world_frame(
         heading = heading.unsqueeze(-2).expand(*points_heading.shape[:-1], 4)
     world_delta = _rotate_flat(heading, points_heading)
     return world_delta + root_pos_world.unsqueeze(-2) if points_heading.ndim == root_pos_world.ndim + 1 else world_delta + root_pos_world
+
+
+def rotate_vectors_heading_to_world_frame(
+    vectors_heading: torch.Tensor,
+    *,
+    root_quat_xyzw: torch.Tensor,
+) -> torch.Tensor:
+    """Rotate root heading-frame vectors into world frame without translation."""
+
+    heading = calc_heading_quat(root_quat_xyzw, w_last=True)
+    if vectors_heading.ndim == heading.ndim + 1:
+        heading = heading.unsqueeze(-2).expand(*vectors_heading.shape[:-1], 4)
+    return _rotate_flat(heading, vectors_heading)
+
+
+def rotate_position_jacobian_world_to_heading(
+    position_jacobian_world: torch.Tensor,
+    *,
+    root_quat_xyzw: torch.Tensor,
+) -> torch.Tensor:
+    if position_jacobian_world.shape[-2] != 3:
+        raise ValueError(f"Expected position_jacobian_world shape [..., 3, dof], got {position_jacobian_world.shape}")
+    columns_as_vectors = position_jacobian_world.transpose(-1, -2)
+    rotated = rotate_vectors_world_to_heading_frame(columns_as_vectors, root_quat_xyzw=root_quat_xyzw)
+    return rotated.transpose(-1, -2)
 
 
 def select_active_position_jacobian(
