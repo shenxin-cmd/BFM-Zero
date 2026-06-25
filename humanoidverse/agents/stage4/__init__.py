@@ -13,6 +13,14 @@ from .control import (
     damped_least_squares,
     joint_margin_scale,
 )
+from .controller import (
+    CoordinationGate,
+    DLSHandController,
+    DLSHandControllerOutput,
+    HandTaskCommand,
+    active_target_to_action,
+    coordination_gate_raw,
+)
 from .kinematics import (
     finite_difference_position_jacobian,
     heading_to_world_frame,
@@ -21,14 +29,20 @@ from .kinematics import (
 )
 
 __all__ = [
+    "CoordinationGate",
+    "DLSHandController",
+    "DLSHandControllerOutput",
     "HandControlMode",
+    "HandTaskCommand",
     "JointCommandLimiter",
     "RightArmJointIndices",
     "Stage4Config",
     "adaptive_damping",
     "assemble_full_action",
     "apply_joint_limit_scaling",
+    "active_target_to_action",
     "clamp_wrist_pd_target",
+    "coordination_gate_raw",
     "damped_least_squares",
     "finite_difference_position_jacobian",
     "heading_to_world_frame",
