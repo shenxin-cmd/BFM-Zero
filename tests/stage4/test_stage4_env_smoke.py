@@ -364,3 +364,130 @@ def test_stage4_isaac_env_dls_action_assembly_smoke():
     finally:
         if env is not None:
             env.close()
+
+
+@pytest.mark.skipif(not _stage4_env_smoke_enabled(), reason="Set RUN_STAGE4_ISAAC_SMOKE=1 to run IsaacSim smoke")
+def test_stage4_isaac_env_dls_limiter_rollout_smoke():
+    from humanoidverse.agents.envs.humanoidverse_isaac import HumanoidVerseIsaacConfig
+    from humanoidverse.agents.stage4 import (
+        HandTaskCommand,
+        JointCommandLimiter,
+        build_stage4_env_snapshot,
+        dls_hand_action_from_snapshot,
+    )
+
+    num_envs = int(os.environ.get("STAGE4_SMOKE_NUM_ENVS", "2"))
+    steps = int(os.environ.get("STAGE4_DLS_LIMITER_STEPS", "8"))
+    max_joint_velocity = float(os.environ.get("STAGE4_DLS_LIMITER_MAX_JOINT_VEL", "0.30"))
+    jump_tol = float(os.environ.get("STAGE4_DLS_LIMITER_JUMP_TOL", "1e-5"))
+    lafan_tail_path = os.environ.get("STAGE4_SMOKE_MOTION_FILE", "humanoidverse/data/lafan_29dof_10s-clipped.pkl")
+
+    cfg = HumanoidVerseIsaacConfig(
+        name="humanoidverse_isaac",
+        device=os.environ.get("STAGE4_SMOKE_DEVICE", "cuda:0"),
+        lafan_tail_path=lafan_tail_path,
+        enable_cameras=False,
+        max_episode_length_s=2.0,
+        disable_obs_noise=True,
+        disable_domain_randomization=True,
+        relative_config_path="exp/bfm_zero/bfm_zero",
+        include_last_action=True,
+        include_history_actor=True,
+        root_height_obs=True,
+        hydra_overrides=[
+            "robot=g1/g1_29dof_hard_waist",
+            "robot.control.action_scale=0.25",
+            "robot.control.action_clip_value=5.0",
+            "robot.control.normalize_action_to=5.0",
+            "env.config.lie_down_init=False",
+            "env.config.lie_down_init_prob=0.0",
+        ],
+    )
+
+    env = None
+    try:
+        env, _ = cfg.build(num_envs=num_envs)
+        base_env = env.unwrapped
+        base_env.config.stage4 = {
+            "hand_control_mode": "task_space_4dof",
+            "end_effector_body_name": "right_wrist_yaw_link",
+            "enforce_wrist_zero_before_env_step": True,
+            "enforce_wrist_zero_after_pd_target_build": True,
+            "wrist_absolute_target": 0.0,
+        }
+        obs, info = env.reset()
+        assert "state" in obs
+
+        initial_snapshot = build_stage4_env_snapshot(base_env)
+        target_offset = torch.zeros(num_envs, 3, device=base_env.device)
+        target_offset[:, 0] = 0.08
+        target_offset[:, 2] = 0.02
+        target_pos = initial_snapshot.end_effector_pos_heading + target_offset
+        limiter = JointCommandLimiter(
+            action_dim=4,
+            num_envs=num_envs,
+            device=base_env.device,
+            ema_alpha=1.0,
+            max_joint_velocity=max_joint_velocity,
+        )
+        limiter.step(initial_snapshot.active_q, dt=base_env.dt)
+
+        wrist_indices = torch.tensor([26, 27, 28], device=base_env.device)
+        previous_active_target = initial_snapshot.active_q.clone()
+        previous_active_action = None
+        max_active_target_jump = 0.0
+        max_action_jump = 0.0
+        final_error = None
+        sigma_min_last = None
+
+        for _ in range(steps):
+            snapshot = build_stage4_env_snapshot(base_env)
+            body_action = torch.zeros(num_envs, 22, device=base_env.device)
+            command = HandTaskCommand(
+                target_pos_root=target_pos,
+                target_lin_vel_root=torch.zeros(num_envs, 3, device=base_env.device),
+                position_mask=torch.ones(num_envs, 1, device=base_env.device),
+                velocity_mask=torch.zeros(num_envs, 1, device=base_env.device),
+                command_id=torch.zeros(num_envs, dtype=torch.long, device=base_env.device),
+                command_done=torch.zeros(num_envs, 1, dtype=torch.bool, device=base_env.device),
+            )
+            out = dls_hand_action_from_snapshot(
+                body_action=body_action,
+                snapshot=snapshot,
+                command=command,
+                action_dim=env.single_action_space.shape[0],
+                max_joint_delta=0.20,
+                comfortable_q=torch.zeros(num_envs, 4, device=base_env.device),
+                nullspace_gain=0.2,
+                max_nullspace_delta=0.03,
+                joint_command_limiter=limiter,
+                dt=base_env.dt,
+            )
+
+            active_target_jump = (out.active_joint_target - previous_active_target).abs().max().item()
+            max_active_target_jump = max(max_active_target_jump, active_target_jump)
+            if previous_active_action is not None:
+                action_jump = (out.active_hand_action - previous_active_action).abs().max().item()
+                max_action_jump = max(max_action_jump, action_jump)
+            previous_active_target = out.active_joint_target.detach().clone()
+            previous_active_action = out.active_hand_action.detach().clone()
+
+            assert torch.isfinite(out.full_action).all()
+            assert torch.all(out.full_action[:, wrist_indices] == 0.0)
+            obs, reward, terminated, truncated, info = env.step(out.full_action)
+            reward_tensor = reward if isinstance(reward, torch.Tensor) else torch.as_tensor(np.asarray(reward))
+            assert torch.isfinite(reward_tensor).all()
+            assert torch.isfinite(base_env.simulator.dof_pos).all()
+            final_error = out.position_error_root.norm(dim=-1).mean().item()
+            sigma_min_last = out.sigma_min.amin().item()
+
+        allowed_target_jump = max_joint_velocity * base_env.dt + jump_tol
+        print(
+            f"limiter rollout max_active_target_jump={max_active_target_jump:.6f}, "
+            f"allowed={allowed_target_jump:.6f}, max_action_jump={max_action_jump:.6f}, "
+            f"final_error={final_error:.6f}, sigma_min_last={sigma_min_last:.6e}"
+        )
+        assert max_active_target_jump <= allowed_target_jump
+    finally:
+        if env is not None:
+            env.close()
