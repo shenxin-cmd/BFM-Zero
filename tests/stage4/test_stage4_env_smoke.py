@@ -120,7 +120,7 @@ def test_stage4_isaac_env_reset_zeroes_wrist_state_and_default_offsets():
     try:
         env, _ = cfg.build(num_envs=num_envs)
         base_env = env.unwrapped
-        stage4_cfg = Stage4Config(hand_control_mode="task_space_4dof")
+        stage4_cfg = Stage4Config()
         base_env.config.stage4 = {
             "hand_control_mode": "task_space_4dof",
             "active_right_arm_joint_names": stage4_cfg.active_right_arm_joint_names,
