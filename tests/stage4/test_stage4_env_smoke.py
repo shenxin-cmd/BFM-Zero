@@ -85,6 +85,89 @@ def test_stage4_isaac_env_wrist_lock_smoke():
             env.close()
 
 
+@pytest.mark.skipif(not _stage4_env_smoke_enabled(), reason="Set RUN_STAGE4_ISAAC_SMOKE=1 to run IsaacSim smoke")
+def test_stage4_isaac_env_reset_zeroes_wrist_state_and_default_offsets():
+    from humanoidverse.agents.envs.humanoidverse_isaac import HumanoidVerseIsaacConfig
+    from humanoidverse.agents.stage4 import Stage4Config, resolve_right_arm_joint_indices
+
+    num_envs = int(os.environ.get("STAGE4_SMOKE_NUM_ENVS", "2"))
+    atol = float(os.environ.get("STAGE4_RESET_WRIST_ATOL", "1e-6"))
+    lafan_tail_path = os.environ.get("STAGE4_SMOKE_MOTION_FILE", "humanoidverse/data/lafan_29dof_10s-clipped.pkl")
+
+    cfg = HumanoidVerseIsaacConfig(
+        name="humanoidverse_isaac",
+        device=os.environ.get("STAGE4_SMOKE_DEVICE", "cuda:0"),
+        lafan_tail_path=lafan_tail_path,
+        enable_cameras=False,
+        max_episode_length_s=2.0,
+        disable_obs_noise=True,
+        disable_domain_randomization=True,
+        relative_config_path="exp/bfm_zero/bfm_zero",
+        include_last_action=True,
+        include_history_actor=True,
+        root_height_obs=True,
+        hydra_overrides=[
+            "robot=g1/g1_29dof_hard_waist",
+            "robot.control.action_scale=0.25",
+            "robot.control.action_clip_value=5.0",
+            "robot.control.normalize_action_to=5.0",
+            "env.config.lie_down_init=False",
+            "env.config.lie_down_init_prob=0.0",
+        ],
+    )
+
+    env = None
+    try:
+        env, _ = cfg.build(num_envs=num_envs)
+        base_env = env.unwrapped
+        stage4_cfg = Stage4Config(hand_control_mode="task_space_4dof")
+        base_env.config.stage4 = {
+            "hand_control_mode": "task_space_4dof",
+            "active_right_arm_joint_names": stage4_cfg.active_right_arm_joint_names,
+            "locked_wrist_joint_names": stage4_cfg.locked_wrist_joint_names,
+            "enforce_wrist_zero_before_env_step": True,
+            "enforce_wrist_zero_after_pd_target_build": True,
+            "wrist_absolute_target": 0.0,
+        }
+        base_env.config.domain_rand.randomize_default_dof_pos = True
+        base_env.config.domain_rand.default_dof_pos_noise_range = (0.5, 0.5)
+
+        env.reset()
+
+        indices = resolve_right_arm_joint_indices(
+            dof_names=base_env.simulator.dof_names,
+            active_joint_names=stage4_cfg.active_right_arm_joint_names,
+            wrist_joint_names=stage4_cfg.locked_wrist_joint_names,
+        )
+        wrist_idx = torch.tensor(indices.wrist_dof_indices, device=base_env.device, dtype=torch.long)
+        non_wrist_idx = torch.tensor(
+            [idx for idx in range(base_env.num_dof) if idx not in indices.wrist_dof_indices],
+            device=base_env.device,
+            dtype=torch.long,
+        )
+
+        wrist_q_abs_max = base_env.simulator.dof_pos[:, wrist_idx].abs().max().item()
+        wrist_dq_abs_max = base_env.simulator.dof_vel[:, wrist_idx].abs().max().item()
+        wrist_offset_abs_max = base_env.default_dof_pos_offset[:, wrist_idx].abs().max().item()
+        non_wrist_offset_mean = base_env.default_dof_pos_offset[:, non_wrist_idx].mean().item()
+        print(
+            "reset wrist q/dq/offset abs max = "
+            f"{wrist_q_abs_max:.6e}, {wrist_dq_abs_max:.6e}, {wrist_offset_abs_max:.6e}; "
+            f"non_wrist_offset_mean={non_wrist_offset_mean:.6f}"
+        )
+
+        assert wrist_q_abs_max <= atol
+        assert wrist_dq_abs_max <= atol
+        assert wrist_offset_abs_max <= atol
+        assert torch.allclose(
+            base_env.default_dof_pos_offset[:, non_wrist_idx],
+            torch.full_like(base_env.default_dof_pos_offset[:, non_wrist_idx], 0.5),
+        )
+    finally:
+        if env is not None:
+            env.close()
+
+
 @pytest.mark.skipif(
     not (_stage4_env_smoke_enabled() and _stage4_isaac_fd_enabled()),
     reason="Set RUN_STAGE4_ISAAC_SMOKE=1 and RUN_STAGE4_ISAAC_FD_JACOBIAN=1 to run real IsaacSim Jacobian finite differences",
