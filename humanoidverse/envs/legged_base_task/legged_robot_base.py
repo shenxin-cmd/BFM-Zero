@@ -22,6 +22,7 @@ from datetime import datetime, timedelta
 import imageio
 from loguru import logger
 import copy
+from collections.abc import Mapping
 
 class LeggedRobotBase(BaseTask):
     def __init__(self, config, device):
@@ -103,6 +104,7 @@ class LeggedRobotBase(BaseTask):
 
         self.add_noise_currculum = self.config.obs.add_noise_currculum
         self.current_noise_curriculum_value = self.config.obs.noise_initial_value
+        self._stage4_right_arm_indices = None
         
 
     def _domain_rand_config(self):
@@ -227,6 +229,7 @@ class LeggedRobotBase(BaseTask):
             actions = actions * rescale_action_to / rescale_action_from
 
         self.actions = torch.clip(actions, -clip_action_limit, clip_action_limit).to(self.device)
+        self.actions = self._stage4_zero_wrist_actions_before_env_step(self.actions)
         
         self.log_dict["action_clip_frac"] = (
                 self.actions.abs() == clip_action_limit
@@ -294,6 +297,7 @@ class LeggedRobotBase(BaseTask):
                 stiffness = self.p_gains
                 actions_scaled = actions_scaled * dof_effort_limit / stiffness
             jpos_target = actions_scaled + (self.default_dof_pos + self.default_dof_pos_offset)
+            jpos_target = self._stage4_clamp_wrist_pd_target(jpos_target)
             # jpos_target *= 0.
             self.simulator._robot.set_joint_position_target(jpos_target, joint_ids=self.simulator.dof_ids)
         else:
@@ -652,7 +656,9 @@ class LeggedRobotBase(BaseTask):
         control_type = self.config.robot.control.control_type
         
         if control_type=="P":
-            torques = self._kp_scale * self.p_gains*(actions_scaled + self.default_dof_pos + self.default_dof_pos_offset - self.simulator.dof_pos) - self._kd_scale * self.d_gains*self.simulator.dof_vel
+            jpos_target = actions_scaled + self.default_dof_pos + self.default_dof_pos_offset
+            jpos_target = self._stage4_clamp_wrist_pd_target(jpos_target)
+            torques = self._kp_scale * self.p_gains*(jpos_target - self.simulator.dof_pos) - self._kd_scale * self.d_gains*self.simulator.dof_vel
         elif control_type=="V":
             torques = self._kp_scale * self.p_gains*(actions_scaled - self.simulator.dof_vel) - self._kd_scale * self.d_gains*(self.simulator.dof_vel - self.last_dof_vel)/self.sim_dt
         elif control_type=="T":
@@ -668,6 +674,84 @@ class LeggedRobotBase(BaseTask):
         
         else:
             return torques
+
+    def _stage4_config_value(self, key, default=None):
+        stage4_cfg = self.config.get("stage4", None)
+        if stage4_cfg is None:
+            return default
+        if isinstance(stage4_cfg, Mapping):
+            return stage4_cfg.get(key, default)
+        return getattr(stage4_cfg, key, default)
+
+    def _stage4_task_space_enabled(self):
+        return self._stage4_config_value("hand_control_mode") == "task_space_4dof"
+
+    def _stage4_get_right_arm_indices(self):
+        if self._stage4_right_arm_indices is None:
+            from humanoidverse.agents.stage4 import resolve_right_arm_joint_indices
+
+            active_names = self._stage4_config_value(
+                "active_right_arm_joint_names",
+                (
+                    "right_shoulder_pitch_joint",
+                    "right_shoulder_roll_joint",
+                    "right_shoulder_yaw_joint",
+                    "right_elbow_joint",
+                ),
+            )
+            wrist_names = self._stage4_config_value(
+                "locked_wrist_joint_names",
+                (
+                    "right_wrist_roll_joint",
+                    "right_wrist_pitch_joint",
+                    "right_wrist_yaw_joint",
+                ),
+            )
+            self._stage4_right_arm_indices = resolve_right_arm_joint_indices(
+                dof_names=self.dof_names,
+                active_joint_names=tuple(active_names),
+                wrist_joint_names=tuple(wrist_names),
+            )
+            print("Stage4 active right-arm joints:")
+            for idx, name in zip(
+                self._stage4_right_arm_indices.active_action_indices,
+                self._stage4_right_arm_indices.active_joint_names,
+                strict=True,
+            ):
+                print(f"  action/dof index {idx} -> {name}")
+            print("Stage4 wrist locked joints:")
+            for idx, name in zip(
+                self._stage4_right_arm_indices.wrist_action_indices,
+                self._stage4_right_arm_indices.wrist_joint_names,
+                strict=True,
+            ):
+                print(f"  action/dof index {idx} -> {name}")
+        return self._stage4_right_arm_indices
+
+    def _stage4_zero_wrist_actions_before_env_step(self, actions):
+        if not self._stage4_task_space_enabled():
+            return actions
+        if not self._stage4_config_value("enforce_wrist_zero_before_env_step", True):
+            return actions
+        from humanoidverse.agents.stage4 import zero_wrist_actions
+
+        indices = self._stage4_get_right_arm_indices()
+        return zero_wrist_actions(actions, indices.wrist_action_indices)
+
+    def _stage4_clamp_wrist_pd_target(self, jpos_target):
+        if not self._stage4_task_space_enabled():
+            return jpos_target
+        if not self._stage4_config_value("enforce_wrist_zero_after_pd_target_build", True):
+            return jpos_target
+        from humanoidverse.agents.stage4 import clamp_wrist_pd_target
+
+        indices = self._stage4_get_right_arm_indices()
+        wrist_absolute_target = float(self._stage4_config_value("wrist_absolute_target", 0.0))
+        return clamp_wrist_pd_target(
+            jpos_target,
+            indices.wrist_dof_indices,
+            wrist_absolute_target=wrist_absolute_target,
+        )
 
     def _create_terrain(self):
         super()._create_terrain()
