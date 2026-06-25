@@ -99,6 +99,8 @@ def build_stage4_env_snapshot(base_env, stage4_cfg: Any = None) -> Stage4EnvSnap
     active_idx = torch.tensor(indices.active_dof_indices, device=simulator.dof_pos.device, dtype=torch.long)
     active_q = simulator.dof_pos.index_select(-1, active_idx)
     active_limits = base_env.dof_pos_limits.index_select(0, active_idx)
+    active_lower = active_limits[:, 0].unsqueeze(0).expand_as(active_q)
+    active_upper = active_limits[:, 1].unsqueeze(0).expand_as(active_q)
     default_active_joint_pos = base_env.default_dof_pos.index_select(-1, active_idx)
 
     jacobians = get_isaacsim_root_physx_jacobians(simulator)
@@ -121,8 +123,8 @@ def build_stage4_env_snapshot(base_env, stage4_cfg: Any = None) -> Stage4EnvSnap
         end_effector_pos_world=end_effector_pos_world,
         end_effector_pos_heading=end_effector_pos_heading,
         active_q=active_q,
-        active_lower=active_limits[:, 0],
-        active_upper=active_limits[:, 1],
+        active_lower=active_lower,
+        active_upper=active_upper,
         default_active_joint_pos=default_active_joint_pos,
         action_scale=_as_action_scale(base_env.config.robot.control.action_scale),
         active_position_jacobian_world=active_position_jacobian_world,

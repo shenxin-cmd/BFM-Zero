@@ -68,6 +68,8 @@ def test_build_stage4_env_snapshot_reads_env_tensors_and_heading_jacobian():
     assert snapshot.indices.active_dof_indices == (22, 23, 24, 25)
     assert snapshot.indices.wrist_dof_indices == (26, 27, 28)
     assert snapshot.active_q.shape == (2, 4)
+    assert snapshot.active_lower.shape == (2, 4)
+    assert snapshot.active_upper.shape == (2, 4)
     assert snapshot.end_effector_pos_heading.shape == (2, 3)
     assert snapshot.active_position_jacobian_world.shape == (2, 3, 4)
     assert snapshot.active_position_jacobian_heading.shape == (2, 3, 4)
