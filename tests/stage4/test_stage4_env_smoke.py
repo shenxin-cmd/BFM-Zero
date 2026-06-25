@@ -1,5 +1,6 @@
 import os
 
+import numpy as np
 import pytest
 import torch
 
@@ -68,7 +69,8 @@ def test_stage4_isaac_env_wrist_lock_smoke():
             action = torch.randn(num_envs, env.single_action_space.shape[0], device=base_env.device)
             action[:, wrist_indices] = 5.0
             obs, reward, terminated, truncated, info = env.step(action)
-            assert torch.isfinite(reward).all()
+            reward_tensor = reward if isinstance(reward, torch.Tensor) else torch.as_tensor(np.asarray(reward))
+            assert torch.isfinite(reward_tensor).all()
             assert torch.isfinite(base_env.simulator.dof_pos).all()
             assert torch.all(base_env.actions[:, wrist_indices] == 0.0)
 
