@@ -6,6 +6,7 @@ from humanoidverse.agents.fb.agent import FBAgentConfig, FBAgentTrainConfig
 from humanoidverse.agents.fb.model import FBModelArchiConfig, FBModelConfig
 from humanoidverse.agents.nn_filters import DictInputFilterConfig
 from humanoidverse.agents.nn_models import ActorArchiConfig, BackwardArchiConfig, ForwardArchiConfig
+from humanoidverse.agents.normalizers import BatchNormNormalizerConfig, ObsNormalizerConfig
 
 
 def _tiny_agent_config() -> FBAgentConfig:
@@ -44,6 +45,12 @@ def _tiny_agent_config() -> FBAgentConfig:
                     embedding_layers=2,
                     input_filter=obs_filter,
                 ),
+            ),
+            obs_normalizer=ObsNormalizerConfig(
+                name="ObsNormalizerConfig",
+                normalizers={
+                    "state": BatchNormNormalizerConfig(name="BatchNormNormalizerConfig", momentum=0.01),
+                },
             ),
             seq_length=1,
             actor_std=0.05,
