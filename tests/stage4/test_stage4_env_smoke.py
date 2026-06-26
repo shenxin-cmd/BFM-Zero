@@ -335,8 +335,8 @@ def test_stage4_isaac_env_dls_action_assembly_smoke():
         target_offset = torch.zeros(num_envs, 3, device=base_env.device)
         target_offset[:, 0] = 0.01
         command = HandTaskCommand(
-            target_pos_root=snapshot.end_effector_pos_heading + target_offset,
-            target_lin_vel_root=torch.zeros(num_envs, 3, device=base_env.device),
+            target_pos_heading=snapshot.end_effector_pos_heading + target_offset,
+            target_lin_vel_heading=torch.zeros(num_envs, 3, device=base_env.device),
             position_mask=torch.ones(num_envs, 1, device=base_env.device),
             velocity_mask=torch.zeros(num_envs, 1, device=base_env.device),
             command_id=torch.zeros(num_envs, dtype=torch.long, device=base_env.device),
@@ -444,8 +444,8 @@ def test_stage4_isaac_env_dls_limiter_rollout_smoke():
             snapshot = build_stage4_env_snapshot(base_env)
             body_action = torch.zeros(num_envs, 22, device=base_env.device)
             command = HandTaskCommand(
-                target_pos_root=target_pos,
-                target_lin_vel_root=torch.zeros(num_envs, 3, device=base_env.device),
+                target_pos_heading=target_pos,
+                target_lin_vel_heading=torch.zeros(num_envs, 3, device=base_env.device),
                 position_mask=torch.ones(num_envs, 1, device=base_env.device),
                 velocity_mask=torch.zeros(num_envs, 1, device=base_env.device),
                 command_id=torch.zeros(num_envs, dtype=torch.long, device=base_env.device),
@@ -478,7 +478,7 @@ def test_stage4_isaac_env_dls_limiter_rollout_smoke():
             reward_tensor = reward if isinstance(reward, torch.Tensor) else torch.as_tensor(np.asarray(reward))
             assert torch.isfinite(reward_tensor).all()
             assert torch.isfinite(base_env.simulator.dof_pos).all()
-            final_error = out.position_error_root.norm(dim=-1).mean().item()
+            final_error = out.position_error_heading.norm(dim=-1).mean().item()
             sigma_min_last = out.sigma_min.amin().item()
 
         allowed_target_jump = max_joint_velocity * base_env.dt + jump_tol
@@ -560,14 +560,37 @@ def test_stage4_isaac_env_static_reach_evaluation_smoke():
             "static reach eval "
             f"steady_error_mean={result.steady_state_error.mean().item():.6f}, "
             f"steady_error_max={result.steady_state_error.max().item():.6f}, "
-            f"max_action_jump={result.max_action_jump.max().item():.6f}, "
-            f"min_sigma={result.min_sigma_min.min().item():.6e}, "
-            f"min_joint_margin={result.min_joint_margin.min().item():.6f}"
+            f"categories={result.target_categories}, "
+            f"reachable_mean={result.grouped_metrics['reachable/steady_error_mean']:.6f}, "
+            f"reachable_success_5cm={result.grouped_metrics['reachable/success_5cm']:.3f}, "
+            f"boundary_mean={result.grouped_metrics['boundary/steady_error_mean']:.6f}, "
+            f"coord_required_mean={result.grouped_metrics['coordination_required/steady_error_mean']:.6f}, "
+            f"max_action_jump={result.global_metrics['max_action_jump']:.6f}, "
+            f"active_vel_max={result.global_metrics['active_joint_velocity_max']:.6f}, "
+            f"active_accel_max={result.global_metrics['active_joint_acceleration_max']:.6f}, "
+            f"wrist_q_abs_max={result.global_metrics['wrist_q_abs_max']:.6e}, "
+            f"wrist_dq_abs_max={result.global_metrics['wrist_dq_abs_max']:.6e}, "
+            f"min_sigma={result.global_metrics['minimum_sigma']:.6e}, "
+            f"min_joint_margin={result.global_metrics['minimum_joint_margin']:.6f}"
         )
         assert torch.isfinite(result.steady_state_error).all()
         assert torch.isfinite(result.max_action_jump).all()
         assert torch.isfinite(result.min_sigma_min).all()
         assert torch.isfinite(result.min_joint_margin).all()
+        assert all(
+            diagnostic["failure_mode"]
+            in (
+                "success",
+                "horizon_too_short",
+                "plateau_or_model_mismatch",
+                "joint_limit_pressure",
+                "low_manipulability",
+                "limiter_velocity_saturated",
+                "limiter_acceleration_saturated",
+                "target_unreachable_by_arm_only_presolve",
+            )
+            for diagnostic in result.target_diagnostics
+        )
     finally:
         if env is not None:
             env.close()

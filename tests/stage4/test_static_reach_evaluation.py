@@ -2,7 +2,12 @@ from types import SimpleNamespace
 
 import torch
 
-from humanoidverse.agents.stage4 import evaluate_static_reach_dls
+from humanoidverse.agents.stage4 import (
+    DLSParameterSet,
+    Stage4CommandSamplerConfig,
+    evaluate_static_reach_dls,
+    evaluate_static_reach_dls_parameter_scan,
+)
 
 
 class _DummyRootPhysxView:
@@ -78,5 +83,78 @@ def test_evaluate_static_reach_dls_returns_per_target_metrics():
     assert result.max_action_jump.shape == (2,)
     assert result.min_sigma_min.shape == (2,)
     assert result.min_joint_margin.shape == (2,)
+    assert result.final_ik_residual.shape == (2,)
+    assert len(result.target_categories) == 2
+    assert len(result.target_diagnostics) == 2
     assert torch.all(torch.isfinite(result.steady_state_error))
     assert torch.all(result.target_offsets_heading == offsets)
+    assert "reachable/steady_error_mean" in result.grouped_metrics
+    assert "boundary/success_2cm" in result.grouped_metrics
+    assert "coordination_required/final_ik_residual" in result.grouped_metrics
+    assert "max_action_jump" in result.global_metrics
+    assert "active_joint_velocity_max" in result.global_metrics
+    assert "wrist_q_abs_max" in result.global_metrics
+    diagnostic = result.target_diagnostics[0]
+    assert diagnostic["target_category"] in ("reachable", "boundary", "coordination_required")
+    assert diagnostic["position_error_curve"].shape == (3, 2)
+    assert diagnostic["active_joint_q_curve"].shape == (3, 2, 4)
+    assert diagnostic["active_joint_target_curve"].shape == (3, 2, 4)
+    assert diagnostic["action_curve"].shape == (3, 2, 29)
+    assert diagnostic["sigma_min_curve"].shape == (3, 2)
+    assert diagnostic["joint_margin_curve"].shape == (3, 2)
+    assert diagnostic["damping_curve"].shape == (3, 2)
+    assert diagnostic["nullspace_action_curve"].shape == (3, 2, 4)
+    assert diagnostic["failure_mode"] in (
+        "success",
+        "horizon_too_short",
+        "plateau_or_model_mismatch",
+        "joint_limit_pressure",
+        "low_manipulability",
+        "limiter_velocity_saturated",
+        "limiter_acceleration_saturated",
+        "target_unreachable_by_arm_only_presolve",
+    )
+
+
+def test_evaluate_static_reach_dls_uses_configurable_classification_thresholds():
+    env = _DummyEnv()
+    offsets = torch.tensor([[0.20, 0.0, 0.0]])
+    sampler_config = Stage4CommandSamplerConfig(
+        reachable_threshold=0.001,
+        coordination_required_threshold=0.01,
+        presolve_steps=1,
+        presolve_max_joint_delta=0.01,
+    )
+
+    result = evaluate_static_reach_dls(
+        env,
+        target_offsets_heading=offsets,
+        steps_per_target=2,
+        max_joint_velocity=1.0,
+        sampler_config=sampler_config,
+    )
+
+    assert result.target_categories == ("coordination_required",)
+    assert result.sampler_config.coordination_required_threshold == 0.01
+
+
+def test_static_reach_parameter_scan_runs_fresh_env_per_parameter_set():
+    make_count = 0
+
+    def make_env():
+        nonlocal make_count
+        make_count += 1
+        return _DummyEnv()
+
+    results = evaluate_static_reach_dls_parameter_scan(
+        make_env,
+        target_offsets_heading=torch.tensor([[0.02, 0.0, 0.0]]),
+        parameter_sets=(
+            DLSParameterSet(label="slow", max_joint_velocity=0.5, steps_per_target=2),
+            DLSParameterSet(label="fast", max_joint_velocity=1.0, steps_per_target=2),
+        ),
+    )
+
+    assert make_count == 2
+    assert set(results) == {"slow", "fast"}
+    assert results["slow"].target_diagnostics[0]["position_error_curve"].shape[0] == 2

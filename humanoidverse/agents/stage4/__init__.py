@@ -6,6 +6,14 @@ from .actions import (
     zero_wrist_actions,
 )
 from .config import HandControlMode, Stage4Config
+from .commands import (
+    CommandMode,
+    Stage4CommandSampler,
+    Stage4CommandSamplerConfig,
+    TargetCategory,
+    TargetClassification,
+    make_hand_task_command_root_heading,
+)
 from .control import (
     JointCommandLimiter,
     adaptive_damping,
@@ -27,7 +35,7 @@ from .controller import (
     dls_hand_action_from_snapshot,
 )
 from .env_adapter import Stage4EnvSnapshot, build_stage4_env_snapshot
-from .evaluation import StaticReachEvaluationResult, evaluate_static_reach_dls
+from .evaluation import DLSParameterSet, StaticReachEvaluationResult, evaluate_static_reach_dls, evaluate_static_reach_dls_parameter_scan
 from .kinematics import (
     finite_difference_position_jacobian,
     get_isaacsim_root_physx_jacobians,
@@ -47,13 +55,19 @@ __all__ = [
     "CoordinationGate",
     "DLSHandController",
     "DLSHandControllerOutput",
+    "DLSParameterSet",
+    "CommandMode",
     "HandControlMode",
     "HandTaskCommand",
     "JointCommandLimiter",
     "RightArmJointIndices",
     "Stage4Config",
+    "Stage4CommandSampler",
+    "Stage4CommandSamplerConfig",
     "Stage4EnvSnapshot",
     "StaticReachEvaluationResult",
+    "TargetCategory",
+    "TargetClassification",
     "adaptive_damping",
     "assemble_full_action",
     "apply_joint_limit_scaling",
@@ -67,10 +81,12 @@ __all__ = [
     "damped_pseudoinverse",
     "dls_hand_action_from_snapshot",
     "evaluate_static_reach_dls",
+    "evaluate_static_reach_dls_parameter_scan",
     "finite_difference_position_jacobian",
     "get_isaacsim_root_physx_jacobians",
     "heading_to_world_frame",
     "joint_margin_scale",
+    "make_hand_task_command_root_heading",
     "nullspace_projector",
     "resolve_body_index",
     "resolve_isaacsim_physx_body_index",

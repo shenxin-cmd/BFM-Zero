@@ -60,8 +60,8 @@ def test_dls_hand_controller_outputs_full_action_with_locked_wrist():
     body_indices = tuple(idx for idx in range(29) if idx not in indices.controlled_action_indices)
     controller = DLSHandController(indices=indices, action_dim=29, body_indices=body_indices, max_joint_delta=0.05)
     command = HandTaskCommand(
-        target_pos_root=torch.tensor([[0.1, 0.0, 0.0]]),
-        target_lin_vel_root=torch.zeros(1, 3),
+        target_pos_heading=torch.tensor([[0.1, 0.0, 0.0]]),
+        target_lin_vel_heading=torch.zeros(1, 3),
         position_mask=torch.ones(1, 1),
         velocity_mask=torch.zeros(1, 1),
         command_id=torch.zeros(1, dtype=torch.long),
@@ -73,7 +73,7 @@ def test_dls_hand_controller_outputs_full_action_with_locked_wrist():
     out = controller.step(
         body_action=torch.zeros(1, len(body_indices)),
         active_q=torch.zeros(1, 4),
-        wrist_pos_root=torch.zeros(1, 3),
+        wrist_pos_heading=torch.zeros(1, 3),
         command=command,
         active_position_jacobian=jac,
         active_lower=torch.full((1, 4), -1.0),
@@ -85,6 +85,12 @@ def test_dls_hand_controller_outputs_full_action_with_locked_wrist():
     assert out.full_action.shape == (1, 29)
     assert torch.all(out.full_action[:, list(indices.wrist_action_indices)] == 0.0)
     assert out.active_joint_delta.shape == (1, 4)
+    assert out.primary_joint_delta.shape == (1, 4)
+    assert out.nullspace_joint_delta.shape == (1, 4)
+    assert out.primary_task_error_before_nullspace.shape == (1,)
+    assert out.primary_task_error_after_nullspace.shape == (1,)
+    assert out.nullspace_action_norm.shape == (1,)
+    assert out.j_times_nullspace_norm.shape == (1,)
     assert out.active_joint_delta[0, 0] > 0.0
 
 
@@ -160,8 +166,8 @@ def test_dls_controller_applies_joint_command_limiter_to_active_joint_targets():
     )
     limiter.step(torch.zeros(1, 4), dt=0.1)
     command = HandTaskCommand(
-        target_pos_root=torch.tensor([[1.0, 0.0, 0.0]]),
-        target_lin_vel_root=torch.zeros(1, 3),
+        target_pos_heading=torch.tensor([[1.0, 0.0, 0.0]]),
+        target_lin_vel_heading=torch.zeros(1, 3),
         position_mask=torch.ones(1, 1),
         velocity_mask=torch.zeros(1, 1),
         command_id=torch.zeros(1, dtype=torch.long),
@@ -172,7 +178,7 @@ def test_dls_controller_applies_joint_command_limiter_to_active_joint_targets():
     common_kwargs = dict(
         body_action=torch.zeros(1, len(body_indices)),
         active_q=torch.zeros(1, 4),
-        wrist_pos_root=torch.zeros(1, 3),
+        wrist_pos_heading=torch.zeros(1, 3),
         command=command,
         active_position_jacobian=jac,
         active_lower=torch.full((1, 4), -1.0),
@@ -215,8 +221,8 @@ def test_dls_controller_adds_comfortable_posture_nullspace_motion():
         damping_max=0.0,
     )
     command = HandTaskCommand(
-        target_pos_root=torch.zeros(1, 3),
-        target_lin_vel_root=torch.zeros(1, 3),
+        target_pos_heading=torch.zeros(1, 3),
+        target_lin_vel_heading=torch.zeros(1, 3),
         position_mask=torch.ones(1, 1),
         velocity_mask=torch.zeros(1, 1),
         command_id=torch.zeros(1, dtype=torch.long),
@@ -228,7 +234,7 @@ def test_dls_controller_adds_comfortable_posture_nullspace_motion():
     out = controller.step(
         body_action=torch.zeros(1, len(body_indices)),
         active_q=torch.zeros(1, 4),
-        wrist_pos_root=torch.zeros(1, 3),
+        wrist_pos_heading=torch.zeros(1, 3),
         command=command,
         active_position_jacobian=jac,
         active_lower=torch.full((1, 4), -1.0),
@@ -240,3 +246,10 @@ def test_dls_controller_adds_comfortable_posture_nullspace_motion():
     task_motion = (jac @ out.active_joint_delta.unsqueeze(-1)).squeeze(-1)
     assert torch.allclose(task_motion, torch.zeros_like(task_motion), atol=1e-5)
     assert out.active_joint_delta[0, 3] > 0.0
+    assert out.nullspace_joint_delta[0, 3] > 0.0
+    assert torch.allclose(out.j_times_nullspace_norm, torch.zeros_like(out.j_times_nullspace_norm), atol=1e-5)
+    assert torch.allclose(
+        out.primary_task_error_after_nullspace,
+        out.primary_task_error_before_nullspace,
+        atol=1e-5,
+    )

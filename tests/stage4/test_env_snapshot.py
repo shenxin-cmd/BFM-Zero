@@ -96,8 +96,8 @@ def test_dls_hand_action_from_snapshot_preserves_body_action_and_locks_wrist():
     snapshot = build_stage4_env_snapshot(env)
     body_action = torch.randn(2, 22, requires_grad=True)
     command = HandTaskCommand(
-        target_pos_root=snapshot.end_effector_pos_heading + torch.tensor([[0.01, 0.0, 0.0], [0.02, 0.0, 0.0]]),
-        target_lin_vel_root=torch.zeros(2, 3),
+        target_pos_heading=snapshot.end_effector_pos_heading + torch.tensor([[0.01, 0.0, 0.0], [0.02, 0.0, 0.0]]),
+        target_lin_vel_heading=torch.zeros(2, 3),
         position_mask=torch.ones(2, 1),
         velocity_mask=torch.zeros(2, 1),
         command_id=torch.zeros(2, dtype=torch.long),

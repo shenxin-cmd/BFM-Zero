@@ -19,8 +19,8 @@ from .env_adapter import Stage4EnvSnapshot
 
 @dataclass(frozen=True)
 class HandTaskCommand:
-    target_pos_root: torch.Tensor
-    target_lin_vel_root: torch.Tensor
+    target_pos_heading: torch.Tensor
+    target_lin_vel_heading: torch.Tensor
     position_mask: torch.Tensor
     velocity_mask: torch.Tensor
     command_id: torch.Tensor
@@ -33,7 +33,13 @@ class DLSHandControllerOutput:
     active_hand_action: torch.Tensor
     active_joint_delta: torch.Tensor
     active_joint_target: torch.Tensor
-    position_error_root: torch.Tensor
+    primary_joint_delta: torch.Tensor
+    nullspace_joint_delta: torch.Tensor
+    position_error_heading: torch.Tensor
+    primary_task_error_before_nullspace: torch.Tensor
+    primary_task_error_after_nullspace: torch.Tensor
+    nullspace_action_norm: torch.Tensor
+    j_times_nullspace_norm: torch.Tensor
     damping: torch.Tensor
     sigma_min: torch.Tensor
     joint_margin: torch.Tensor
@@ -109,7 +115,7 @@ class DLSHandController:
         *,
         body_action: torch.Tensor,
         active_q: torch.Tensor,
-        wrist_pos_root: torch.Tensor,
+        wrist_pos_heading: torch.Tensor,
         command: HandTaskCommand,
         active_position_jacobian: torch.Tensor,
         active_lower: torch.Tensor,
@@ -119,7 +125,7 @@ class DLSHandController:
         joint_command_limiter: JointCommandLimiter | None = None,
         dt: float | None = None,
     ) -> DLSHandControllerOutput:
-        position_error = (command.target_pos_root - wrist_pos_root) * command.position_mask
+        position_error = (command.target_pos_heading - wrist_pos_heading) * command.position_mask
         damping, sigma_min = adaptive_damping(
             active_position_jacobian,
             damping_min=self.damping_min,
@@ -140,6 +146,11 @@ class DLSHandController:
             active_upper,
             margin=self.joint_limit_margin,
         )
+        primary_dq = dq
+        primary_task_error_before_nullspace = (
+            position_error - (active_position_jacobian @ primary_dq.unsqueeze(-1)).squeeze(-1)
+        ).norm(dim=-1)
+        nullspace_dq = torch.zeros_like(dq)
         if self.comfortable_q is not None and self.nullspace_gain > 0.0:
             comfortable_q = torch.as_tensor(self.comfortable_q, dtype=active_q.dtype, device=active_q.device)
             if comfortable_q.ndim == 1:
@@ -159,6 +170,10 @@ class DLSHandController:
                 active_upper,
                 margin=self.joint_limit_margin,
             )
+        primary_task_error_after_nullspace = (
+            position_error - (active_position_jacobian @ (primary_dq + nullspace_dq).unsqueeze(-1)).squeeze(-1)
+        ).norm(dim=-1)
+        j_times_nullspace = (active_position_jacobian @ nullspace_dq.unsqueeze(-1)).squeeze(-1)
         active_target = active_q + dq
         if joint_command_limiter is not None:
             if dt is None:
@@ -189,7 +204,13 @@ class DLSHandController:
             active_hand_action=active_action,
             active_joint_delta=dq,
             active_joint_target=active_target,
-            position_error_root=position_error,
+            primary_joint_delta=primary_dq,
+            nullspace_joint_delta=nullspace_dq,
+            position_error_heading=position_error,
+            primary_task_error_before_nullspace=primary_task_error_before_nullspace,
+            primary_task_error_after_nullspace=primary_task_error_after_nullspace,
+            nullspace_action_norm=nullspace_dq.norm(dim=-1),
+            j_times_nullspace_norm=j_times_nullspace.norm(dim=-1),
             damping=damping,
             sigma_min=sigma_min,
             joint_margin=margin,
@@ -288,7 +309,7 @@ def dls_hand_action_from_snapshot(
     return controller.step(
         body_action=body_action,
         active_q=snapshot.active_q,
-        wrist_pos_root=snapshot.end_effector_pos_heading,
+        wrist_pos_heading=snapshot.end_effector_pos_heading,
         command=command,
         active_position_jacobian=snapshot.active_position_jacobian_heading,
         active_lower=snapshot.active_lower,
