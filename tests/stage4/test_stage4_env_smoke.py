@@ -500,6 +500,7 @@ def test_stage4_isaac_env_static_reach_evaluation_smoke():
 
     num_envs = int(os.environ.get("STAGE4_SMOKE_NUM_ENVS", "2"))
     steps_per_target = int(os.environ.get("STAGE4_STATIC_REACH_STEPS", "8"))
+    wrist_state_atol = float(os.environ.get("STAGE4_STATIC_REACH_WRIST_STATE_ATOL", "1e-6"))
     lafan_tail_path = os.environ.get("STAGE4_SMOKE_MOTION_FILE", "humanoidverse/data/lafan_29dof_10s-clipped.pkl")
 
     cfg = HumanoidVerseIsaacConfig(
@@ -577,6 +578,8 @@ def test_stage4_isaac_env_static_reach_evaluation_smoke():
         assert torch.isfinite(result.max_action_jump).all()
         assert torch.isfinite(result.min_sigma_min).all()
         assert torch.isfinite(result.min_joint_margin).all()
+        assert result.global_metrics["wrist_q_abs_max"] <= wrist_state_atol
+        assert result.global_metrics["wrist_dq_abs_max"] <= wrist_state_atol
         assert all(
             diagnostic["failure_mode"]
             in (

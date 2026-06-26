@@ -305,6 +305,9 @@ class LeggedRobotBase(BaseTask):
 
     def _post_physics_step(self):
         self._refresh_sim_tensors()
+        if self._stage4_task_space_enabled() and self._stage4_config_value("enforce_wrist_zero_after_physics_step", True):
+            self._stage4_zero_wrist_sim_state()
+            self._refresh_sim_tensors()
         self.episode_length_buf += 1
         # update counters
         self._update_counters_each_step()
@@ -769,6 +772,28 @@ class LeggedRobotBase(BaseTask):
         wrist_idx = torch.tensor(indices.wrist_dof_indices, device=self.device, dtype=torch.long)
         self.target_robot_dof_state[env_ids.unsqueeze(-1), wrist_idx, 0] = 0.0
         self.target_robot_dof_state[env_ids.unsqueeze(-1), wrist_idx, 1] = 0.0
+
+    def _stage4_zero_wrist_sim_state(self, env_ids=None):
+        if not self._stage4_task_space_enabled():
+            return
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
+        else:
+            env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+        if env_ids.numel() == 0:
+            return
+        indices = self._stage4_get_right_arm_indices()
+        wrist_idx = torch.tensor(indices.wrist_dof_indices, device=self.device, dtype=torch.long)
+        if hasattr(self.simulator, "dof_state"):
+            dof_state = self.simulator.dof_state.clone()
+        else:
+            dof_state = torch.stack((self.simulator.dof_pos, self.simulator.dof_vel), dim=-1)
+        dof_state[env_ids.unsqueeze(-1), wrist_idx, 0] = 0.0
+        dof_state[env_ids.unsqueeze(-1), wrist_idx, 1] = 0.0
+        self.simulator.set_dof_state_tensor(env_ids, dof_state)
+        self.simulator.dof_pos[env_ids.unsqueeze(-1), wrist_idx] = 0.0
+        if hasattr(self.simulator, "dof_vel"):
+            self.simulator.dof_vel[env_ids.unsqueeze(-1), wrist_idx] = 0.0
 
     def _create_terrain(self):
         super()._create_terrain()

@@ -43,6 +43,21 @@ class _Config(dict):
         return self[item]
 
 
+class _DummySimulator:
+    def __init__(self, num_envs=2):
+        self.dof_pos = torch.ones(num_envs, 29)
+        self.dof_vel = -torch.ones(num_envs, 29)
+        self.dof_state = torch.stack((self.dof_pos, self.dof_vel), dim=-1)
+        self.dof_ids = list(range(29))
+        self.last_set_env_ids = None
+
+    def set_dof_state_tensor(self, env_ids, dof_state):
+        self.last_set_env_ids = env_ids.clone()
+        self.dof_state = dof_state.clone()
+        self.dof_pos = self.dof_state[..., 0]
+        self.dof_vel = self.dof_state[..., 1]
+
+
 def _make_env_with_stage4(enabled: bool = True):
     env = object.__new__(LeggedRobotBase)
     env.dof_names = list(G1_29DOF_NAMES)
@@ -67,7 +82,8 @@ def _make_env_with_stage4(enabled: bool = True):
         }
     )
     env.device = "cpu"
-    env.simulator = SimpleNamespace(dof_ids=list(range(29)))
+    env.simulator = _DummySimulator()
+    env.num_envs = 2
     env.num_dof = 29
     env.num_dofs = 29
     return env
@@ -127,6 +143,20 @@ def test_stage4_target_state_reset_hard_locks_wrist_q_and_dq_to_zero():
     assert torch.all(env.target_robot_dof_state[:, [26, 27, 28], 0] == 0.0)
     assert torch.all(env.target_robot_dof_state[:, [26, 27, 28], 1] == 0.0)
     assert torch.all(env.target_robot_dof_state[:, 25, 0] == 1.0)
+
+
+def test_stage4_post_physics_hook_hard_locks_wrist_sim_state_to_zero():
+    env = _make_env_with_stage4(enabled=True)
+    env.simulator.dof_pos[:, [26, 27, 28]] = torch.tensor([[0.6, -0.4, 0.2], [0.1, -0.2, 0.3]])
+    env.simulator.dof_vel[:, [26, 27, 28]] = torch.tensor([[2.0, -3.0, 4.0], [5.0, -6.0, 7.0]])
+    env.simulator.dof_state = torch.stack((env.simulator.dof_pos, env.simulator.dof_vel), dim=-1)
+
+    env._stage4_zero_wrist_sim_state()
+
+    assert torch.all(env.simulator.dof_pos[:, [26, 27, 28]] == 0.0)
+    assert torch.all(env.simulator.dof_vel[:, [26, 27, 28]] == 0.0)
+    assert torch.all(env.simulator.dof_pos[:, 25] == 1.0)
+    assert torch.all(env.simulator.last_set_env_ids == torch.tensor([0, 1]))
 
 
 def test_stage4_domain_randomization_keeps_wrist_default_offsets_zero():

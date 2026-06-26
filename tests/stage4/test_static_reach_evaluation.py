@@ -94,6 +94,9 @@ def test_evaluate_static_reach_dls_returns_per_target_metrics():
     assert "max_action_jump" in result.global_metrics
     assert "active_joint_velocity_max" in result.global_metrics
     assert "wrist_q_abs_max" in result.global_metrics
+    assert result.global_metrics["active_joint_velocity_max"] <= 1.0 + 1e-5
+    assert result.global_metrics["wrist_q_abs_max"] == 0.0
+    assert result.global_metrics["wrist_dq_abs_max"] == 0.0
     diagnostic = result.target_diagnostics[0]
     assert diagnostic["target_category"] in ("reachable", "boundary", "coordination_required")
     assert diagnostic["position_error_curve"].shape == (3, 2)

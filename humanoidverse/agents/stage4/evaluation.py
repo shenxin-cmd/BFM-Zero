@@ -246,6 +246,8 @@ def evaluate_static_reach_dls(
     diagnostics: list[dict[str, torch.Tensor | str]] = []
 
     wrist_idx = torch.tensor(initial_snapshot.indices.wrist_dof_indices, device=device, dtype=torch.long)
+    previous_command_target = initial_snapshot.active_q.detach().clone()
+    previous_command_velocity = torch.zeros_like(previous_command_target)
 
     for target_idx, offset in enumerate(offsets):
         snapshot = build_stage4_env_snapshot(base_env)
@@ -267,9 +269,6 @@ def evaluate_static_reach_dls(
         final_error = torch.full((), float("nan"), dtype=torch.float32, device=device)
 
         initial_wrist_pos = snapshot.end_effector_pos_heading.detach().clone()
-        previous_active_target = snapshot.active_q.detach().clone()
-        previous_active_velocity = torch.zeros_like(previous_active_target)
-
         position_error_curve = []
         active_joint_q_curve = []
         active_joint_target_curve = []
@@ -311,19 +310,16 @@ def evaluate_static_reach_dls(
                 max_action_jump = torch.maximum(max_action_jump, (out.active_hand_action - previous_action).abs().max())
             previous_action = out.active_hand_action.detach().clone()
 
-            active_velocity = (out.active_joint_target - previous_active_target) / base_env.dt
-            active_acceleration = (active_velocity - previous_active_velocity) / base_env.dt
-            max_active_velocity = torch.maximum(max_active_velocity, active_velocity.abs().max())
-            max_active_acceleration = torch.maximum(max_active_acceleration, active_acceleration.abs().max())
-            previous_active_target = out.active_joint_target.detach().clone()
-            previous_active_velocity = active_velocity.detach().clone()
+            command_velocity = (out.active_joint_target - previous_command_target) / base_env.dt
+            command_acceleration = (command_velocity - previous_command_velocity) / base_env.dt
+            max_active_velocity = torch.maximum(max_active_velocity, command_velocity.abs().max())
+            max_active_acceleration = torch.maximum(max_active_acceleration, command_acceleration.abs().max())
+            previous_command_target = out.active_joint_target.detach().clone()
+            previous_command_velocity = command_velocity.detach().clone()
 
             min_sigma = torch.minimum(min_sigma, out.sigma_min.amin())
             min_margin = torch.minimum(min_margin, out.joint_margin.amin())
             final_error = out.position_error_heading.norm(dim=-1).mean()
-            wrist_q_abs_max = torch.maximum(wrist_q_abs_max, base_env.simulator.dof_pos[:, wrist_idx].abs().max())
-            if hasattr(base_env.simulator, "dof_vel"):
-                wrist_dq_abs_max = torch.maximum(wrist_dq_abs_max, base_env.simulator.dof_vel[:, wrist_idx].abs().max())
 
             position_error_curve.append(out.position_error_heading.norm(dim=-1).detach().clone())
             active_joint_q_curve.append(snapshot.active_q.detach().clone())
@@ -344,6 +340,9 @@ def evaluate_static_reach_dls(
                 raise RuntimeError(f"Non-finite reward during static reach target {target_idx}")
             if not torch.isfinite(base_env.simulator.dof_pos).all():
                 raise RuntimeError(f"Non-finite dof_pos during static reach target {target_idx}")
+            wrist_q_abs_max = torch.maximum(wrist_q_abs_max, base_env.simulator.dof_pos[:, wrist_idx].abs().max())
+            if hasattr(base_env.simulator, "dof_vel"):
+                wrist_dq_abs_max = torch.maximum(wrist_dq_abs_max, base_env.simulator.dof_vel[:, wrist_idx].abs().max())
 
         final_snapshot = build_stage4_env_snapshot(base_env)
         error_curve = torch.stack(position_error_curve).mean(dim=-1)
