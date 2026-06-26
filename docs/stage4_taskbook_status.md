@@ -314,13 +314,20 @@ Real env smoke result:
 - `active_hand_action_shape = (2, 4)`
 - `wrist_action_values = 0`
 - `dq_finite = True`
-- `sigma_min` was very small, around `1e-12` to `1e-11`
+- Superseded observation: an earlier run reported `sigma_min` around
+  `1e-12` to `1e-11`.
 
 Conclusion:
 
 - DLS action generation is numerically finite.
-- Initial right-arm pose can be near singular.
-- The later gated body coordination residual is necessary and should use `sigma_min` or related reachability features.
+- The earlier near-zero `sigma_min` conclusion is superseded by the later
+  IsaacSim/PhysX body and DOF index mapping fix and multi-pose finite-difference
+  Jacobian validation in section 8.2.
+- Body coordination must not be justified from that pre-fix `sigma_min`.
+  Whether waist/body coordination is necessary must be decided from stratified
+  Stage4B evidence: arm-only IK residual, real manipulability after correct
+  indexing, joint-limit pressure, and whether targets lie outside the 4DoF
+  right-arm workspace.
 
 Taskbook status:
 
@@ -538,7 +545,7 @@ Not yet at:
 Need answer:
 
 ```text
-Where does `HandTaskCommand.target_pos_root/heading` come from in Stage4 training?
+Where does `HandTaskCommand.target_pos_heading` come from in Stage4 training?
 ```
 
 Options:
